@@ -902,6 +902,13 @@ node_title() { printf '%s' "${N_TITLE[$1]:-${N_NAME[$1]}}"; }
 
 node_name_ok() { [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]]; }
 
+# Проверки полей нового узла. Хост и пользователь попадают в аргументы ssh, поэтому
+# никаких пробелов, "@" и ведущего "-". IPv6 не поддерживается: ":" занят под порт в nodes.conf
+host_ok()  { [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]; }
+user_ok()  { [[ "$1" =~ ^[a-z_][a-z0-9_-]*$ ]]; }
+port_ok()  { [[ "$1" =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 )); }
+title_ok() { [[ "$1" != *"|"* && "$1" != *$'\n'* ]]; }
+
 # Имя файла конфига узла для клиентов AWG, по подписи узла: France.conf
 node_file_name() {
   local i="$1" t
@@ -1436,30 +1443,61 @@ cmd_refresh() {
 
 # Узлы: iof node add | import | del | list
 
-# Раздача ключа по паролю на узел с индексом $1 в массивах IM_*
+# Раздача ключа iof на узел с индексом $1 в массивах IM_*: вход по паролю (sshpass) или ключом
 push_key_job() {
-  local j="$1" ip="${IM_IP[$1]}" port="${IM_PORT[$1]}" pub rc=0
+  local j="$1" host="${IM_HOST[$1]}" port="${IM_PORT[$1]}" user="${IM_USER[$1]}" pub cmd err="" rc=0
   pub="$(cat "$SSH_KEY.pub")"
   [[ -n "$pub" ]] || { echo "нет публичного ключа" >&2; return 1; }
-  SSHPASS="${IM_PASS[$j]}" sshpass -e ssh -p "$port" \
-    -o StrictHostKeyChecking=accept-new -o PubkeyAuthentication=no \
-    -o PreferredAuthentications=password,keyboard-interactive -o NumberOfPasswordPrompts=1 \
-    -o ConnectTimeout=10 "root@$ip" \
-    "umask 077; mkdir -p ~/.ssh; touch ~/.ssh/authorized_keys; grep -qxF '$pub' ~/.ssh/authorized_keys || echo '$pub' >> ~/.ssh/authorized_keys" \
-    >/dev/null 2>&1 || rc=$?
+  cmd="umask 077; mkdir -p ~/.ssh; touch ~/.ssh/authorized_keys; grep -qxF '$pub' ~/.ssh/authorized_keys || echo '$pub' >> ~/.ssh/authorized_keys"
+  # Не root: iof выполняет команды через sudo -n, без него ключ класть незачем
+  if [[ "$user" != "root" ]]; then cmd="sudo -n true 2>/dev/null || exit 42; $cmd"; fi
+  # stderr ssh нужен, чтобы отличить неверный пароль от недоступного сервера
+  case "${IM_MODE[$j]}" in
+    installed) ;;  # ключ iof положен вручную, остаётся проверка ниже
+    key)
+      err="$(ssh -i "${IM_KEY[$j]}" -p "$port" -o IdentitiesOnly=yes -o BatchMode=yes \
+        -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "$user@$host" "$cmd" \
+        2>&1 >/dev/null)" || rc=$? ;;
+    *)
+      err="$(SSHPASS="${IM_PASS[$j]}" sshpass -e ssh -p "$port" \
+        -o StrictHostKeyChecking=accept-new -o PubkeyAuthentication=no \
+        -o PreferredAuthentications=password,keyboard-interactive -o NumberOfPasswordPrompts=1 \
+        -o ConnectTimeout=10 "$user@$host" "$cmd" \
+        2>&1 >/dev/null)" || rc=$? ;;
+  esac
   case "$rc" in
     0) ;;
-    5) echo "неверный пароль root" >&2; return 1 ;;
-    6) echo "ключ хоста изменился, удали старую запись: ssh-keygen -R $ip" >&2; return 1 ;;
-    255) echo "нет связи по SSH или вход root по паролю запрещён" >&2; return 1 ;;
-    *) echo "ошибка входа по паролю (код $rc)" >&2; return 1 ;;
+    42) echo "у $user нет sudo без пароля (NOPASSWD), iof с ним работать не сможет" >&2; return 1 ;;
+    5) echo "неверный пароль $user" >&2; return 1 ;;
+    6) echo "ключ хоста изменился, удали старую запись: ssh-keygen -R $host" >&2; return 1 ;;
+    255)
+      if [[ "$err" == *"Permission denied"* && "${IM_MODE[$j]}" == "key" ]]; then
+        echo "ключ не подходит для $user" >&2
+      elif [[ "$err" == *"Permission denied"* ]]; then
+        echo "неверный пароль $user или вход по паролю запрещён" >&2
+      else
+        err="$(grep -v '^Warning: Permanently added' <<<"$err" | tail -n 1 | tr -d '\r')"
+        echo "нет связи по SSH${err:+: $err}" >&2
+      fi
+      return 1 ;;
+    *) echo "ошибка входа (код $rc)" >&2; return 1 ;;
   esac
-  ssh -i "$SSH_KEY" -p "$port" -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
-    "root@$ip" true >/dev/null 2>&1 || { echo "пароль подошёл, но вход по ключу не работает" >&2; return 1; }
+  if ! ssh_cmd "$user@$host:$port" "$(remote_sudo "$user@$host")true" </dev/null >/dev/null 2>&1; then
+    if [[ "${IM_MODE[$j]}" != "installed" ]]; then
+      echo "вход удался, но ключ iof не работает" >&2
+    elif [[ "$user" != "root" ]]; then
+      echo "ключ iof не подошёл или у $user нет sudo без пароля (NOPASSWD)" >&2
+    else
+      echo "нет связи по SSH или ключ iof не добавлен в ~/.ssh/authorized_keys у $user" >&2
+    fi
+    return 1
+  fi
 }
 
-# Раздаёт ключ на узлы из массивов IM_NAME IM_IP IM_PASS IM_TITLE IM_PORT и дописывает
-# удачные в nodes.conf. Код 0, если добавлен хотя бы один узел
+# Раздаёт ключ на узлы из массивов IM_NAME IM_HOST IM_ADDR IM_USER IM_PORT IM_TITLE, способ
+# входа в IM_MODE: password (IM_PASS), key (файл ключа в IM_KEY) или installed (ключ iof уже
+# положен вручную). Удачные узлы дописывает в nodes.conf.
+# Код 0, если добавлен хотя бы один узел
 onboard_nodes() {
   local j target ok=0
   local failed=()
@@ -1470,7 +1508,8 @@ onboard_nodes() {
     ssh-keygen -t ed25519 -N "" -f "$SSH_KEY" -C "iof@$(hostname)" >/dev/null || die "не удалось создать SSH-ключ"
   fi
   [[ -s "$SSH_KEY.pub" ]] || die "нет публичного ключа $SSH_KEY.pub"
-  if ! have sshpass; then
+  # sshpass нужен только для входа по паролю
+  if [[ " ${IM_MODE[*]} " == *" password "* ]] && ! have sshpass; then
     echo "Ставлю sshpass..."
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq sshpass >/dev/null 2>&1 \
       || { apt-get update -qq >/dev/null 2>&1; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq sshpass >/dev/null 2>&1; } \
@@ -1482,9 +1521,9 @@ onboard_nodes() {
   pmap push_key_job "${!IM_NAME[@]}"
   for j in "${!IM_NAME[@]}"; do
     if pm_ok "$j"; then
-      target="root@${IM_IP[$j]}"
+      target="${IM_USER[$j]}@${IM_HOST[$j]}"
       if [[ "${IM_PORT[$j]}" != "22" ]]; then target="$target:${IM_PORT[$j]}"; fi
-      printf '%s | %s | %s | %s\n' "${IM_NAME[$j]}" "${IM_IP[$j]}" "$target" "${IM_TITLE[$j]}" >> "$NODES_FILE"
+      printf '%s | %s | %s | %s\n' "${IM_NAME[$j]}" "${IM_ADDR[$j]}" "$target" "${IM_TITLE[$j]}" >> "$NODES_FILE"
       ok=$((ok + 1))
     else
       failed+=("$j")
@@ -1494,7 +1533,7 @@ onboard_nodes() {
   if (( ${#failed[@]} > 0 )); then
     echo "Не удалось (${#failed[@]}), в nodes.conf не попали:"
     for j in "${failed[@]}"; do
-      printf '  %-20s %-16s %s\n' "${IM_NAME[$j]}" "${IM_IP[$j]}" "$(pm_err "$j" | tail -n 1)"
+      printf '  %-20s %-16s %s\n' "${IM_NAME[$j]}" "${IM_HOST[$j]}" "$(pm_err "$j" | tail -n 1)"
     done
   fi
   (( ok > 0 ))
@@ -1506,7 +1545,7 @@ cmd_node_import() {
   [[ -n "$file" && -f "$file" ]] || die "укажи файл: iof node import servers.txt"
   N_NAME=()
   if nodes_present; then read_nodes; fi
-  IM_NAME=(); IM_IP=(); IM_PASS=(); IM_TITLE=(); IM_PORT=()
+  IM_NAME=(); IM_HOST=(); IM_ADDR=(); IM_USER=(); IM_MODE=(); IM_PASS=(); IM_KEY=(); IM_TITLE=(); IM_PORT=()
   while IFS='|' read -r name ip pw title port || [[ -n "$name" ]]; do
     name="$(trim "$name")"
     if [[ -z "$name" || "$name" == \#* ]]; then continue; fi
@@ -1517,13 +1556,16 @@ cmd_node_import() {
     n=$((n + 1))
     node_name_ok "$name" || die "строка $n: имя '$name' — только латиница, цифры, точка, дефис, подчёркивание"
     [[ -n "$ip" && -n "$pw" ]] || die "строка $n ($name): нужны IP и пароль"
+    host_ok "$ip" || die "строка $n ($name): '$ip' не похож на IPv4 или имя хоста"
+    port_ok "${port:-22}" || die "строка $n ($name): порт '$port' вне 1-65535"
     [[ "$seen" != *" $name "* ]] || die "имя '$name' встречается в файле дважды"
     seen+="$name "
     if node_index "$name" >/dev/null 2>&1; then
       echo "Пропускаю $name: уже есть в nodes.conf"
       continue
     fi
-    IM_NAME+=("$name"); IM_IP+=("$ip"); IM_PASS+=("$pw"); IM_TITLE+=("${title:-$name}"); IM_PORT+=("${port:-22}")
+    IM_NAME+=("$name"); IM_HOST+=("$ip"); IM_ADDR+=("$ip"); IM_USER+=("root"); IM_MODE+=("password")
+    IM_PASS+=("$pw"); IM_KEY+=(""); IM_TITLE+=("${title:-$name}"); IM_PORT+=("${port:-22}")
   done < "$file"
   (( ${#IM_NAME[@]} > 0 )) || die "в файле нет новых узлов"
 
@@ -1533,20 +1575,82 @@ cmd_node_import() {
   echo "Дальше: sudo iof hy2 install all"
 }
 
+# iof node add <имя> <хост> [подпись] [ssh_порт] [--user имя] [--addr адрес_для_клиентов]
+#   [--key файл | --key-stdin | --password-stdin | --key-installed]
+# Без них пароль спрашивается в терминале. --key-installed: ключ iof уже добавлен на сервер вручную. Варианты со stdin нужны веб-панели:
+# так пароль и ключ не видны в списке процессов
 cmd_node_add() {
-  local name="${1:-}" ip="${2:-}" title="${3:-}" port="${4:-22}" pw
-  [[ -n "$name" && -n "$ip" ]] || die "используй: iof node add <имя> <ip> [подпись] [ssh_порт]"
+  local pos=() user="root" addr="" auth="ask" keyfile="" pw="" tmp="" key="" name host title port
+  while (( $# > 0 )); do
+    case "$1" in
+      --user|--addr|--key)
+        [[ $# -ge 2 ]] || die "после $1 нужно значение"
+        case "$1" in
+          --user) user="$2" ;;
+          --addr) addr="$2" ;;
+          --key)  auth="key-file"; keyfile="$2" ;;
+        esac
+        shift 2 ;;
+      --key-stdin)      auth="key-stdin"; shift ;;
+      --password-stdin) auth="password-stdin"; shift ;;
+      --key-installed)  auth="installed"; shift ;;
+      -*) die "неизвестный параметр $1" ;;
+      *)  pos+=("$1"); shift ;;
+    esac
+  done
+  name="${pos[0]:-}"; host="${pos[1]:-}"; title="${pos[2]:-}"; port="${pos[3]:-22}"
+  addr="${addr:-$host}"
+  [[ -n "$name" && -n "$host" ]] || die "используй: iof node add <имя> <хост> [подпись] [ssh_порт] [--user имя] [--key файл]"
   node_name_ok "$name" || die "имя: только латиница, цифры, точка, дефис, подчёркивание"
+  host_ok "$host" || die "хост '$host': нужен IPv4 или имя хоста (латиница, цифры, точка, дефис)"
+  host_ok "$addr" || die "адрес для клиентов '$addr': нужен IPv4 или имя хоста"
+  user_ok "$user" || die "пользователь '$user': строчная латиница, цифры, _ и -"
+  port_ok "$port" || die "ssh-порт '$port' вне 1-65535"
+  title_ok "$title" || die "подпись не может содержать | и перевод строки"
   N_NAME=()
   if nodes_present; then
     read_nodes
     if node_index "$name" >/dev/null; then die "узел '$name' уже есть"; fi
   fi
-  read -rsp "Пароль root для $ip: " pw
-  echo
-  [[ -n "$pw" ]] || die "пароль пустой"
-  IM_NAME=("$name"); IM_IP=("$ip"); IM_PASS=("$pw"); IM_TITLE=("${title:-$name}"); IM_PORT=("$port")
-  onboard_nodes || exit 1
+
+  case "$auth" in
+    installed) ;;
+    ask)
+      read -rsp "Пароль $user для $host: " pw
+      echo ;;
+    password-stdin)
+      IFS= read -r pw || true ;;
+    key-file|key-stdin)
+      mkdir -p "$BASE"
+      tmp="$(mktemp -d "$BASE/.key.XXXXXX")"
+      PM_DIRS+=("$tmp")
+      key="$tmp/key"
+      # Переводы строк Windows и отсутствие последнего перевода строки ssh не принимает
+      if [[ "$auth" == "key-file" ]]; then
+        [[ -r "$keyfile" ]] || die "нет файла ключа $keyfile"
+        (umask 077; printf '%s\n' "$(tr -d '\r' < "$keyfile")" > "$key")
+      else
+        (umask 077; printf '%s\n' "$(tr -d '\r')" > "$key")
+      fi
+      if grep -q 'PuTTY-User-Key-File' "$key"; then
+        die "это ключ PuTTY (.ppk). Сконвертируй в PuTTYgen: Conversions -> Export OpenSSH key"
+      fi
+      grep -q -- '-----BEGIN .*PRIVATE KEY-----' "$key" || die "нужен приватный ключ OpenSSH (-----BEGIN ... PRIVATE KEY-----), а не .pub"
+      ssh-keygen -y -P "" -f "$key" >/dev/null 2>&1 \
+        || die "ключ не читается: защищён паролем или повреждён. Снять пароль: ssh-keygen -p -f <ключ>" ;;
+  esac
+  # Дальше stdin не нужен: ssh в фоновых задачах не должен его читать
+  exec </dev/null
+  local mode="password"
+  if [[ -n "$key" ]]; then mode="key"; elif [[ "$auth" == "installed" ]]; then mode="installed"; fi
+  if [[ "$mode" == "password" && -z "$pw" ]]; then die "пароль пустой"; fi
+
+  IM_NAME=("$name"); IM_HOST=("$host"); IM_ADDR=("$addr"); IM_USER=("$user"); IM_MODE=("$mode")
+  IM_PASS=("$pw"); IM_KEY=("$key"); IM_TITLE=("${title:-$name}"); IM_PORT=("$((10#$port))")
+  local rc=0
+  onboard_nodes || rc=1
+  if [[ -n "$key" ]] && have shred; then shred -u "$key" 2>/dev/null || true; fi
+  (( rc == 0 )) || exit 1
   echo "Дальше: sudo iof hy2 install $name"
 }
 
@@ -2365,6 +2469,10 @@ Island of Freedom управление VPN-серверами // by meldevlp
 Узлы
   iof node import файл        добавить много серверов по паролям root (строки: имя | ip | пароль | подпись | ssh_порт)
   iof node add имя ip [подпись] [порт]   добавить один сервер, пароль спросит
+      --user mel                вход не под root (нужен sudo без пароля)
+      --key файл                вход SSH-ключом вместо пароля
+      --key-installed           ключ iof (/root/.ssh/iof_ed25519.pub) уже добавлен на сервер
+      --addr адрес              адрес для клиентов, если отличается от адреса SSH
   iof node list               список узлов
   iof node del имя            убрать узел из списка (сервер не трогает)
 

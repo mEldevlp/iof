@@ -1,27 +1,20 @@
 # iof (Island of Freedom)
 
-Управление группой VPN-серверов (Hysteria2, AmneziaWG 2.0) с одного управляющего сервера
-по SSH, плюс веб-панель `iof-web` для просмотра состояния и выдачи ссылок.
+Управление VPN-серверами (Hysteria2, AmneziaWG) с одного управляющего сервера по SSH
+и веб-панель к нему.
 
-- `iof.sh` — сам скрипт, ставится в `/usr/local/bin/iof`
-- `iof-nightly` — ночное обновление пакетов и перезагрузка всех узлов, ставится в
-  `/usr/local/sbin/iof-nightly`, запускается из cron root: `0 4 * * * /usr/local/sbin/iof-nightly`
-  (`sudo crontab -e`; `install.sh` расписание не трогает, только напоминает, если его нет)
-- `web/` — веб-панель (python3 без зависимостей), подробности в [web/README.md](web/README.md)
-- `install.sh` — установка и обновление обоих из этого репозитория
+## Установка
 
-## Установка на управляющий сервер (Ubuntu 24.04)
+На управляющем сервере (Ubuntu 24.04):
 
 ```
 sudo apt update && sudo apt install -y git python3 qrencode
-sudo cp /usr/local/bin/iof /root/iof.backup          # если iof уже стоит
 sudo git clone https://github.com/mEldevlp/iof /opt/iof
 sudo bash /opt/iof/install.sh
 sudo iof status
 ```
 
-Данные в `/root/iof` (узлы, ссылки, ключи) установка не трогает.
-`install.sh --no-web` ставит только `iof`, без панели.
+Ставятся `iof`, `iof-nightly` и веб-панель. Данные в `/root/iof` не трогаются.
 
 ## Обновление
 
@@ -29,21 +22,37 @@ sudo iof status
 sudo iof update
 ```
 
-Делает `git pull` в `/opt/iof`, показывает новые коммиты и запускает `install.sh`.
-Если `iof.sh` не проходит `bash -n`, рабочий `iof` остаётся как был.
-Папку клона можно поменять через `IOF_SRC` в `/root/iof/iof.env`.
-
-Откат на прошлую версию: `sudo git -C /opt/iof log --oneline`, затем
-`sudo git -C /opt/iof checkout <коммит> && sudo bash /opt/iof/install.sh`.
-Вернуться на свежую: `sudo git -C /opt/iof checkout master && sudo iof update`.
+Скачивает новую версию с GitHub и ставит её. Если в `iof.sh` ошибка, рабочий `iof` остаётся прежним.
 
 ## Веб-панель
 
-Слушает только `127.0.0.1:8088`. С компьютера:
+Открывается только через SSH-туннель. На компьютере:
 
 ```
 ssh -L 8088:127.0.0.1:8088 пользователь@сервер
 ```
 
-и открыть http://127.0.0.1:8088/ в браузере. Состояние: `systemctl status iof-web`,
-логи: `journalctl -u iof-web -n 50`.
+и в браузере http://127.0.0.1:8088/
+
+- **Обзор** — состояние всех серверов, как `iof status`.
+- **Hysteria2** — группы ссылок: скопировать для Hiddify, QR-коды.
+- **Добавить сервер** — новый сервер по паролю, SSH-ключу или уже добавленному ключу iof,
+  сразу с установкой Hysteria2. Работает через `iof node add`, лог виден на странице.
+
+## Ночное обслуживание
+
+`iof-nightly` обновляет пакеты и перезагружает все серверы. Включить (`sudo crontab -e`):
+
+```
+0 4 * * * /usr/local/sbin/iof-nightly
+```
+
+## Если что-то не так
+
+- Панель не открывается: `systemctl status iof-web`, `journalctl -u iof-web -n 50`.
+- Вернуть прошлую версию: `sudo git -C /opt/iof log --oneline`, затем
+  `sudo git -C /opt/iof checkout <коммит> && sudo bash /opt/iof/install.sh`.
+  Обратно на свежую: `sudo git -C /opt/iof checkout master && sudo iof update`.
+- Открыть панель без туннеля (за nginx с HTTPS): в `/root/iof/web.env` задать
+  `IOF_WEB_PASSWORD=...` и `IOF_WEB_HOSTS=домен`. Без пароля панель наружу не запустится:
+  через неё можно управлять всеми серверами.

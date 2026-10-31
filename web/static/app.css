@@ -64,6 +64,8 @@
 }
 
 * { box-sizing: border-box; }
+/* hidden должен скрывать и элементы, которым задан display */
+[hidden] { display: none !important; }
 html { -webkit-text-size-adjust: 100%; }
 body {
   margin: 0;
@@ -198,7 +200,7 @@ main {
 
 /* Таблица узлов */
 .table-wrap { overflow-x: auto; }
-table.nodes[hidden] { display: none !important; }
+
 table.nodes { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
 .nodes th {
   text-align: left; font-size: 12px; font-weight: 600; color: var(--ink-2);
@@ -315,7 +317,8 @@ img.qr { display: block; width: 100%; max-width: 240px; height: auto; margin: 0 
   border: 1px dashed var(--axis); border-radius: 8px; font-size: 12.5px; color: var(--ink-2); text-align: center;
 }
 .qr-placeholder code { font-size: 12px; }
-.hint { padding: 12px 16px 16px; font-size: 12.5px; color: var(--ink-2); }
+.hint { margin: 0; font-size: 12.5px; color: var(--ink-2); }
+.group-detail > .hint { padding: 12px 16px 16px; }
 
 .cmds { margin: 0; padding: 0 16px 14px; display: grid; grid-template-columns: max-content 1fr; gap: 8px 18px; font-size: 13px; }
 .cmds dt { margin: 0; }
@@ -330,6 +333,74 @@ img.qr { display: block; width: 100%; max-width: 240px; height: auto; margin: 0 
 .qr-dialog h2 { font-size: 14px; font-weight: 650; overflow-wrap: anywhere; }
 .qr-dialog img.qr { max-width: 280px; }
 .qr-dialog .hint { padding: 10px 0 0; text-align: center; }
+
+/* Страница «Добавить сервер» */
+.add-layout { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); gap: 16px; align-items: start; }
+.side { display: grid; gap: 16px; min-width: 0; }
+.form fieldset { border: 0; margin: 0; padding: 0 16px 16px; min-width: 0; }
+.form legend {
+  float: left; width: 100%; padding: 14px 0 10px; margin-bottom: 2px;
+  border-top: 1px solid var(--grid);
+  font-size: 12px; font-weight: 650; color: var(--ink-2); letter-spacing: 0.02em;
+}
+.form legend + * { clear: both; }
+.form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 14px; }
+.field { min-width: 0; }
+.field label { display: block; font-size: 12.5px; font-weight: 600; margin-bottom: 4px; }
+.field input, .field textarea {
+  width: 100%; height: 34px; padding: 0 10px;
+  border: 1px solid var(--ring); border-radius: 8px;
+  background: var(--page); color: var(--ink); font: inherit; font-size: 13.5px;
+}
+.field textarea { height: auto; padding: 8px 10px; font-family: var(--mono); font-size: 12px; resize: vertical; }
+.field input::placeholder, .field textarea::placeholder { color: var(--muted); }
+.field .hint { margin-top: 4px; font-size: 12px; }
+.field [aria-invalid="true"] { border-color: var(--crit); }
+.field-error { margin: 4px 0 0; font-size: 12px; color: var(--crit); font-weight: 550; }
+.input-row { display: flex; gap: 8px; align-items: center; margin-top: 0; }
+.input-row input { flex: 1; }
+.field textarea + .input-row { margin-top: 8px; align-items: flex-start; }
+.file-btn { cursor: pointer; flex: none; }
+.seg {
+  display: inline-flex; flex-wrap: wrap; gap: 2px; margin-top: 14px; padding: 3px;
+  border-radius: 9px; background: var(--surface-2); border: 1px solid var(--ring);
+}
+.seg label { cursor: pointer; }
+.seg input { position: absolute; opacity: 0; pointer-events: none; }
+.seg span { display: block; padding: 5px 12px; border-radius: 6px; font-size: 13px; font-weight: 550; color: var(--ink-2); }
+.seg input:checked + span { background: var(--surface); color: var(--ink); box-shadow: 0 0 0 1px var(--ring); }
+.seg input:focus-visible + span { outline: 2px solid var(--accent); outline-offset: 1px; }
+.auth-pane { margin-top: 12px; }
+.note-plain { margin: 12px 0 0; font-size: 12.5px; color: var(--ink-2); }
+.more { margin-top: 12px; }
+.more summary { cursor: pointer; font-size: 13px; font-weight: 550; color: var(--ink-2); margin-bottom: 8px; }
+.form-error {
+  display: flex; gap: 8px; align-items: flex-start; margin: 0 16px 12px; padding: 9px 12px;
+  border-radius: 8px; font-size: 13px; background: var(--crit-bg);
+  border: 1px solid color-mix(in srgb, var(--crit) 35%, transparent);
+}
+.form-error .ico { margin-top: 2px; }
+.form-actions { display: flex; justify-content: flex-end; padding: 0 16px 16px; }
+pre.code {
+  margin: 8px 0; padding: 10px 12px; border-radius: 8px; background: var(--surface-2);
+  font-family: var(--mono); font-size: 11.5px; white-space: pre-wrap; word-break: break-all;
+}
+pre.log {
+  margin: 0 16px 16px; padding: 10px 12px; min-height: 80px; max-height: 380px; overflow: auto;
+  border: 1px solid var(--grid); border-radius: 8px; background: var(--page);
+  font-family: var(--mono); font-size: 12px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere;
+}
+.note.good { background: var(--good-bg); border: 1px solid color-mix(in srgb, var(--good) 30%, transparent); }
+.note.crit { background: var(--crit-bg); border: 1px solid color-mix(in srgb, var(--crit) 35%, transparent); }
+.note a { color: var(--accent); }
+.steps { margin: 0; padding: 0 16px 10px 36px; font-size: 13px; }
+.steps li { margin: 3px 0; }
+.pad { padding: 0 16px 14px; }
+.pad .chips { margin-top: 4px; }
+.spinner {
+  width: 12px; height: 12px; border-radius: 50%; flex: none;
+  border: 2px solid var(--grid); border-top-color: var(--accent); animation: spin 0.8s linear infinite;
+}
 
 .toast {
   position: fixed; left: 50%; bottom: 24px; z-index: 20;
@@ -348,7 +419,7 @@ img.qr { display: block; width: 100%; max-width: 240px; height: auto; margin: 0 
   .grid3 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 @media (max-width: 960px) {
-  .hy2-layout { grid-template-columns: minmax(0, 1fr); }
+  .hy2-layout, .add-layout { grid-template-columns: minmax(0, 1fr); }
   .group-body { grid-template-columns: minmax(0, 1fr); }
   .qr-all { width: auto; max-width: 260px; margin: 0 auto 4px; }
   .nodes thead { display: none; }
@@ -390,5 +461,8 @@ img.qr { display: block; width: 100%; max-width: 240px; height: auto; margin: 0 
   .link-actions { width: 100%; }
   .link-actions .btn { flex: 1; justify-content: center; }
   .cmds { grid-template-columns: minmax(0, 1fr); gap: 2px; }
+  .form-grid { grid-template-columns: minmax(0, 1fr); }
+  .seg { display: flex; }
+  .seg label { flex: 1; text-align: center; }
   .cmds dd { margin-bottom: 8px; }
 }

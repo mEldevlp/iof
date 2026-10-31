@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Добавить сервер · Island of Freedom</title>
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="app.css">
+  <script src="common.js" defer></script>
+  <script src="add.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <svg class="logo" viewBox="0 0 32 32" aria-hidden="true">
+        <circle cx="16" cy="16" r="15" fill="var(--accent)"/>
+        <path d="M5 21c3-1.6 5.4-1.6 8 0s5.4 1.6 8 0 5.2-1.6 6 0" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round"/>
+        <path d="M11 17.5c1-4.5 3-7.5 6-8.5M17 9c-1.6 2.6-1.4 5.5 0 8.6M17 9c2.4.2 4.6 1.4 5.5 3.6M17 9c-2.6-.6-5 0-6.3 1.6" fill="none" stroke="#fff" stroke-width="1.8" stroke-linecap="round"/>
+      </svg>
+      <div>
+        <h1>Island of Freedom</h1>
+        <p>VPN-узлы: Hysteria2 и AmneziaWG</p>
+      </div>
+    </div>
+    <nav class="nav" aria-label="Разделы">
+      <a href="./">Обзор</a>
+      <a href="hy2.html">Hysteria2</a>
+      <a href="add.html" aria-current="page">Добавить сервер</a>
+    </nav>
+  </header>
+
+  <main>
+    <div id="alert" class="alert" role="alert" hidden></div>
+
+    <div class="add-layout">
+      <form id="form" class="card form" novalidate autocomplete="off">
+        <div class="card-head"><h2>Новый сервер</h2></div>
+
+        <fieldset>
+          <legend>Сервер</legend>
+          <div class="form-grid">
+            <div class="field">
+              <label for="f-host">Хост</label>
+              <input id="f-host" name="host" required placeholder="203.0.113.44" spellcheck="false">
+              <p class="hint">IPv4 или домен, по которому iof заходит по SSH</p>
+            </div>
+            <div class="field field-narrow">
+              <label for="f-port">SSH-порт</label>
+              <input id="f-port" name="port" inputmode="numeric" value="22">
+            </div>
+            <div class="field">
+              <label for="f-name">Имя узла</label>
+              <input id="f-name" name="name" required placeholder="node-4" spellcheck="false">
+              <p class="hint">Для команд iof: латиница, цифры, точка, дефис, подчёркивание</p>
+            </div>
+            <div class="field">
+              <label for="f-title">Подпись в клиенте</label>
+              <input id="f-title" name="title" placeholder="Node 4">
+              <p class="hint">В Hiddify и Amnezia: «Hysteria | Node 4». Пусто — как имя</p>
+            </div>
+          </div>
+        </fieldset>
+
+        <fieldset>
+          <legend>Вход</legend>
+          <div class="form-grid">
+            <div class="field">
+              <label for="f-user">Пользователь</label>
+              <input id="f-user" name="user" value="root" spellcheck="false">
+              <p class="hint">Не root — нужен sudo без пароля (NOPASSWD)</p>
+            </div>
+          </div>
+          <div class="seg" role="radiogroup" aria-label="Способ входа">
+            <label><input type="radio" name="auth" value="password" checked><span>Пароль</span></label>
+            <label><input type="radio" name="auth" value="key"><span>SSH-ключ</span></label>
+            <label><input type="radio" name="auth" value="installed"><span>Ключ iof уже добавлен</span></label>
+          </div>
+
+          <div class="auth-pane" data-auth="password">
+            <div class="field">
+              <label for="f-password">Пароль пользователя</label>
+              <div class="input-row">
+                <input id="f-password" type="password" autocomplete="new-password" spellcheck="false">
+                <button id="toggle-pass" class="btn small" type="button">Показать</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="auth-pane" data-auth="key" hidden>
+            <div class="field">
+              <label for="f-key">Приватный ключ OpenSSH</label>
+              <textarea id="f-key" rows="6" spellcheck="false" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----&#10;...&#10;-----END OPENSSH PRIVATE KEY-----"></textarea>
+              <div class="input-row">
+                <label class="btn small file-btn">Загрузить из файла<input id="f-keyfile" type="file" class="sr-only"></label>
+                <p class="hint">Ключ без пароля. Ключ PuTTY (.ppk) сначала экспортируй: PuTTYgen → Conversions → Export OpenSSH key</p>
+              </div>
+            </div>
+          </div>
+
+          <div class="auth-pane" data-auth="installed" hidden>
+            <p class="hint">Добавь на новом сервере публичный ключ iof в <code>~/.ssh/authorized_keys</code> пользователя, например так:</p>
+            <pre id="pubkey-cmd" class="code"></pre>
+            <button id="copy-pubkey" class="btn small" type="button">Скопировать команду</button>
+          </div>
+
+          <p id="secret-note" class="note-plain">Пароль и ключ нужны один раз: iof входит с ними и кладёт на сервер свой ключ.
+            Панель их не сохраняет ни в браузере, ни на диске.</p>
+        </fieldset>
+
+        <fieldset>
+          <legend>После добавления</legend>
+          <label class="check"><input id="f-hy2" type="checkbox" checked> Сразу установить Hysteria2 и добавить узел в группы ссылок</label>
+          <p id="hy2-hint" class="hint">Конфиг по образцу этого сервера, как <code>iof hy2 install</code></p>
+          <details class="more">
+            <summary>Дополнительно</summary>
+            <div class="field">
+              <label for="f-addr">Адрес для клиентов</label>
+              <input id="f-addr" name="addr" placeholder="как хост" spellcheck="false">
+              <p class="hint">Если клиенты подключаются не по тому адресу, по которому iof заходит по SSH</p>
+            </div>
+          </details>
+        </fieldset>
+
+        <div id="form-error" class="form-error" role="alert" hidden></div>
+        <div class="form-actions">
+          <button id="submit" class="btn primary" type="submit">Добавить сервер</button>
+        </div>
+      </form>
+
+      <div class="side">
+        <section id="job" class="card" hidden>
+          <div class="card-head">
+            <h2 id="job-title">Выполнение</h2>
+            <span id="job-state"></span>
+          </div>
+          <div id="job-result"></div>
+          <pre id="job-log" class="log" aria-live="polite"></pre>
+        </section>
+
+        <section class="card">
+          <div class="card-head"><h2>Что произойдёт</h2></div>
+          <ol class="steps">
+            <li>iof зайдёт на сервер с паролем или ключом и положит туда свой ключ</li>
+            <li>проверит вход своим ключом (и sudo, если пользователь не root)</li>
+            <li>допишет сервер в <code>/root/iof/nodes.conf</code></li>
+            <li>если отмечено, поставит Hysteria2 и добавит узел во все группы ссылок</li>
+          </ol>
+          <p class="hint pad">AmneziaWG ставится приложением Amnezia VPN. После этого
+            <code>sudo iof awg add "Имя"</code> создаст клиентов и на новом узле.</p>
+          <div class="pad">
+            <div class="hint">Уже в nodes.conf:</div>
+            <div id="known" class="chips"></div>
+          </div>
+        </section>
+      </div>
+    </div>
+  </main>
+
+  <footer class="foot">iof-web · добавление идёт командой <code>iof node add</code>, лог виден целиком</footer>
+</body>
+</html>

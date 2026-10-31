@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """iof-web: веб-панель для iof (Island of Freedom).
 
-Работает на управляющем сервере от root, только читает: состояние узлов берёт из
-`iof api status`, списки ретрансляторов, групп Hysteria2 и клиентов AWG читает из
-/root/iof напрямую. Ссылки Hysteria2 (в них пароль) отдаёт на странице hy2,
-ключи и конфиги AWG не отдаёт.
+Работает на управляющем сервере от root. Состояние узлов берёт из `iof api status`,
+списки ретрансляторов, групп Hysteria2 и клиентов AWG читает из /root/iof напрямую.
+Ссылки Hysteria2 (в них пароль) отдаёт на странице hy2, ключи и конфиги AWG не отдаёт.
+Меняет что-то только через команды iof (добавление сервера: iof node add, iof hy2 install),
+по одной задаче за раз, с логом выполнения.
 
 Без зависимостей, нужен только python3. По умолчанию слушает 127.0.0.1:8088,
 снаружи заходить через SSH-туннель:  ssh -L 8088:127.0.0.1:8088 admin@сервер
@@ -21,6 +22,8 @@ import ipaddress
 import json
 import os
 import re
+import secrets
+import shlex
 import shutil
 import subprocess
 import sys
@@ -42,6 +45,8 @@ STATIC_FILES = {
     "/demo.js": ("demo.js", "text/javascript; charset=utf-8"),
     "/dashboard.js": ("dashboard.js", "text/javascript; charset=utf-8"),
     "/hy2.js": ("hy2.js", "text/javascript; charset=utf-8"),
+    "/add.html": ("add.html", "text/html; charset=utf-8"),
+    "/add.js": ("add.js", "text/javascript; charset=utf-8"),
     "/app.css": ("app.css", "text/css; charset=utf-8"),
     "/favicon.svg": ("favicon.svg", "image/svg+xml"),
 }
@@ -149,6 +154,10 @@ class StatusCache:
                 return dict(self.data, cached=True)
             self.data = self.probe()
             return dict(self.data, cached=False)
+
+    def invalidate(self):
+        with self.lock:
+            self.data = None
 
     def probe(self):
         t0 = time.time()
@@ -296,14 +305,173 @@ def read_awg_clients(base):
     return clients
 
 
+# Задачи: команды iof, которые что-то меняют. Одна за раз, лог хранится в памяти
+
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+class Jobs:
+    KEEP = 10      # сколько последних задач помнить
+    MAX_LOG = 600  # строк лога на задачу
+    TIMEOUT = 900  # секунд на один шаг
+
+    def __init__(self, on_done):
+        self.on_done = on_done
+        self.lock = threading.Lock()
+        self.items = []
+        self.running = False
+
+    def busy(self):
+        with self.lock:
+            return self.running
+
+    def list(self):
+        with self.lock:
+            return [dict(j, log=list(j["log"])) for j in reversed(self.items)]
+
+    def start(self, title, steps):
+        """steps: [(подпись для лога, argv, stdin bytes или None)]. None, если занято."""
+        with self.lock:
+            if self.running:
+                return None
+            self.running = True
+            job = {"id": secrets.token_hex(6), "title": title, "state": "running",
+                   "started": time.time(), "finished": None, "log": []}
+            self.items = (self.items + [job])[-self.KEEP:]
+        threading.Thread(target=self.run, args=(job, steps), daemon=True).start()
+        return job
+
+    def say(self, job, line):
+        with self.lock:
+            job["log"].append(line)
+            del job["log"][:-self.MAX_LOG]
+
+    def run(self, job, steps):
+        env = dict(os.environ, LC_ALL="C.UTF-8", LANG="C.UTF-8")
+        state = "ok"
+        try:
+            for label, argv, stdin in steps:
+                self.say(job, f"$ {label}")
+                p = subprocess.Popen(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                     stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL)
+                timer = threading.Timer(self.TIMEOUT, p.kill)
+                timer.start()
+                try:
+                    if stdin is not None:
+                        try:
+                            p.stdin.write(stdin)
+                            p.stdin.close()
+                        except BrokenPipeError:
+                            pass
+                    for raw in p.stdout:
+                        line = ANSI.sub("", raw.decode("utf-8", "replace")).rstrip("\n").split("\r")[-1]
+                        if line.strip():
+                            self.say(job, line)
+                        # hy2 install завершается с кодом 0, даже если на узле не получилось
+                        if line.startswith("Ошибки ("):
+                            state = "warn"
+                    rc = p.wait()
+                finally:
+                    timer.cancel()
+                if rc != 0:
+                    self.say(job, f"Команда завершилась с кодом {rc}")
+                    state = "error"
+                    break
+        except OSError as e:
+            self.say(job, f"Не удалось запустить: {e}")
+            state = "error"
+        finally:
+            with self.lock:
+                job["state"] = state
+                job["finished"] = time.time()
+                self.running = False
+            self.on_done()
+
+
+# Проверки полей нового сервера, те же, что делает iof node add, чтобы ошибки было видно
+# сразу в форме. iof всё равно проверяет их ещё раз сам
+NODE_NAME = re.compile(r"^[A-Za-z0-9._-]{1,40}$")
+NODE_HOST = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
+NODE_USER = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
+
+
+def node_add_steps(iof, body, existing):
+    """Поля формы -> (заголовок задачи, шаги для Jobs). ValueError с текстом для формы."""
+    def text(key, limit):
+        v = body.get(key, "")
+        if not isinstance(v, str):
+            raise ValueError(f"поле {key}: нужна строка")
+        v = v.strip()
+        if len(v) > limit:
+            raise ValueError(f"поле {key}: слишком длинное")
+        return v
+
+    name, host, addr = text("name", 40), text("host", 253), text("addr", 253)
+    title, user, auth = text("title", 64), text("user", 32) or "root", text("auth", 16)
+    if not NODE_NAME.match(name):
+        raise ValueError("имя узла: латиница, цифры, точка, дефис, подчёркивание")
+    if name in existing:
+        raise ValueError(f"узел {name} уже есть в nodes.conf")
+    if not NODE_HOST.match(host):
+        raise ValueError("хост: IPv4 или имя хоста (латиница, цифры, точка, дефис)")
+    if addr and not NODE_HOST.match(addr):
+        raise ValueError("адрес для клиентов: IPv4 или имя хоста")
+    if "|" in title:
+        raise ValueError("подпись не может содержать |")
+    if not NODE_USER.match(user):
+        raise ValueError("пользователь: строчная латиница, цифры, _ и -")
+    try:
+        port = int(body.get("port") or 22)
+    except (TypeError, ValueError):
+        port = 0
+    if not 1 <= port <= 65535:
+        raise ValueError("SSH-порт: число от 1 до 65535")
+
+    argv = [iof, "node", "add", name, host, title, str(port), "--user", user, "--addr", addr or host]
+    stdin = None
+    if auth == "password":
+        password = body.get("password", "")
+        if not isinstance(password, str) or not password or len(password) > 1024 or "\n" in password:
+            raise ValueError("пароль: обязателен, одной строкой")
+        argv.append("--password-stdin")
+        stdin = (password + "\n").encode("utf-8")
+    elif auth == "key":
+        key = body.get("key", "")
+        if (not isinstance(key, str) or len(key) > 16384
+                or ("PRIVATE KEY" not in key and "PuTTY" not in key)):
+            raise ValueError("ключ: вставь приватный ключ OpenSSH целиком (-----BEGIN ... PRIVATE KEY-----)")
+        argv.append("--key-stdin")
+        stdin = key.encode("utf-8")
+    elif auth == "installed":
+        argv.append("--key-installed")
+    else:
+        raise ValueError("способ входа: пароль, ключ или ключ iof уже добавлен")
+
+    # В лог идёт команда без пароля и ключа: они уходят в iof через stdin
+    steps = [(shlex.join(["iof", *argv[1:]]), argv, stdin)]
+    if body.get("install_hy2"):
+        steps.append((f"iof hy2 install {name}", [iof, "hy2", "install", name], None))
+    return f"Добавление сервера {name} ({host})", steps
+
+
 # HTTP
+
+def host_only(value):
+    """Имя хоста из заголовка Host или Origin без схемы и порта, в нижнем регистре."""
+    h = (value or "").strip().lower()
+    if "://" in h:
+        h = urlsplit(h).netloc
+    if h.startswith("["):
+        return h[1:h.find("]")] if "]" in h else ""
+    return h.rsplit(":", 1)[0] if ":" in h else h
+
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "iof-web"
     sys_version = ""
 
     def do_GET(self):
-        if not self.authorized():
+        if not self.host_allowed() or not self.authorized():
             return
         url = urlsplit(self.path)
         query = {k: v[0] for k, v in parse_qs(url.query).items()}
@@ -314,9 +482,83 @@ class Handler(BaseHTTPRequestHandler):
             return self.hy2(force)
         if url.path == "/api/hy2/qr":
             return self.hy2_qr(query.get("g", ""), query.get("i", ""))
+        if url.path == "/api/nodes/add-info":
+            return self.add_info()
+        if url.path == "/api/jobs":
+            return self.send_json({"jobs": self.server.jobs.list()})
         if url.path in STATIC_FILES:
             return self.static(*STATIC_FILES[url.path])
         self.send_json({"error": "не найдено"}, HTTPStatus.NOT_FOUND)
+
+    def do_POST(self):
+        if not self.host_allowed() or not self.authorized() or not self.same_origin():
+            return
+        if urlsplit(self.path).path != "/api/nodes":
+            return self.send_json({"error": "не найдено"}, HTTPStatus.NOT_FOUND)
+        body = self.read_json()
+        if body is None:
+            return
+        try:
+            title, steps = node_add_steps(self.server.iof, body, self.node_names())
+        except ValueError as e:
+            return self.send_json({"error": str(e)}, HTTPStatus.BAD_REQUEST)
+        if body.get("install_hy2") and not self.server.hy2_template.is_file():
+            return self.send_json({"error": f"нет шаблона {self.server.hy2_template} для установки Hysteria2"},
+                                  HTTPStatus.BAD_REQUEST)
+        job = self.server.jobs.start(title, steps)
+        if job is None:
+            return self.send_json({"error": "уже идёт другая задача, дождись её окончания"}, HTTPStatus.CONFLICT)
+        self.send_json({"job": job["id"]}, HTTPStatus.ACCEPTED)
+
+    # Защита от DNS rebinding: чужой домен, указывающий на 127.0.0.1, не получит ответ панели
+    def host_allowed(self):
+        if host_only(self.headers.get("Host")) in self.server.hosts:
+            return True
+        self.send_json({"error": "неизвестный Host, см. IOF_WEB_HOSTS"}, HTTPStatus.FORBIDDEN)
+        return False
+
+    # Защита от CSRF: менять что-то можно только со страниц самой панели. Свой заголовок
+    # браузер не даст отправить с чужого сайта без preflight, а на него сервер не отвечает
+    def same_origin(self):
+        origin = self.headers.get("Origin")
+        ok = (self.headers.get("X-IOF-Request") == "1"
+              and self.headers.get("Content-Type", "").startswith("application/json")
+              and (origin is None or host_only(origin) in self.server.hosts))
+        if not ok:
+            self.send_json({"error": "запрос не со страницы панели"}, HTTPStatus.FORBIDDEN)
+        return ok
+
+    def read_json(self):
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = -1
+        if not 0 < length <= 65536:
+            self.send_json({"error": "пустой или слишком большой запрос"}, HTTPStatus.BAD_REQUEST)
+            return None
+        try:
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            body = None
+        if not isinstance(body, dict):
+            self.send_json({"error": "нужен JSON-объект"}, HTTPStatus.BAD_REQUEST)
+            return None
+        return body
+
+    def node_names(self):
+        return {r[0] for r in read_conf(self.server.base / "nodes.conf", 4)}
+
+    def add_info(self):
+        try:
+            pubkey = self.server.ssh_pub.read_text(encoding="utf-8").strip()
+        except OSError:
+            pubkey = ""
+        self.send_json({
+            "nodes": sorted(self.node_names()),
+            "pubkey": pubkey,
+            "hy2_template": self.server.hy2_template.is_file(),
+            "busy": self.server.jobs.busy(),
+        })
 
     def authorized(self):
         password = self.server.password
@@ -421,11 +663,21 @@ def main():
         sys.exit(f"Отказываюсь слушать {host} без пароля: задай IOF_WEB_PASSWORD "
                  "или оставь 127.0.0.1 и заходи через SSH-туннель")
 
+    # Имена, по которым панель открывают в браузере. Через SSH-туннель это 127.0.0.1 или
+    # localhost; за nginx с доменом добавь домен в IOF_WEB_HOSTS (через запятую)
+    hosts = {"127.0.0.1", "localhost", "::1", host.lower()}
+    hosts |= {host_only(h) for h in os.environ.get("IOF_WEB_HOSTS", "").split(",") if h.strip()}
+
     srv = ThreadingHTTPServer((host, int(port)), Handler)
     srv.daemon_threads = True
     srv.base = Path(args.base)
+    srv.iof = args.iof
     srv.password = password
+    srv.hosts = hosts
+    srv.ssh_pub = Path(os.environ.get("IOF_SSH_KEY", "/root/.ssh/iof_ed25519") + ".pub")
+    srv.hy2_template = Path(os.environ.get("HY2_TEMPLATE", "/etc/hysteria/config.yaml"))
     srv.cache = StatusCache(args.iof, args.ttl)
+    srv.jobs = Jobs(on_done=srv.cache.invalidate)
     print(f"iof-web: http://{args.listen}/", file=sys.stderr)
     try:
         srv.serve_forever()
