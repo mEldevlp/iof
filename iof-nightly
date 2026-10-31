@@ -1,0 +1,26 @@
+#!/bin/bash
+# Ночное обслуживание всех узлов iof: обновление пакетов и перезагрузка.
+# На каждом узле работа запускается отдельным systemd-юнитом, поэтому она не зависит
+# от SSH-сессии и не прервётся, когда управляющий сервер сам уйдёт в перезагрузку.
+
+JOB='export DEBIAN_FRONTEND=noninteractive
+{
+  # Управляющий сервер (там, где стоит iof) ждёт, пока задание разойдётся по остальным узлам
+  if [ -x /usr/local/bin/iof ]; then
+    echo "== $(date "+%F %T") управляющий сервер, жду 5 минут"
+    sleep 300
+  fi
+  echo "== $(date "+%F %T") обновление"
+  apt-get -o DPkg::Lock::Timeout=600 update
+  timeout 1800 apt-get -o DPkg::Lock::Timeout=600 -o Dpkg::Options::=--force-confold -y upgrade
+  echo "== $(date "+%F %T") перезагрузка"
+} >> /var/log/iof-nightly.log 2>&1
+/usr/sbin/shutdown -r now'
+
+# base64, чтобы не возиться с кавычками при передаче через iof exec и ssh
+B64="$(printf '%s' "$JOB" | base64 -w0)"
+
+{
+  echo "== $(date '+%F %T')"
+  /usr/local/bin/iof exec "systemd-run --unit=iof-nightly --collect /bin/bash -c 'echo $B64 | base64 -d | bash'"
+} >> /var/log/iof-nightly-run.log 2>&1

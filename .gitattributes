@@ -1,0 +1,3 @@
+# Скрипты запускаются на Linux: всегда LF, даже при checkout на Windows
+* text=auto eol=lf
+*.pdf binary
