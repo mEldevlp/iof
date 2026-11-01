@@ -44,7 +44,7 @@ function demoNodes() {
   const jitter = (v, d) => Math.max(0, Math.round(v + (Math.random() - 0.5) * d));
   const node = (name, addr, title, o) => ({
     name, addr, title, reachable: true, issues: [], ok: true,
-    ms: jitter(o.ms, 200), uptime_s: o.up,
+    ms: jitter(o.ms, Math.min(200, o.ms)), uptime_s: o.up,
     hy2: { installed: true, state: "active", udp: true, port: "443", auth: "password", users: 0, version: "v2.13.0", ...o.hy2 },
     awg: { state: "running", port: o.awgPort, peers: o.peers, online: jitter(o.online, 2), ...o.awg },
     cpu: { pct: o.cpu, load1: (o.cpu / 100 * o.cpus).toFixed(2), cpus: o.cpus },

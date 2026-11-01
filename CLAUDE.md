@@ -32,6 +32,7 @@ Docker Desktop там не запускается: Kaspersky Standard не да�
 | `web/iof-web.service` | systemd-юнит панели | `/etc/systemd/system/iof-web.service` |
 | `web/static/*` | страницы панели: html, js, css | `/opt/iof-web/static/` |
 | `web/design.md` | цвета, шрифты, размеры, брейкпоинты и классы панели | не ставится |
+| `docs/panel-*.png` | скриншоты панели для README, сняты в демо-режиме (см. «Проверка изменений») | не ставится |
 | `README.md` | инструкция для пользователя | — |
 | `stand/` | тестовый стенд на Docker: `Dockerfile` (Ubuntu 24.04 с systemd и SSH), `compose.yml` (old, node1, node2, new), `stand.sh`, `hy2-template.yaml` | не ставится; попадает в `/opt/iof` как часть клона |
 
@@ -218,6 +219,15 @@ for f in web/static/*.js; do node --check "$f"; done
 демо-режиме (`index.html?demo` и другие страницы). Встроенный браузер не открывает `file://`,
 поэтому `web/static` надо раздать любым статическим сервером на Node; удобно отдавать ту же CSP,
 что у `iof-web`, тогда сразу видны inline-стили.
+
+Скриншоты для README (`docs/panel-overview.png` светлый, `docs/panel-node.png` тёмный) снимаются
+Chrome без окна с демо-страниц, раздаваемых статическим сервером. Окно 1360×860 (так таблица узлов
+ещё не превращается в карточки), масштаб 1.5. Тему задаёт `--blink-settings=preferredColorScheme=1`
+(светлая) или `--force-dark-mode` (тёмная), а `--virtual-time-budget` даёт демо-данным загрузиться:
+
+```bash
+chrome --headless=new --hide-scrollbars --window-size=1360,860 --force-device-scale-factor=1.5 --virtual-time-budget=5000 --blink-settings=preferredColorScheme=1 --screenshot=docs/panel-overview.png "http://localhost:8099/index.html?demo"
+```
 
 **Тестовый стенд** (`stand/`, Docker Engine в WSL Ubuntu-24.04) — для проверки по-настоящему:
 четыре «сервера» Ubuntu 24.04 с systemd и SSH в сети 172.30.0.0/24, пароль root `stand`.
