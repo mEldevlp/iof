@@ -126,7 +126,6 @@ async function submit(e) {
 }
 
 document.addEventListener("DOMContentLoaded", () => {
-  keepDemoInLinks();
   initLoginForm();
   $("#f-host").addEventListener("input", () => {
     if (!add.nameTouched) $("#f-name").value = suggestName($("#f-host").value.trim());

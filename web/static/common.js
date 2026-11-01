@@ -1,7 +1,8 @@
 "use strict";
 
-// Общее для страниц iof-web: форматирование, иконки, загрузка данных и автообновление.
-// С параметром ?demo страницы работают на встроенных примерах (demo.js), без сервера.
+// Общее для страниц iof-web: каркас с боковым меню, форматирование, иконки, загрузка данных
+// и автообновление. С параметром ?demo страницы работают на встроенных примерах (demo.js), без сервера.
+// Подключается в <head> без defer, чтобы выбранная тема применилась до первой отрисовки
 
 const DEMO = new URLSearchParams(location.search).has("demo");
 const $ = (sel) => document.querySelector(sel);
@@ -15,6 +16,60 @@ const prefs = {
     try { localStorage.setItem("iof-web." + key, value); } catch { /* приватный режим */ }
   },
 };
+
+// Тема: auto (как в системе), light или dark. Цвета обеих тем в app.css
+function applyTheme(theme) {
+  if (theme === "light" || theme === "dark") document.documentElement.dataset.theme = theme;
+  else delete document.documentElement.dataset.theme;
+}
+applyTheme(prefs.get("theme", "auto"));
+
+
+// Каркас страницы: боковое меню, переключатель темы, на узком экране меню по кнопке
+
+function initTheme() {
+  const buttons = document.querySelectorAll("[data-set-theme]");
+  const mark = (theme) => buttons.forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.setTheme === theme)));
+  mark(prefs.get("theme", "auto"));
+  buttons.forEach((b) => b.addEventListener("click", () => {
+    prefs.set("theme", b.dataset.setTheme);
+    applyTheme(b.dataset.setTheme);
+    mark(b.dataset.setTheme);
+  }));
+}
+
+// Меню выезжает слева, закрывается по фону, Escape и переходу по ссылке
+function initDrawer() {
+  const btn = $("#menu-btn");
+  if (!btn) return;
+  const scrim = document.createElement("div");
+  scrim.className = "scrim";
+  document.body.appendChild(scrim);
+  const isOpen = () => document.body.classList.contains("nav-open");
+  const toggle = (open) => {
+    document.body.classList.toggle("nav-open", open);
+    btn.setAttribute("aria-expanded", String(open));
+    if (open) $("#sidebar .nav a").focus();
+  };
+  btn.addEventListener("click", () => toggle(!isOpen()));
+  scrim.addEventListener("click", () => toggle(false));
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && isOpen()) { toggle(false); btn.focus(); }
+  });
+}
+
+// Демо-режим сохраняется при переходе между страницами
+function keepDemoInLinks() {
+  if (!DEMO) return;
+  document.querySelectorAll(".sidebar a").forEach((a) => { a.href += "?demo"; });
+  $("#demo-chip").hidden = false;
+}
+
+document.addEventListener("DOMContentLoaded", () => {
+  keepDemoInLinks();
+  initTheme();
+  initDrawer();
+});
 
 
 // Форматирование
@@ -131,13 +186,12 @@ function toast(text) {
   toastTimer = setTimeout(() => el.classList.remove("show"), 2200);
 }
 
-// Демо-режим сохраняется при переходе между страницами
-function keepDemoInLinks() {
-  if (DEMO) document.querySelectorAll(".nav a").forEach((a) => { a.href += "?demo"; });
-}
-
-// Плашка о незавершённом переносе управляющего сервера (поле migrate в ответах панели)
+// Плашка и отметка в меню о незавершённом переносе управляющего сервера (поле migrate в ответах панели).
+// На самой странице «Перенос» плашки нет
 function renderMigrate(m) {
+  const badge = $("#nav-migrate");
+  badge.hidden = !m;
+  badge.textContent = m ? (m.role === "source" ? "идёт" : "завершить") : "";
   const el = $("#migrate-banner");
   if (!el) return;
   el.hidden = !m;
@@ -362,8 +416,6 @@ function startPage(page) {
   }
 
   document.addEventListener("DOMContentLoaded", () => {
-    keepDemoInLinks();
-
     $("#auto").value = prefs.get("auto", "60");
     $("#refresh").addEventListener("click", () => load(true));
     $("#auto").addEventListener("change", () => { prefs.set("auto", $("#auto").value); schedule(); });

@@ -6,102 +6,139 @@
   <title>Island of Freedom</title>
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="app.css">
-  <script src="common.js" defer></script>
+  <script src="common.js"></script>
   <script src="demo.js" defer></script>
   <script src="dashboard.js" defer></script>
 </head>
 <body>
-  <header class="topbar">
-    <div class="brand">
-      <svg class="logo" viewBox="0 0 32 32" aria-hidden="true">
-        <circle cx="16" cy="16" r="15" fill="var(--accent)"/>
-        <path d="M5 21c3-1.6 5.4-1.6 8 0s5.4 1.6 8 0 5.2-1.6 6 0" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round"/>
-        <path d="M11 17.5c1-4.5 3-7.5 6-8.5M17 9c-1.6 2.6-1.4 5.5 0 8.6M17 9c2.4.2 4.6 1.4 5.5 3.6M17 9c-2.6-.6-5 0-6.3 1.6" fill="none" stroke="#fff" stroke-width="1.8" stroke-linecap="round"/>
-      </svg>
-      <div>
-        <h1>Island of Freedom</h1>
-        <p>VPN-узлы: Hysteria2 и AmneziaWG</p>
-      </div>
-    </div>
-    <nav class="nav" aria-label="Разделы">
-      <a href="./" aria-current="page">Обзор</a>
-      <a href="hy2.html">Hysteria2</a>
-      <a href="add.html">Добавить сервер</a>
-      <a href="migrate.html">Перенос</a>
-    </nav>
-    <div class="controls">
-      <span id="stamp" class="stamp" aria-live="polite">Загрузка…</span>
-      <label class="select">
-        <span class="sr-only">Автообновление</span>
-        <select id="auto">
-          <option value="0">Автообновление выкл.</option>
-          <option value="30">Каждые 30 с</option>
-          <option value="60">Каждую минуту</option>
-          <option value="300">Каждые 5 мин</option>
-        </select>
-      </label>
-      <button id="refresh" class="btn" type="button">
-        <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9M13.5 2.5v3h-3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
-        <span>Обновить</span>
-      </button>
-    </div>
-  </header>
-
-  <main>
-    <div id="alert" class="alert" role="alert" hidden></div>
-    <div id="migrate-banner" class="note warn banner" role="status" hidden></div>
-
-    <section id="health" class="health" aria-live="polite"></section>
-
-    <section id="kpis" class="kpis" aria-label="Сводка"></section>
-
-    <section class="card">
-      <div class="card-head">
-        <h2>Узлы <span id="nodes-count" class="count"></span></h2>
-        <div class="filters">
-          <input id="q" type="search" placeholder="Поиск: имя, подпись, адрес" aria-label="Поиск узлов">
-          <label class="check"><input id="onlybad" type="checkbox"> только с проблемами</label>
+  <div class="shell">
+    <aside id="sidebar" class="sidebar">
+      <a class="brand" href="./">
+        <svg class="logo" viewBox="0 0 32 32" aria-hidden="true">
+          <circle cx="16" cy="16" r="15" fill="var(--accent)"/>
+          <path d="M5 21c3-1.6 5.4-1.6 8 0s5.4 1.6 8 0 5.2-1.6 6 0" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round"/>
+          <path d="M11 17.5c1-4.5 3-7.5 6-8.5M17 9c-1.6 2.6-1.4 5.5 0 8.6M17 9c2.4.2 4.6 1.4 5.5 3.6M17 9c-2.6-.6-5 0-6.3 1.6" fill="none" stroke="#fff" stroke-width="1.8" stroke-linecap="round"/>
+        </svg>
+        <span><b>Island of Freedom</b><small>VPN-узлы: Hysteria2 и AWG</small></span>
+      </a>
+      <nav class="nav" aria-label="Разделы">
+        <p class="nav-label">Мониторинг</p>
+        <a href="./" aria-current="page">
+          <svg class="nav-ico" viewBox="0 0 20 20" aria-hidden="true"><rect x="3" y="3" width="6" height="6" rx="1.5"/><rect x="11" y="3" width="6" height="6" rx="1.5"/><rect x="3" y="11" width="6" height="6" rx="1.5"/><rect x="11" y="11" width="6" height="6" rx="1.5"/></svg>
+          <span>Обзор</span>
+        </a>
+        <a href="hy2.html">
+          <svg class="nav-ico" viewBox="0 0 20 20" aria-hidden="true"><path d="M8.5 11.5l3-3M9.3 6.2l1.1-1.1a3 3 0 0 1 4.3 4.3l-1.1 1.1M10.7 13.8l-1.1 1.1a3 3 0 0 1-4.3-4.3l1.1-1.1"/></svg>
+          <span>Hysteria2</span>
+        </a>
+        <p class="nav-label">Управление</p>
+        <a href="add.html">
+          <svg class="nav-ico" viewBox="0 0 20 20" aria-hidden="true"><rect x="2.5" y="3" width="15" height="5.5" rx="1.5"/><path d="M9.5 11.5H4A1.5 1.5 0 0 0 2.5 13v1.5A1.5 1.5 0 0 0 4 16h5.5M15 11v6M12 14h6M5.5 5.75h.01"/></svg>
+          <span>Добавить сервер</span>
+        </a>
+        <a href="migrate.html">
+          <svg class="nav-ico" viewBox="0 0 20 20" aria-hidden="true"><path d="M3 7h13M13 4l3 3-3 3M17 13H4M7 10l-3 3 3 3"/></svg>
+          <span>Перенос</span>
+          <span id="nav-migrate" class="nav-badge" hidden></span>
+        </a>
+      </nav>
+      <div class="side-foot">
+        <p id="demo-chip" class="demo-chip" hidden>Демо-режим: данные выдуманы, сервер не нужен</p>
+        <div class="theme-row">
+          <span id="theme-label">Тема</span>
+          <div class="theme" role="group" aria-labelledby="theme-label">
+            <button type="button" data-set-theme="auto" title="Как в системе" aria-label="Как в системе"><svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="5.75"/><path class="fill" d="M8 2.25a5.75 5.75 0 0 1 0 11.5z"/></svg></button>
+            <button type="button" data-set-theme="light" title="Светлая" aria-label="Светлая"><svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="2.75"/><path d="M8 1.5v1.5M8 13v1.5M1.5 8H3M13 8h1.5M3.4 3.4l1.06 1.06M11.54 11.54l1.06 1.06M3.4 12.6l1.06-1.06M11.54 4.46l1.06-1.06"/></svg></button>
+            <button type="button" data-set-theme="dark" title="Тёмная" aria-label="Тёмная"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13.5 9.6A5.75 5.75 0 0 1 6.4 2.5a5.75 5.75 0 1 0 7.1 7.1z"/></svg></button>
+          </div>
         </div>
       </div>
-      <div class="table-wrap">
-        <table class="nodes">
-          <thead>
-            <tr>
-              <th>Узел</th>
-              <th>Адрес</th>
-              <th>Hysteria2</th>
-              <th>AmneziaWG</th>
-              <th class="col-meter">ЦП</th>
-              <th class="col-meter">Память</th>
-              <th class="col-meter">Диск</th>
-              <th>Работает</th>
-              <th class="num">Отклик</th>
-            </tr>
-          </thead>
-          <tbody id="nodes"></tbody>
-        </table>
-      </div>
-      <p id="nodes-empty" class="empty" hidden></p>
-    </section>
+    </aside>
 
-    <div class="grid3">
-      <section class="card">
-        <div class="card-head"><h2>Ретрансляторы <span id="relays-count" class="count"></span></h2></div>
-        <div id="relays" class="list"></div>
-      </section>
-      <section class="card">
-        <div class="card-head"><h2>Группы Hysteria2 <span id="hy2-count" class="count"></span></h2></div>
-        <div id="hy2" class="list"></div>
-      </section>
-      <section class="card">
-        <div class="card-head"><h2>Клиенты AmneziaWG <span id="awg-count" class="count"></span></h2></div>
-        <div id="awg" class="list"></div>
-      </section>
+    <div class="content">
+      <header class="page-head">
+        <button id="menu-btn" class="btn menu-btn" type="button" aria-controls="sidebar" aria-expanded="false" aria-label="Меню">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 4h11M2.5 8h11M2.5 12h11" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+        </button>
+        <div class="page-title">
+          <h1>Обзор</h1>
+          <p>Состояние узлов, протоколов и ретрансляторов</p>
+        </div>
+        <div class="controls">
+          <span id="stamp" class="stamp" aria-live="polite">Загрузка…</span>
+          <label class="select">
+            <span class="sr-only">Автообновление</span>
+            <select id="auto">
+              <option value="0">Автообновление выкл.</option>
+              <option value="30">Каждые 30 с</option>
+              <option value="60">Каждую минуту</option>
+              <option value="300">Каждые 5 мин</option>
+            </select>
+          </label>
+          <button id="refresh" class="btn" type="button">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9M13.5 2.5v3h-3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            <span>Обновить</span>
+          </button>
+        </div>
+      </header>
+
+      <main>
+        <div id="alert" class="alert" role="alert" hidden></div>
+        <div id="migrate-banner" class="note warn banner" role="status" hidden></div>
+
+        <section id="health" class="health" aria-live="polite"></section>
+
+        <section id="kpis" class="kpis" aria-label="Сводка"></section>
+
+        <section class="card">
+          <div class="card-head">
+            <h2>Узлы <span id="nodes-count" class="count"></span></h2>
+            <div class="filters">
+              <input id="q" type="search" placeholder="Поиск: имя, подпись, адрес" aria-label="Поиск узлов">
+              <label class="check"><input id="onlybad" type="checkbox"> только с проблемами</label>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table class="nodes">
+              <thead>
+                <tr>
+                  <th>Узел</th>
+                  <th>Адрес</th>
+                  <th>Hysteria2</th>
+                  <th>AmneziaWG</th>
+                  <th class="col-meter">ЦП</th>
+                  <th class="col-meter">Память</th>
+                  <th class="col-meter">Диск</th>
+                  <th>Работает</th>
+                  <th class="num">Отклик</th>
+                </tr>
+              </thead>
+              <tbody id="nodes"></tbody>
+            </table>
+          </div>
+          <p id="nodes-empty" class="empty" hidden></p>
+        </section>
+
+        <div class="grid3">
+          <section class="card">
+            <div class="card-head"><h2>Ретрансляторы <span id="relays-count" class="count"></span></h2></div>
+            <div id="relays" class="list"></div>
+          </section>
+          <section class="card">
+            <div class="card-head"><h2>Группы Hysteria2 <span id="hy2-count" class="count"></span></h2></div>
+            <div id="hy2" class="list"></div>
+          </section>
+          <section class="card">
+            <div class="card-head"><h2>Клиенты AmneziaWG <span id="awg-count" class="count"></span></h2></div>
+            <div id="awg" class="list"></div>
+          </section>
+        </div>
+      </main>
+
+      <footer class="foot">
+        iof-web · «Отклик» — время SSH-входа и сбора данных, а не пинг
+      </footer>
     </div>
-  </main>
-
-  <footer class="foot">
-    iof-web · «Отклик» — время SSH-входа и сбора данных, а не пинг
-  </footer>
+  </div>
 </body>
 </html>

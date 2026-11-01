@@ -6,184 +6,221 @@
   <title>Перенос · Island of Freedom</title>
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="app.css">
-  <script src="common.js" defer></script>
+  <script src="common.js"></script>
   <script src="migrate.js" defer></script>
 </head>
 <body>
-  <header class="topbar">
-    <div class="brand">
-      <svg class="logo" viewBox="0 0 32 32" aria-hidden="true">
-        <circle cx="16" cy="16" r="15" fill="var(--accent)"/>
-        <path d="M5 21c3-1.6 5.4-1.6 8 0s5.4 1.6 8 0 5.2-1.6 6 0" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round"/>
-        <path d="M11 17.5c1-4.5 3-7.5 6-8.5M17 9c-1.6 2.6-1.4 5.5 0 8.6M17 9c2.4.2 4.6 1.4 5.5 3.6M17 9c-2.6-.6-5 0-6.3 1.6" fill="none" stroke="#fff" stroke-width="1.8" stroke-linecap="round"/>
-      </svg>
-      <div>
-        <h1>Island of Freedom</h1>
-        <p>VPN-узлы: Hysteria2 и AmneziaWG</p>
+  <div class="shell">
+    <aside id="sidebar" class="sidebar">
+      <a class="brand" href="./">
+        <svg class="logo" viewBox="0 0 32 32" aria-hidden="true">
+          <circle cx="16" cy="16" r="15" fill="var(--accent)"/>
+          <path d="M5 21c3-1.6 5.4-1.6 8 0s5.4 1.6 8 0 5.2-1.6 6 0" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round"/>
+          <path d="M11 17.5c1-4.5 3-7.5 6-8.5M17 9c-1.6 2.6-1.4 5.5 0 8.6M17 9c2.4.2 4.6 1.4 5.5 3.6M17 9c-2.6-.6-5 0-6.3 1.6" fill="none" stroke="#fff" stroke-width="1.8" stroke-linecap="round"/>
+        </svg>
+        <span><b>Island of Freedom</b><small>VPN-узлы: Hysteria2 и AWG</small></span>
+      </a>
+      <nav class="nav" aria-label="Разделы">
+        <p class="nav-label">Мониторинг</p>
+        <a href="./">
+          <svg class="nav-ico" viewBox="0 0 20 20" aria-hidden="true"><rect x="3" y="3" width="6" height="6" rx="1.5"/><rect x="11" y="3" width="6" height="6" rx="1.5"/><rect x="3" y="11" width="6" height="6" rx="1.5"/><rect x="11" y="11" width="6" height="6" rx="1.5"/></svg>
+          <span>Обзор</span>
+        </a>
+        <a href="hy2.html">
+          <svg class="nav-ico" viewBox="0 0 20 20" aria-hidden="true"><path d="M8.5 11.5l3-3M9.3 6.2l1.1-1.1a3 3 0 0 1 4.3 4.3l-1.1 1.1M10.7 13.8l-1.1 1.1a3 3 0 0 1-4.3-4.3l1.1-1.1"/></svg>
+          <span>Hysteria2</span>
+        </a>
+        <p class="nav-label">Управление</p>
+        <a href="add.html">
+          <svg class="nav-ico" viewBox="0 0 20 20" aria-hidden="true"><rect x="2.5" y="3" width="15" height="5.5" rx="1.5"/><path d="M9.5 11.5H4A1.5 1.5 0 0 0 2.5 13v1.5A1.5 1.5 0 0 0 4 16h5.5M15 11v6M12 14h6M5.5 5.75h.01"/></svg>
+          <span>Добавить сервер</span>
+        </a>
+        <a href="migrate.html" aria-current="page">
+          <svg class="nav-ico" viewBox="0 0 20 20" aria-hidden="true"><path d="M3 7h13M13 4l3 3-3 3M17 13H4M7 10l-3 3 3 3"/></svg>
+          <span>Перенос</span>
+          <span id="nav-migrate" class="nav-badge" hidden></span>
+        </a>
+      </nav>
+      <div class="side-foot">
+        <p id="demo-chip" class="demo-chip" hidden>Демо-режим: данные выдуманы, сервер не нужен</p>
+        <div class="theme-row">
+          <span id="theme-label">Тема</span>
+          <div class="theme" role="group" aria-labelledby="theme-label">
+            <button type="button" data-set-theme="auto" title="Как в системе" aria-label="Как в системе"><svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="5.75"/><path class="fill" d="M8 2.25a5.75 5.75 0 0 1 0 11.5z"/></svg></button>
+            <button type="button" data-set-theme="light" title="Светлая" aria-label="Светлая"><svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="2.75"/><path d="M8 1.5v1.5M8 13v1.5M1.5 8H3M13 8h1.5M3.4 3.4l1.06 1.06M11.54 11.54l1.06 1.06M3.4 12.6l1.06-1.06M11.54 4.46l1.06-1.06"/></svg></button>
+            <button type="button" data-set-theme="dark" title="Тёмная" aria-label="Тёмная"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13.5 9.6A5.75 5.75 0 0 1 6.4 2.5a5.75 5.75 0 1 0 7.1 7.1z"/></svg></button>
+          </div>
+        </div>
       </div>
-    </div>
-    <nav class="nav" aria-label="Разделы">
-      <a href="./">Обзор</a>
-      <a href="hy2.html">Hysteria2</a>
-      <a href="add.html">Добавить сервер</a>
-      <a href="migrate.html" aria-current="page">Перенос</a>
-    </nav>
-  </header>
+    </aside>
 
-  <main>
-    <div id="alert" class="alert" role="alert" hidden></div>
+    <div class="content">
+      <header class="page-head">
+        <button id="menu-btn" class="btn menu-btn" type="button" aria-controls="sidebar" aria-expanded="false" aria-label="Меню">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 4h11M2.5 8h11M2.5 12h11" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+        </button>
+        <div class="page-title">
+          <h1>Перенос управления</h1>
+          <p>Управляющим станет другой сервер, а этот останется VPN-узлом</p>
+        </div>
+      </header>
 
-    <div class="add-layout">
-      <div class="side">
-        <form id="form" class="card form" novalidate autocomplete="off" hidden>
-          <div class="card-head"><h2>Перенести управление на другой сервер</h2></div>
-          <p class="hint pad">Новый сервер станет управляющим, а этот останется VPN-узлом. Клиенты подключаются
-            к узлам напрямую, поэтому их ссылки и ключи не меняются.</p>
+      <main>
+        <div id="alert" class="alert" role="alert" hidden></div>
 
-          <fieldset>
-            <legend>Новый управляющий сервер</legend>
-            <div class="form-grid">
-              <div class="field">
-                <label for="f-host">Хост</label>
-                <input id="f-host" name="host" required placeholder="203.0.113.50" spellcheck="false">
-                <p class="hint">IPv4 или домен. Ubuntu или Debian, лучше чистый сервер</p>
-              </div>
-              <div class="field field-narrow">
-                <label for="f-port">SSH-порт</label>
-                <input id="f-port" name="port" inputmode="numeric" value="22">
-              </div>
-              <div class="field">
-                <label for="f-user">Пользователь</label>
-                <input id="f-user" name="user" value="root" spellcheck="false">
-                <p class="hint">Не root — нужен sudo без пароля (NOPASSWD)</p>
-              </div>
-            </div>
-            <div class="seg" role="radiogroup" aria-label="Способ входа">
-              <label><input type="radio" name="auth" value="password" checked><span>Пароль</span></label>
-              <label><input type="radio" name="auth" value="key"><span>SSH-ключ</span></label>
-              <label><input type="radio" name="auth" value="installed"><span>Ключ iof уже добавлен</span></label>
-            </div>
+        <div class="add-layout">
+          <div class="side">
+            <form id="form" class="card form" novalidate autocomplete="off" hidden>
+              <div class="card-head"><h2>Перенести управление на другой сервер</h2></div>
+              <p class="hint pad">Новый сервер станет управляющим, а этот останется VPN-узлом. Клиенты подключаются
+                к узлам напрямую, поэтому их ссылки и ключи не меняются.</p>
 
-            <div class="auth-pane" data-auth="password">
-              <div class="field">
-                <label for="f-password">Пароль пользователя</label>
-                <div class="input-row">
-                  <input id="f-password" type="password" autocomplete="new-password" spellcheck="false">
-                  <button id="toggle-pass" class="btn small" type="button">Показать</button>
+              <fieldset>
+                <legend>Новый управляющий сервер</legend>
+                <div class="form-grid">
+                  <div class="field">
+                    <label for="f-host">Хост</label>
+                    <input id="f-host" name="host" required placeholder="203.0.113.50" spellcheck="false">
+                    <p class="hint">IPv4 или домен. Ubuntu или Debian, лучше чистый сервер</p>
+                  </div>
+                  <div class="field field-narrow">
+                    <label for="f-port">SSH-порт</label>
+                    <input id="f-port" name="port" inputmode="numeric" value="22">
+                  </div>
+                  <div class="field">
+                    <label for="f-user">Пользователь</label>
+                    <input id="f-user" name="user" value="root" spellcheck="false">
+                    <p class="hint">Не root — нужен sudo без пароля (NOPASSWD)</p>
+                  </div>
                 </div>
-              </div>
-            </div>
-
-            <div class="auth-pane" data-auth="key" hidden>
-              <div class="field">
-                <label for="f-key">Приватный ключ OpenSSH</label>
-                <textarea id="f-key" rows="6" spellcheck="false" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----&#10;...&#10;-----END OPENSSH PRIVATE KEY-----"></textarea>
-                <div class="input-row">
-                  <label class="btn small file-btn">Загрузить из файла<input id="f-keyfile" type="file" class="sr-only"></label>
-                  <p class="hint">Ключ без пароля. Ключ PuTTY (.ppk) сначала экспортируй: PuTTYgen → Conversions → Export OpenSSH key</p>
+                <div class="seg" role="radiogroup" aria-label="Способ входа">
+                  <label><input type="radio" name="auth" value="password" checked><span>Пароль</span></label>
+                  <label><input type="radio" name="auth" value="key"><span>SSH-ключ</span></label>
+                  <label><input type="radio" name="auth" value="installed"><span>Ключ iof уже добавлен</span></label>
                 </div>
+
+                <div class="auth-pane" data-auth="password">
+                  <div class="field">
+                    <label for="f-password">Пароль пользователя</label>
+                    <div class="input-row">
+                      <input id="f-password" type="password" autocomplete="new-password" spellcheck="false">
+                      <button id="toggle-pass" class="btn small" type="button">Показать</button>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="auth-pane" data-auth="key" hidden>
+                  <div class="field">
+                    <label for="f-key">Приватный ключ OpenSSH</label>
+                    <textarea id="f-key" rows="6" spellcheck="false" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----&#10;...&#10;-----END OPENSSH PRIVATE KEY-----"></textarea>
+                    <div class="input-row">
+                      <label class="btn small file-btn">Загрузить из файла<input id="f-keyfile" type="file" class="sr-only"></label>
+                      <p class="hint">Ключ без пароля. Ключ PuTTY (.ppk) сначала экспортируй: PuTTYgen → Conversions → Export OpenSSH key</p>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="auth-pane" data-auth="installed" hidden>
+                  <p class="hint">Добавь на новом сервере публичный ключ iof в <code>~/.ssh/authorized_keys</code> пользователя, например так:</p>
+                  <pre id="pubkey-cmd" class="code"></pre>
+                  <button id="copy-pubkey" class="btn small" type="button">Скопировать команду</button>
+                </div>
+
+                <p id="secret-note" class="note-plain">Пароль и ключ нужны один раз: iof входит с ними и кладёт на сервер свой ключ.
+                  Панель их не сохраняет ни в браузере, ни на диске.</p>
+              </fieldset>
+
+              <fieldset>
+                <legend>Этот сервер после переноса</legend>
+                <div class="field">
+                  <label for="f-self">Как новый сервер будет заходить сюда</label>
+                  <input id="f-self" spellcheck="false">
+                  <p id="self-hint" class="hint"></p>
+                </div>
+              </fieldset>
+
+              <div id="form-error" class="form-error" role="alert" hidden></div>
+              <div class="form-actions">
+                <button id="submit" class="btn primary" type="submit">Начать перенос</button>
               </div>
-            </div>
+            </form>
 
-            <div class="auth-pane" data-auth="installed" hidden>
-              <p class="hint">Добавь на новом сервере публичный ключ iof в <code>~/.ssh/authorized_keys</code> пользователя, например так:</p>
-              <pre id="pubkey-cmd" class="code"></pre>
-              <button id="copy-pubkey" class="btn small" type="button">Скопировать команду</button>
-            </div>
+            <section id="source" class="card" hidden>
+              <div class="card-head">
+                <h2>Идёт перенос на <span id="source-peer" class="mono"></span></h2>
+                <span id="source-started" class="item-meta"></span>
+              </div>
+              <div class="note warn">
+                <span data-icon="warn"></span>
+                <div>Изменения на этом сервере заблокированы, чтобы данные не разошлись с новым.
+                  Смотреть состояние и ссылки можно.</div>
+              </div>
+              <ol class="steps">
+                <li>Открой панель нового сервера. Туннель на другом порту, чтобы не мешал этому:
+                  <pre id="tunnel-cmd" class="code"></pre>
+                  и в браузере <code>http://127.0.0.1:8089/</code></li>
+                <li>На её «Обзоре» проверь, что все узлы на связи, в том числе этот сервер</li>
+                <li>Там в «Переносе» нажми «Завершить перенос»: этот сервер станет обычным узлом</li>
+              </ol>
+              <div id="source-error" class="form-error" role="alert" hidden></div>
+              <div class="form-actions">
+                <button id="retry" class="btn" type="button">Повторить перенос</button>
+                <button id="cancel" class="btn" type="button">Отменить перенос</button>
+              </div>
+              <p class="hint pad">«Повторить» нужно, если перенос прервался: данные скопируются на новый сервер заново.
+                «Отменить» удалит с нового сервера iof и копию данных и снимет блокировку здесь.</p>
+            </section>
 
-            <p id="secret-note" class="note-plain">Пароль и ключ нужны один раз: iof входит с ними и кладёт на сервер свой ключ.
-              Панель их не сохраняет ни в браузере, ни на диске.</p>
-          </fieldset>
+            <section id="target" class="card" hidden>
+              <div class="card-head">
+                <h2>Этот сервер принимает управление от <span id="target-peer" class="mono"></span></h2>
+                <span id="target-started" class="item-meta"></span>
+              </div>
+              <ol class="steps">
+                <li>Проверь на <a id="overview-link" href="./">Обзоре</a>, что все узлы на связи, в том числе старый сервер</li>
+                <li>Нажми «Завершить перенос». Со старого сервера уберутся панель, команды iof и задания cron,
+                  а сам он останется VPN-узлом. Задания cron переедут сюда</li>
+              </ol>
+              <div class="pad">
+                <label class="check"><input id="f-skip-old" type="checkbox"> Старый сервер недоступен, завершить без него</label>
+                <p class="hint">Если он всё же работает, сними с него iof вручную, иначе ночное обслуживание пойдёт с двух серверов</p>
+              </div>
+              <div id="target-error" class="form-error" role="alert" hidden></div>
+              <div class="form-actions">
+                <button id="finish" class="btn primary" type="button">Завершить перенос</button>
+              </div>
+            </section>
+          </div>
 
-          <fieldset>
-            <legend>Этот сервер после переноса</legend>
-            <div class="field">
-              <label for="f-self">Как новый сервер будет заходить сюда</label>
-              <input id="f-self" spellcheck="false">
-              <p id="self-hint" class="hint"></p>
-            </div>
-          </fieldset>
+          <div class="side">
+            <section id="job" class="card" hidden>
+              <div class="card-head">
+                <h2 id="job-title">Выполнение</h2>
+                <span id="job-state"></span>
+              </div>
+              <div id="job-result"></div>
+              <pre id="job-log" class="log" aria-live="polite"></pre>
+            </section>
 
-          <div id="form-error" class="form-error" role="alert" hidden></div>
-          <div class="form-actions">
-            <button id="submit" class="btn primary" type="submit">Начать перенос</button>
+            <section class="card">
+              <div class="card-head"><h2>Как идёт перенос</h2></div>
+              <ol class="steps">
+                <li>iof заходит на новый сервер и кладёт туда свой ключ</li>
+                <li>ставит там iof и панель той же версии, что здесь</li>
+                <li>блокирует изменения здесь и копирует туда <code>/root/iof</code>, ключ iof, шаблон Hysteria2 и доверенные ключи узлов</li>
+                <li>в <code>nodes.conf</code> нового сервера этот становится обычным узлом</li>
+                <li>проверяет, что новый сервер видит все узлы</li>
+                <li>«Завершить перенос» в панели нового сервера снимает управление отсюда и переносит задания cron</li>
+              </ol>
+              <p class="hint pad">До завершения перенос можно отменить. Старые данные iof после завершения
+                остаются на этом сервере в <code>/root/iof.moved-…</code>, их можно удалить, когда всё проверишь.</p>
+            </section>
           </div>
-        </form>
+        </div>
+      </main>
 
-        <section id="source" class="card" hidden>
-          <div class="card-head">
-            <h2>Идёт перенос на <span id="source-peer" class="mono"></span></h2>
-            <span id="source-started" class="item-meta"></span>
-          </div>
-          <div class="note warn">
-            <span data-icon="warn"></span>
-            <div>Изменения на этом сервере заблокированы, чтобы данные не разошлись с новым.
-              Смотреть состояние и ссылки можно.</div>
-          </div>
-          <ol class="steps">
-            <li>Открой панель нового сервера. Туннель на другом порту, чтобы не мешал этому:
-              <pre id="tunnel-cmd" class="code"></pre>
-              и в браузере <code>http://127.0.0.1:8089/</code></li>
-            <li>На её «Обзоре» проверь, что все узлы на связи, в том числе этот сервер</li>
-            <li>Там в «Переносе» нажми «Завершить перенос»: этот сервер станет обычным узлом</li>
-          </ol>
-          <div id="source-error" class="form-error" role="alert" hidden></div>
-          <div class="form-actions">
-            <button id="retry" class="btn" type="button">Повторить перенос</button>
-            <button id="cancel" class="btn" type="button">Отменить перенос</button>
-          </div>
-          <p class="hint pad">«Повторить» нужно, если перенос прервался: данные скопируются на новый сервер заново.
-            «Отменить» удалит с нового сервера iof и копию данных и снимет блокировку здесь.</p>
-        </section>
-
-        <section id="target" class="card" hidden>
-          <div class="card-head">
-            <h2>Этот сервер принимает управление от <span id="target-peer" class="mono"></span></h2>
-            <span id="target-started" class="item-meta"></span>
-          </div>
-          <ol class="steps">
-            <li>Проверь на <a id="overview-link" href="./">Обзоре</a>, что все узлы на связи, в том числе старый сервер</li>
-            <li>Нажми «Завершить перенос». Со старого сервера уберутся панель, команды iof и задания cron,
-              а сам он останется VPN-узлом. Задания cron переедут сюда</li>
-          </ol>
-          <div class="pad">
-            <label class="check"><input id="f-skip-old" type="checkbox"> Старый сервер недоступен, завершить без него</label>
-            <p class="hint">Если он всё же работает, сними с него iof вручную, иначе ночное обслуживание пойдёт с двух серверов</p>
-          </div>
-          <div id="target-error" class="form-error" role="alert" hidden></div>
-          <div class="form-actions">
-            <button id="finish" class="btn primary" type="button">Завершить перенос</button>
-          </div>
-        </section>
-      </div>
-
-      <div class="side">
-        <section id="job" class="card" hidden>
-          <div class="card-head">
-            <h2 id="job-title">Выполнение</h2>
-            <span id="job-state"></span>
-          </div>
-          <div id="job-result"></div>
-          <pre id="job-log" class="log" aria-live="polite"></pre>
-        </section>
-
-        <section class="card">
-          <div class="card-head"><h2>Как идёт перенос</h2></div>
-          <ol class="steps">
-            <li>iof заходит на новый сервер и кладёт туда свой ключ</li>
-            <li>ставит там iof и панель той же версии, что здесь</li>
-            <li>блокирует изменения здесь и копирует туда <code>/root/iof</code>, ключ iof, шаблон Hysteria2 и доверенные ключи узлов</li>
-            <li>в <code>nodes.conf</code> нового сервера этот становится обычным узлом</li>
-            <li>проверяет, что новый сервер видит все узлы</li>
-            <li>«Завершить перенос» в панели нового сервера снимает управление отсюда и переносит задания cron</li>
-          </ol>
-          <p class="hint pad">До завершения перенос можно отменить. Старые данные iof после завершения
-            остаются на этом сервере в <code>/root/iof.moved-…</code>, их можно удалить, когда всё проверишь.</p>
-        </section>
-      </div>
+      <footer class="foot">iof-web · перенос идёт командами <code>iof migrate</code>, лог виден целиком</footer>
     </div>
-  </main>
-
-  <footer class="foot">iof-web · перенос идёт командами <code>iof migrate</code>, лог виден целиком</footer>
+  </div>
 </body>
 </html>

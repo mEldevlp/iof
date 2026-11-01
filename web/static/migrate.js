@@ -32,6 +32,7 @@ function render() {
   const i = mig.info;
   const m = i.migrate;
   const role = m ? m.role : "";
+  renderMigrate(m);
   $("#form").hidden = role !== "";
   $("#source").hidden = role !== "source";
   $("#target").hidden = role !== "target";
@@ -172,7 +173,6 @@ function finish() {
 }
 
 document.addEventListener("DOMContentLoaded", () => {
-  keepDemoInLinks();
   document.querySelectorAll("[data-icon]").forEach((el) => { el.outerHTML = icon(el.dataset.icon); });
   if (DEMO) $("#overview-link").href += "?demo";
   initLoginForm();
