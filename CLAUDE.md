@@ -112,7 +112,8 @@ sha1-хэш. Повторный запуск с той же подписью д�
   (по паролю через sshpass, по ключу или с проверкой `--key-installed`). Пароль или ключ для первого
   входа разбирает `read_auth` (результат в `AUTH_MODE`, `AUTH_PASS`, `AUTH_KEY`), ключ iof создаёт
   `ensure_ssh_key`, sshpass ставит `ensure_sshpass`. Всё это общее для `node add` и `migrate start`.
-- `index_set` добавляет или удаляет строку в `index.tsv`.
+- `index_set` добавляет, обновляет на месте или удаляет строку в `index.tsv`. Дата создания
+  у существующей группы не меняется: `hy2 add` той же подписи и `refresh` её сохраняют.
 - **Перенос управляющего сервера** (`iof migrate`). `start` на старом сервере: кладёт ключ на новый,
   проверяет его (`n_migrate_check`: не этот же сервер, есть apt, нет своих узлов), пишет `migrate.conf`
   (role=source), собирает архив (`migrate_bundle`) и через `n_migrate_receive` ставит на новом iof

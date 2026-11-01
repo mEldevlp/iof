@@ -1205,15 +1205,23 @@ table() {
 }
 row()   { local IFS=$'\t'; printf '%s\n' "$*"; }
 
-# Удаляет из индекса (файл $1) строку с ключом $2, при переданных $3 дописывает новую
+# Строка индекса (файл $1) с ключом $2: без $3 удаляется, с $3 добавляется в конец или
+# обновляется на своём месте. Дата создания у существующей строки остаётся прежней: повторный
+# hy2 add и refresh пересобирают группу, а не создают её заново.
+# Значения идут через окружение: awk -v разбирал бы \ в подписи
 index_set() {
-  local file="$1" name="$2" label="${3:-}"
+  local file="$1"
   mkdir -p "$(dirname "$file")"
   touch "$file"
-  grep -v -P "^\Q$name\E\t" "$file" > "${file}.tmp" || true
-  if [[ -n "$label" ]]; then
-    printf '%s\t%s\t%s\n' "$name" "$label" "$(date '+%F %T')" >> "${file}.tmp"
-  fi
+  IX_NAME="$2" IX_LABEL="${3:-}" IX_NOW="$(date '+%F %T')" awk -F'\t' -v OFS='\t' '
+    $1 == ENVIRON["IX_NAME"] {
+      if (ENVIRON["IX_LABEL"] != "" && !done) print $1, ENVIRON["IX_LABEL"], ($3 != "" ? $3 : ENVIRON["IX_NOW"])
+      done = 1
+      next
+    }
+    { print }
+    END { if (ENVIRON["IX_LABEL"] != "" && !done) print ENVIRON["IX_NAME"], ENVIRON["IX_LABEL"], ENVIRON["IX_NOW"] }
+  ' "$file" > "${file}.tmp"
   mv "${file}.tmp" "$file"
 }
 
