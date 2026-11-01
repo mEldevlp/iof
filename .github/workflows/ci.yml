@@ -1,0 +1,57 @@
+# CI iof: статические проверки и прогон на тестовом стенде из двух серверов в Docker:
+# old — управляющий сервер (он же VPN-узел), node1 — обычный узел.
+# То же локально: bash ci/lint.sh, а стенд — bash stand/stand.sh up old node1, setup, test.
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Новый push в ту же ветку отменяет недоделанную проверку старого
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Проверки кода
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - name: Поставить shellcheck и pyflakes
+        run: |
+          command -v shellcheck >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck; }
+          pipx install pyflakes==3.2.0
+      - name: bash ci/lint.sh
+        run: bash ci/lint.sh
+
+  stand:
+    name: Стенд из двух серверов
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - name: Поднять серверы old и node1
+        run: bash stand/stand.sh up old node1
+      - name: Поставить iof на old, подключить node1, Hysteria2 на обоих
+        run: bash stand/stand.sh setup
+      - name: Проверить узлы, туннели, ретранслятор и панель
+        run: bash stand/stand.sh test
+      - name: Журналы серверов
+        if: failure()
+        working-directory: stand
+        run: |
+          for s in old node1; do
+            echo "::group::$s"
+            docker compose exec -T "$s" bash -c '
+              systemctl --failed --no-pager
+              journalctl -u hysteria-server -u iof-web -u iof-relay -n 40 --no-pager
+              tail -n 30 /var/log/iof-hy2-install.log 2>/dev/null' </dev/null || true
+            echo "::endgroup::"
+          done

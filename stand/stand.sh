@@ -9,9 +9,11 @@
 # из Git Bash — если работает Docker Desktop. WSL гасит Ubuntu вместе с Docker, когда в ней нет
 # открытых сессий: пока стенд нужен, держи окно Ubuntu открытым.
 #
-#   bash stand/stand.sh up            собрать образ и поднять серверы
-#   bash stand/stand.sh setup         поставить iof на old из рабочей копии, подключить node1 и node2,
-#                                     Hysteria2, группу ссылок, задания cron
+#   bash stand/stand.sh up [сервер...]   собрать образ и поднять серверы (по умолчанию все, CI: old node1)
+#   bash stand/stand.sh setup         поставить iof на old из рабочей копии, подключить поднятые node1
+#                                     и node2, Hysteria2, группу ссылок, задания cron
+#   bash stand/stand.sh test [сервер] проверить, что iof работает (stand/test.sh); сервер — управляющий,
+#                                     по умолчанию old
 #   bash stand/stand.sh sync [сервер] обновить iof из рабочей копии (по умолчанию на old и new, где он стоит)
 #   bash stand/stand.sh tunnel        туннели к панелям: old -> http://127.0.0.1:8081/, new -> :8082
 #   bash stand/stand.sh probe start|show|stop   VPN-клиент на node2 через Hysteria2 на old и проверка
@@ -42,10 +44,19 @@ run_script() {
   on "$s" bash /root/.stand-script.sh </dev/null
 }
 
+# Поднятые серверы стенда в порядке SERVERS, по одному в строке
+running() {
+  local up s
+  up="$(dc ps --services --status running)"
+  for s in "${SERVERS[@]}"; do
+    if grep -qx "$s" <<<"$up"; then echo "$s"; fi
+  done
+}
+
 # Ждёт, пока на сервере поднимутся systemd и sshd
 wait_ready() {
-  local s="$1" i
-  for i in $(seq 1 60); do
+  local s="$1"
+  for _ in $(seq 1 60); do
     if [[ "$(on "$s" systemctl is-active ssh 2>/dev/null || true)" == "active" ]]; then return 0; fi
     sleep 1
   done
@@ -59,31 +70,43 @@ push_src() {
     | on "$s" bash -c 'rm -rf /opt/iof && mkdir -p /opt/iof && tar -xf - -C /opt/iof && chown -R root:root /opt/iof && chmod -R u=rwX,go=rX /opt/iof'
 }
 
-# Ключ для туннелей с этого компьютера в authorized_keys root на всех серверах
+# Ключ для туннелей с этого компьютера в authorized_keys root на всех поднятых серверах
 ensure_key() {
   local s
   if [[ ! -f "$KEY" ]]; then
     mkdir -p "$(dirname "$KEY")"
     ssh-keygen -q -t ed25519 -N "" -C "iof-stand" -f "$KEY"
   fi
-  for s in "${SERVERS[@]}"; do
+  for s in $(running); do
     on "$s" bash -c 'umask 077; mkdir -p /root/.ssh; k="$(cat)"; touch /root/.ssh/authorized_keys
       grep -qxF "$k" /root/.ssh/authorized_keys || printf "%s\n" "$k" >> /root/.ssh/authorized_keys' < "$KEY.pub"
   done
 }
 
+# Без аргументов поднимает все серверы, иначе только названные: CI поднимает old и node1
 cmd_up() {
-  local s
+  local s list=("$@")
+  if (( ${#list[@]} == 0 )); then list=("${SERVERS[@]}"); fi
+  for s in "${list[@]}"; do
+    [[ " ${SERVERS[*]} " == *" $s "* ]] || die "нет сервера $s, есть: ${SERVERS[*]}"
+  done
   dc build
-  dc up -d
-  for s in "${SERVERS[@]}"; do wait_ready "$s"; done
+  dc up -d "${list[@]}"
+  for s in "${list[@]}"; do wait_ready "$s"; done
   ensure_key
-  echo "Стенд поднят: ${SERVERS[*]}. Дальше: bash stand/stand.sh setup"
+  echo "Стенд поднят: ${list[*]}. Дальше: bash stand/stand.sh setup"
 }
 
 cmd_setup() {
+  local up n nodes=()
+  up="$(running)"
+  grep -qx old <<<"$up" || die "old не поднят, сначала: bash stand/stand.sh up"
+  # Подключаются только поднятые узлы
+  for n in node1:11 node2:12; do
+    if grep -qx "${n%%:*}" <<<"$up"; then nodes+=("$n"); fi
+  done
   push_src old
-  run_script old <<'EOS'
+  { printf 'NODES="%s"\n' "${nodes[*]}"; cat; } <<'EOS' | run_script old
 set -euo pipefail
 echo "== old: пакеты и iof"
 apt-get update -qq >/dev/null
@@ -96,7 +119,7 @@ chmod 700 /root/iof
 [[ -f /etc/hysteria/config.yaml ]] || cp /opt/iof/stand/hy2-template.yaml /etc/hysteria/config.yaml
 [[ -f /root/iof/nodes.conf ]] || printf 'old | 172.30.0.10 | local | Old\n' > /root/iof/nodes.conf
 
-for n in node1:11 node2:12; do
+for n in $NODES; do
   name="${n%%:*}"
   if ! grep -q "^$name " /root/iof/nodes.conf; then
     echo "== old: iof node add $name"
@@ -178,13 +201,14 @@ EOS
 }
 
 case "${1:-}" in
-  up)     cmd_up ;;
+  up)     shift; cmd_up "$@" ;;
   setup)  cmd_setup ;;
+  test)   shift; exec bash "$DIR/test.sh" "$@" ;;
   sync)   shift; cmd_sync "$@" ;;
   tunnel) cmd_tunnel ;;
   probe)  shift; cmd_probe "$@" ;;
   iof)    shift; s="${1:?укажи сервер}"; shift; on "$s" iof "$@" ;;
   sh)     dc exec "${2:?укажи сервер}" bash ;;
   down)   dc down ;;
-  *)      sed -n '3,21p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *)      sed -n '3,23p' "$0" | sed 's/^# \{0,1\}//' ;;
 esac

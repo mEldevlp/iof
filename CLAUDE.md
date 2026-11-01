@@ -34,7 +34,10 @@ Docker Desktop там не запускается: Kaspersky Standard не да�
 | `web/design.md` | цвета, шрифты, размеры, брейкпоинты и классы панели | не ставится |
 | `docs/panel-*.png` | скриншоты панели для README, сняты в демо-режиме (см. «Проверка изменений») | не ставится |
 | `README.md` | инструкция для пользователя | — |
-| `stand/` | тестовый стенд на Docker: `Dockerfile` (Ubuntu 24.04 с systemd и SSH), `compose.yml` (old, node1, node2, new), `stand.sh`, `hy2-template.yaml` | не ставится; попадает в `/opt/iof` как часть клона |
+| `stand/` | тестовый стенд на Docker: `Dockerfile` (Ubuntu 24.04 с systemd и SSH), `compose.yml` (old, node1, node2, new), `stand.sh`, `test.sh` (проверка iof на стенде), `hy2-template.yaml` | не ставится; попадает в `/opt/iof` как часть клона |
+| `ci/lint.sh` | статические проверки: `bash -n`, shellcheck, разбор и pyflakes для `iof-web.py`, `node --check`, правила проекта (NODE_FUNCS, STATIC_FILES, CSP, LF) | не ставится |
+| `.github/workflows/ci.yml` | CI в GitHub Actions, см. «Проверка изменений» | не ставится |
+| `.shellcheckrc` | настройки shellcheck: отключены SC2178 и SC2128, ложные срабатывания на local-переменные разных функций | не ставится |
 
 Клон репозитория на сервере лежит в `/opt/iof` (`IOF_SRC`). `iof update` делает `git pull --ff-only`
 и запускает `install.sh`. Сначала `install.sh` проверяет синтаксис (`bash -n`, `ast.parse`), и при
@@ -99,6 +102,7 @@ sha1-хэш. Повторный запуск с той же подписью д�
   через stdin bash-скрипт: `declare -f` всех функций из массива `NODE_FUNCS` плюс вызов.
   Поэтому `n_*` не должны зависеть от остального кода. Новую `n_*` нужно **добавить в `NODE_FUNCS`**.
   Пароли не попадают в аргументы процессов узла. Если пользователь не root, команда идёт через `sudo -n`.
+  Что все `n_*` есть в `NODE_FUNCS`, проверяет `ci/lint.sh`.
 - `ssh_cmd`: ключ iof, `BatchMode`, `ConnectTimeout=8`, `StrictHostKeyChecking=accept-new`.
 - `read_nodes` заполняет массивы `N_NAME N_ADDR N_SSH N_TITLE`, `read_relays` — массивы `R_*`.
   `select_nodes` кладёт в `SEL` индексы узлов по шаблонам из `-n`.
@@ -159,7 +163,8 @@ sha1-хэш. Повторный запуск с той же подписью д�
   с заголовком `X-IOF-Request: 1`, `Content-Type: application/json` и своим `Origin` (защита от CSRF).
   CSP `default-src 'self'`: **никаких inline-скриптов и `style=`** (ширина задаётся через CSSOM),
   внешних CDN тоже нет.
-- Статика отдаётся **только из словаря `STATIC_FILES`**: новую страницу надо добавить туда.
+- Статика отдаётся **только из словаря `STATIC_FILES`**: новую страницу надо добавить туда
+  (`ci/lint.sh` сверяет словарь с `web/static` и ищет в статике то, что запрещает CSP).
 - Пароли и ключи из формы передаются в `iof` через stdin (`--password-stdin`, `--key-stdin`),
   в лог задачи пишется команда без них. Поля формы проверяются и в панели, и в `iof`.
   Поля входа на сервер разбирает `login_fields` (общая для добавления и переноса).
@@ -205,19 +210,30 @@ sha1-хэш. Повторный запуск с той же подписью д�
 
 ## Проверка изменений
 
-Тестов нет. Минимум после правок:
+Минимум после правок — статические проверки (работают и в Git Bash):
 
 ```bash
-bash -n iof.sh && bash -n iof-nightly && bash -n install.sh
+bash ci/lint.sh
 ```
 
-```bash
-for f in web/static/*.js; do node --check "$f"; done
-```
+На машине разработки нет shellcheck и Python, эти проверки там пропускаются (`skip`), в CI они
+обязательны. Полностью, как в CI, `lint.sh` можно прогнать в контейнере Ubuntu 24.04 в WSL с
+`apt install shellcheck pyflakes3 nodejs git` и `CI=true`.
 
-Синтаксис `web/iof-web.py` проверяет `install.sh` (`ast.parse`); локально это возможно только там,
-где есть Python. `shellcheck` на машине разработки не установлен. Интерфейс проверяется в
-демо-режиме (`index.html?demo` и другие страницы). Встроенный браузер не открывает `file://`,
+**CI** (`.github/workflows/ci.yml`, GitHub Actions) запускается на push в master, на PR и вручную.
+Задача `lint` выполняет `ci/lint.sh` (shellcheck с `--severity=warning`, pyflakes ставится через
+pipx). Задача `stand` поднимает на раннере стенд из двух серверов, `old` (управляющий и узел)
+и `node1` (узел): `stand.sh up old node1`, `setup`, `test`. При ошибке печатает журналы серверов,
+итоги `test` видны на странице запуска. Секретов у workflow нет, на настоящие серверы он не ходит:
+обновление управляющего сервера по-прежнему `iof update`.
+
+`stand/test.sh` (`stand.sh test [управляющий сервер]`) проверяет: все узлы на связи и без проблем,
+`iof exec` и `iof check`, группу Hysteria2 (по ссылке на каждый узел клиент Hysteria2 с другого
+сервера открывает `PROBE_URL` через туннель, ссылка с неверным паролем получает отказ авторизации),
+ретранслятор (`relay add`, туннель через него, `relay del`), `hy2 restart`, панель (страницы,
+`/api/dashboard`, отказ при чужом `Host`, без `X-IOF-Request` и с чужим `Origin`, создание и удаление
+группы задачей панели). Всё созданное удаляет, в том числе при обрыве. Узлы в `nodes.conf` должны
+называться как контейнеры. Интерфейс проверяется в демо-режиме (`index.html?demo` и другие страницы). Встроенный браузер не открывает `file://`,
 поэтому `web/static` надо раздать любым статическим сервером на Node; удобно отдавать ту же CSP,
 что у `iof-web`, тогда сразу видны inline-стили.
 
@@ -242,8 +258,9 @@ wsl -d Ubuntu-24.04 -u root --cd /mnt/c/dev/repos/iof -- bash stand/stand.sh up
 ```
 
 ```bash
-bash stand/stand.sh up        # собрать и поднять
-bash stand/stand.sh setup     # iof из рабочей копии на old, узлы, Hysteria2, группа ссылок, cron
+bash stand/stand.sh up        # собрать и поднять; up old node1 — только эти серверы, как в CI
+bash stand/stand.sh setup     # iof из рабочей копии на old, поднятые узлы, Hysteria2, группа ссылок, cron
+bash stand/stand.sh test      # проверка iof на стенде (stand/test.sh); после переноса: test new
 bash stand/stand.sh sync      # после правок: залить рабочую копию на серверы, где стоит iof
 bash stand/stand.sh tunnel    # панели: old http://localhost:8081/, new http://localhost:8082/
 bash stand/stand.sh probe start   # VPN-клиент на node2 через Hysteria2 на old, проверка связи раз в 2 с
@@ -262,8 +279,13 @@ bash stand/stand.sh down
 - Туннели (`stand.sh tunnel`) поднимаются в WSL, порты 8081/8082 видны и из Windows: встроенный
   браузер открывает их через записи `stand-old-panel` и `stand-new-panel` в `.claude/launch.json`.
 - `machine-id` во всех контейнерах одинаковый, как у VPS из одного образа. iof на него не опирается.
-- Hysteria2 ставится официальным установщиком, поэтому `setup` нужен интернет. AmneziaWG на стенде
+- Hysteria2 ставится официальным установщиком, поэтому `setup` нужен интернет. `test` тоже:
+  через туннели открывается `PROBE_URL` (по умолчанию `generate_204` от Google). AmneziaWG на стенде
   нет: ему нужен Docker внутри сервера.
+- Клиент Hysteria2 понимает ссылку `hy2://` прямо в поле `server` конфига, а формат файла
+  конфига определяет по расширению: файл без `.yaml` не прочитается.
+- Ретранслятор `test` проверяет клиентом на самом узле: пакеты уходят на ретранслятор и через DNAT
+  возвращаются на узел. С самого ретранслятора так нельзя: свои пакеты не проходят PREROUTING.
 - Ключ для туннелей хранится в `~/.iof-stand` в WSL: с `/mnt/c` ssh ключ не берёт, там права 777.
 
 ## Неочевидные места

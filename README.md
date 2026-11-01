@@ -1,5 +1,7 @@
 # iof (Island of Freedom)
 
+[![CI](https://github.com/mEldevlp/iof/actions/workflows/ci.yml/badge.svg)](https://github.com/mEldevlp/iof/actions/workflows/ci.yml)
+
 Управление VPN-серверами (Hysteria2, AmneziaWG) с одного управляющего сервера по SSH
 и веб-панель к нему.
 
@@ -91,11 +93,26 @@ sudo iof migrate cancel                    # на старом, отменить
 ```
 bash stand/stand.sh up       # поднять серверы
 bash stand/stand.sh setup    # iof из рабочей копии на old, узлы, Hysteria2
+bash stand/stand.sh test     # проверить узлы, туннели Hysteria2, ретранслятор и панель
 bash stand/stand.sh tunnel   # панели: old http://localhost:8081/, new http://localhost:8082/
 bash stand/stand.sh down     # убрать
 ```
 
 Остальные команды: `bash stand/stand.sh` без аргументов.
+
+## Проверки (CI)
+
+На каждый push в master и на pull request GitHub Actions запускает две проверки:
+
+- **Проверки кода** (`bash ci/lint.sh`, можно и локально): синтаксис скриптов, shellcheck,
+  pyflakes для панели, синтаксис js, правила проекта (функции узла в `NODE_FUNCS`, файлы панели
+  в `STATIC_FILES`, ничего, что запрещает CSP панели).
+- **Стенд из двух серверов**: в Docker поднимаются управляющий сервер `old` и узел `node1`,
+  на `old` ставится iof из этого коммита, он подключает `node1` по паролю и ставит Hysteria2 на оба.
+  Затем `stand.sh test` проверяет, что всё работает: узлы на связи, VPN-туннели по выданным ссылкам
+  между серверами, ретранслятор, веб-панель и её защита.
+
+Workflow ничего не выкладывает на настоящие серверы: обновление по-прежнему `sudo iof update`.
 
 ## Ночное обслуживание
 

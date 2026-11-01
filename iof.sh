@@ -30,6 +30,7 @@ PARALLEL=20
 IOF_SRC="/opt/iof"   # клон репозитория для iof update
 IOF_ONLY=""
 if [[ -f "$ENV_FILE" ]]; then
+  # shellcheck source=/dev/null # файл на сервере, в репозитории его нет
   source "$ENV_FILE"
 fi
 

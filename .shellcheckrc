@@ -1,0 +1,4 @@
+# Настройки shellcheck для ci/lint.sh и редакторов. ci/lint.sh запускает его с --severity=warning.
+# SC2178, SC2128: shellcheck не различает local-переменные разных функций и считает строку,
+# которая в другой функции была массивом, ошибкой (в iof.sh так с ok, bad, state и другими)
+disable=SC2178,SC2128
