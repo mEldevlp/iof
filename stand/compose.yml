@@ -1,0 +1,45 @@
+# Тестовый стенд iof: old — управляющий сервер (и VPN-узел), node1 и node2 — узлы,
+# new — чистый сервер, на который переносится управление. Управление: stand/stand.sh
+name: iof-stand
+
+x-server: &server
+  image: iof-stand
+  # Образ собирает только old, остальные берут готовый, иначе четыре сборки сталкиваются
+  pull_policy: never
+  # WSL гасит Ubuntu вместе с Docker, когда в ней не остаётся сессий: серверы поднимутся сами
+  restart: unless-stopped
+  # systemd внутри контейнера
+  privileged: true
+  cgroup: host
+  tmpfs: [/run, /run/lock]
+  volumes:
+    - /sys/fs/cgroup:/sys/fs/cgroup:rw
+
+services:
+  old:
+    <<: *server
+    build: .
+    pull_policy: build
+    hostname: old
+    networks: { stand: { ipv4_address: 172.30.0.10 } }
+    ports: ["127.0.0.1:2201:22"]
+  node1:
+    <<: *server
+    hostname: node1
+    networks: { stand: { ipv4_address: 172.30.0.11 } }
+    ports: ["127.0.0.1:2202:22"]
+  node2:
+    <<: *server
+    hostname: node2
+    networks: { stand: { ipv4_address: 172.30.0.12 } }
+    ports: ["127.0.0.1:2203:22"]
+  new:
+    <<: *server
+    hostname: new
+    networks: { stand: { ipv4_address: 172.30.0.20 } }
+    ports: ["127.0.0.1:2204:22"]
+
+networks:
+  stand:
+    ipam:
+      config: [{ subnet: 172.30.0.0/24 }]

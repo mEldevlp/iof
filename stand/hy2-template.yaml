@@ -1,0 +1,10 @@
+# Конфиг Hysteria2 управляющего сервера стенда, по нему iof hy2 install ставит остальные узлы
+listen: :443
+
+tls:
+  cert: /etc/hysteria/server.crt
+  key: /etc/hysteria/server.key
+
+auth:
+  type: password
+  password: stand-hy2-password

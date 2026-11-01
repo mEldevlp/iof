@@ -380,7 +380,10 @@ img.qr { display: block; width: 100%; max-width: 240px; height: auto; margin: 0 
   border: 1px solid color-mix(in srgb, var(--crit) 35%, transparent);
 }
 .form-error .ico { margin-top: 2px; }
-.form-actions { display: flex; justify-content: flex-end; padding: 0 16px 16px; }
+.form-actions { display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap; padding: 0 16px 16px; }
+/* Плашка над содержимым страницы, например о незавершённом переносе управляющего сервера */
+.note.banner { margin: 0; }
+.pad .check + .hint { margin-top: 4px; }
 pre.code {
   margin: 8px 0; padding: 10px 12px; border-radius: 8px; background: var(--surface-2);
   font-family: var(--mono); font-size: 11.5px; white-space: pre-wrap; word-break: break-all;

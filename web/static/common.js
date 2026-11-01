@@ -131,6 +131,174 @@ function toast(text) {
   toastTimer = setTimeout(() => el.classList.remove("show"), 2200);
 }
 
+// Демо-режим сохраняется при переходе между страницами
+function keepDemoInLinks() {
+  if (DEMO) document.querySelectorAll(".nav a").forEach((a) => { a.href += "?demo"; });
+}
+
+// Плашка о незавершённом переносе управляющего сервера (поле migrate в ответах панели)
+function renderMigrate(m) {
+  const el = $("#migrate-banner");
+  if (!el) return;
+  el.hidden = !m;
+  if (!m) return;
+  const link = `migrate.html${DEMO ? "?demo" : ""}`;
+  el.innerHTML = m.role === "source"
+    ? `${icon("warn")}<div>Идёт перенос управления на <b>${esc(m.peer)}</b>, изменения на этом сервере заблокированы. <a href="${link}">Подробнее</a></div>`
+    : `${icon("warn")}<div>Этот сервер принимает управление от <b>${esc(m.peer)}</b>. Проверь, что все узлы на связи, и <a href="${link}">заверши перенос</a></div>`;
+}
+
+
+// Формы с задачей iof: «Добавить сервер» и «Перенос». Поля входа на сервер: #f-host, #f-port,
+// #f-user, радио auth, #f-password, #f-key, #f-keyfile, #toggle-pass, #pubkey-cmd, #copy-pubkey,
+// #secret-note. Карточка задачи: #job, #job-title, #job-state, #job-result, #job-log
+
+const HOST_RE = /^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$/;
+const USER_RE = /^[a-z_][a-z0-9_-]{0,31}$/;
+
+const JOB_STATES = {
+  running: ["none", "выполняется…"],
+  ok: ["good", "готово"],
+  warn: ["warn", "готово с ошибками"],
+  error: ["crit", "ошибка"],
+};
+
+async function getJson(url) {
+  const r = await fetch(url, { cache: "no-store", credentials: "same-origin" });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return r.json();
+}
+
+// Изменения только POST с JSON и заголовком X-IOF-Request: по ним сервер отсекает запросы с чужих сайтов
+async function postJson(url, data) {
+  const r = await fetch(url, {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json", "X-IOF-Request": "1" },
+    body: JSON.stringify(data),
+  });
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(body.error || `HTTP ${r.status}`);
+  return body;
+}
+
+function authMode() {
+  return document.querySelector('input[name="auth"]:checked').value;
+}
+
+// Хост, порт, пользователь и пароль или ключ, те же правила, что у iof. Ошибки кладёт в errors
+// по селекторам полей
+function collectLogin(errors) {
+  const v = (id) => $(id).value.trim();
+  const data = { host: v("#f-host"), port: v("#f-port") || "22", user: v("#f-user") || "root", auth: authMode() };
+  if (!HOST_RE.test(data.host)) errors["#f-host"] = "IPv4 или домен: латиница, цифры, точка, дефис";
+  const port = Number(data.port);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) errors["#f-port"] = "1–65535";
+  if (!USER_RE.test(data.user)) errors["#f-user"] = "строчная латиница, цифры, _ и -";
+  if (data.auth === "password") {
+    data.password = $("#f-password").value;
+    if (!data.password) errors["#f-password"] = "введи пароль";
+  } else if (data.auth === "key") {
+    data.key = $("#f-key").value;
+    if (!/PRIVATE KEY|PuTTY/.test(data.key)) errors["#f-key"] = "вставь приватный ключ целиком";
+  }
+  return data;
+}
+
+// После отправки секреты в странице больше не нужны
+function clearSecrets() {
+  $("#f-password").value = "";
+  $("#f-key").value = "";
+}
+
+function showErrors(errors) {
+  document.querySelectorAll(".field-error").forEach((e) => e.remove());
+  document.querySelectorAll("[aria-invalid]").forEach((e) => e.removeAttribute("aria-invalid"));
+  for (const [sel, text] of Object.entries(errors)) {
+    const input = $(sel);
+    input.setAttribute("aria-invalid", "true");
+    const p = document.createElement("p");
+    p.className = "field-error";
+    p.textContent = text;
+    input.closest(".field").appendChild(p);
+  }
+  // Фокус на первое поле с ошибкой по порядку на странице
+  const first = document.querySelector('[aria-invalid="true"]');
+  if (first) first.focus();
+}
+
+function formError(text, sel = "#form-error") {
+  const el = $(sel);
+  el.hidden = !text;
+  el.innerHTML = text ? `${icon("crit")} ${esc(text)}` : "";
+}
+
+// Команда для сервера, которая добавляет ключ iof в authorized_keys
+function pubkeyCommand(pubkey) {
+  return pubkey
+    ? `mkdir -p ~/.ssh && echo '${pubkey}' >> ~/.ssh/authorized_keys && chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys`
+    : "Ключа iof ещё нет: он создаётся при первом добавлении сервера по паролю или ключу.";
+}
+
+// Переключатель способа входа, показ пароля, ключ из файла и копирование команды с ключом iof
+function initLoginForm() {
+  document.querySelectorAll('input[name="auth"]').forEach((r) => r.addEventListener("change", () => {
+    document.querySelectorAll(".auth-pane").forEach((p) => { p.hidden = p.dataset.auth !== authMode(); });
+    $("#secret-note").hidden = authMode() === "installed";
+  }));
+  $("#toggle-pass").addEventListener("click", () => {
+    const p = $("#f-password");
+    p.type = p.type === "password" ? "text" : "password";
+    $("#toggle-pass").textContent = p.type === "password" ? "Показать" : "Скрыть";
+  });
+  // Файл ключа читается в браузере и уходит на сервер только при отправке формы
+  $("#f-keyfile").addEventListener("change", async (e) => {
+    const f = e.target.files[0];
+    if (f) $("#f-key").value = await f.text();
+    e.target.value = "";
+  });
+  $("#copy-pubkey").addEventListener("click", async () => {
+    toast(await copyText($("#pubkey-cmd").textContent) ? "Команда скопирована" : "Не удалось скопировать");
+  });
+}
+
+// Задача страницы: запущенная с неё (id), иначе последняя задача этого вида (node или migrate)
+async function pageJob(kind, id, demoJobs) {
+  const jobs = DEMO ? demoJobs() : (await getJson("api/jobs")).jobs;
+  return jobs.find((j) => j.id === id) || jobs.find((j) => (j.kind || "node") === kind);
+}
+
+// Шапка и лог карточки задачи, итог под шапкой страница задаёт через jobResult.
+// Возвращает уровень значка: good, warn, crit или none
+function renderJobCard(job) {
+  const card = $("#job");
+  if (!job) { card.hidden = true; return null; }
+  card.hidden = false;
+  const [lvl, label] = JOB_STATES[job.state] || JOB_STATES.error;
+  $("#job-title").textContent = job.title;
+  $("#job-state").innerHTML = job.state === "running"
+    ? `<span class="st"><span class="spinner" aria-hidden="true"></span>${label}</span>` : badge(lvl, label);
+
+  const log = $("#job-log");
+  const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 24;
+  log.textContent = job.log.join("\n");
+  if (atBottom) log.scrollTop = log.scrollHeight;
+  return lvl;
+}
+
+function jobResult(lvl, html) {
+  $("#job-result").className = html ? `note ${lvl}` : "";
+  $("#job-result").innerHTML = html || "";
+}
+
+// Причина из вывода iof: строка после «Не удалось (N)…» или «Ошибка: …»
+function failReason(log) {
+  const i = log.findIndex((l) => l.startsWith("Не удалось ("));
+  if (i >= 0 && log[i + 1]) return log[i + 1].trim().split(/\s{2,}/).pop();
+  const err = log.find((l) => l.startsWith("Ошибка: "));
+  return err ? err.slice(8) : "";
+}
+
 
 // Загрузка данных страницы, кнопка «Обновить», автообновление и строка состояния.
 // page: { url, demo() -> Promise<data>, render(data) }
@@ -158,7 +326,10 @@ function startPage(page) {
   function render() {
     renderAlert();
     renderStamp();
-    if (state.data) page.render(state.data);
+    if (state.data) {
+      renderMigrate(state.data.migrate);
+      page.render(state.data);
+    }
   }
 
   async function load(force = false) {
@@ -191,8 +362,7 @@ function startPage(page) {
   }
 
   document.addEventListener("DOMContentLoaded", () => {
-    // Демо-режим сохраняется при переходе между страницами
-    if (DEMO) document.querySelectorAll(".nav a").forEach((a) => { a.href += "?demo"; });
+    keepDemoInLinks();
 
     $("#auto").value = prefs.get("auto", "60");
     $("#refresh").addEventListener("click", () => load(true));

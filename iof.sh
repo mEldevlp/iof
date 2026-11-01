@@ -15,6 +15,8 @@ HY2_DIR="$BASE/hy2"
 HY2_INDEX="$HY2_DIR/index.tsv"
 AWG_LINKS="$BASE/awg"
 AWG_INDEX="$AWG_LINKS/index.tsv"
+MIGRATE_FILE="$BASE/migrate.conf"
+MIGRATE_INBOX="/root/.iof-migrate"   # куда новый управляющий сервер принимает данные при переносе
 SSH_KEY="/root/.ssh/iof_ed25519"
 
 # Настройки по умолчанию, переопределяются в iof.env
@@ -44,6 +46,7 @@ n_defaults() {
   AWG_DIR="/opt/amnezia/awg"
   AWG_DNS="1.1.1.1, 1.0.0.1"
   AWG_BACKUP="/var/backups/iof-awg"
+  IOF_HOME="/root/iof"   # то же, что BASE на управляющем сервере, для переноса управления
 }
 
 n_err() { echo "Ошибка [$(hostname)]: $*" >&2; exit 1; }
@@ -316,7 +319,7 @@ n_hy2_install() {
   if ! systemctl is-active --quiet "$SERVICE"; then
     n_err "сервис не работает: $(journalctl -u "$SERVICE" -n 3 --no-pager 2>/dev/null | tail -n 1)"
   fi
-  ver="$(hysteria version 2>/dev/null | awk -F': *' '/^Version/{print $2; exit}' || true)"
+  ver="$(hysteria version 2>/dev/null | awk -F':[[:space:]]*' '/^Version/{print $2; exit}' || true)"
   echo "installed ${ver:-?}"
 }
 
@@ -656,7 +659,7 @@ n_status() {
   fi
   state="$(systemctl is-active "$SERVICE" 2>/dev/null || true)"
   if [[ -n "$port" && -n "$(ss -Huln "sport = :$port" 2>/dev/null)" ]]; then udp="yes"; fi
-  ver="$(hysteria version 2>/dev/null | awk -F': *' '/^Version/{print $2; exit}' || true)"
+  ver="$(hysteria version 2>/dev/null | awk -F':[[:space:]]*' '/^Version/{print $2; exit}' || true)"
 
   if n_awg_find; then
     if n_awg_running && n_awg_iface; then
@@ -809,6 +812,154 @@ n_relay_status() {
   printf '%s %s\n' "${active:-inactive}" "${rules:-0}"
 }
 
+
+# Перенос управляющего сервера (iof migrate). Эти функции выполняются на новом
+# или на старом управляющем сервере, когда тот уже стал обычным узлом.
+
+# Сведения о будущем управляющем сервере для iof migrate start, строки key=value.
+# probe — метка из $IOF_HOME/.migrate-probe: если она совпала с меткой, которую только что
+# записал старый сервер, это он сам. machine-id для этого не годится: у VPS из одного образа
+# он бывает одинаковым
+n_migrate_check() {
+  local nodes=0 role="" id=""
+  n_defaults
+  [[ $EUID -eq 0 ]] || n_err "нужны права root"
+  if [[ -f "$IOF_HOME/nodes.conf" ]]; then
+    nodes="$(grep -cvE '^[[:space:]]*(#|$)' "$IOF_HOME/nodes.conf" || true)"
+  fi
+  if [[ -f "$IOF_HOME/migrate.conf" ]]; then
+    role="$(awk -F= '$1 == "role" { print $2; exit }' "$IOF_HOME/migrate.conf")"
+    id="$(awk -F= '$1 == "id" { print $2; exit }' "$IOF_HOME/migrate.conf")"
+  fi
+  printf 'probe=%s\nos=%s\napt=%s\nnodes=%s\nrole=%s\nid=%s\n' \
+    "$(cat "$IOF_HOME/.migrate-probe" 2>/dev/null || true)" \
+    "$(. /etc/os-release 2>/dev/null; printf '%s %s' "${ID:-?}" "${VERSION_ID:-}")" \
+    "$(command -v apt-get >/dev/null 2>&1 && echo yes || echo no)" \
+    "${nodes:-0}" "$role" "$id"
+}
+
+# Принимает управление из папки $2, куда iof migrate start прислал data (будущий $IOF_HOME),
+# ssh (ключ iof и known_hosts) и src (клон репозитория). Ставит iof той же версии, что на старом
+# сервере. Копия данных с прошлой попытки этого же переноса ($1) заменяется, другие сохраняются рядом
+n_migrate_receive() {
+  local id="$1" inbox="$2" ts f
+  n_defaults
+  [[ $EUID -eq 0 ]] || n_err "нужны права root"
+  [[ -d "$inbox/data" && -d "$inbox/src" && -s "$inbox/ssh/iof_ed25519" ]] || n_err "нет присланных данных в $inbox"
+  ts="$(date +%Y%m%d-%H%M%S)"
+
+  export DEBIAN_FRONTEND=noninteractive
+  if ! command -v git >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1 || ! command -v qrencode >/dev/null 2>&1; then
+    echo "[$(hostname)] ставлю git, python3 и qrencode" >&2
+    # На только что созданном сервере apt часто занят автообновлением, поэтому ждём блокировку
+    apt-get -o DPkg::Lock::Timeout=300 update -qq >/dev/null 2>&1 || true
+    apt-get -o DPkg::Lock::Timeout=300 install -y -qq git python3 qrencode >/dev/null 2>&1 \
+      || n_err "не удалось установить git, python3 и qrencode"
+  fi
+
+  rm -rf /opt/iof.migrate-new
+  mv "$inbox/src" /opt/iof.migrate-new
+  rm -rf /opt/iof
+  mv /opt/iof.migrate-new /opt/iof
+  chown -R root:root /opt/iof
+  echo "[$(hostname)] ставлю iof и панель" >&2
+  # stdin пустой: сам этот скрипт пришёл через stdin (run_on), install.sh не должен его читать
+  bash /opt/iof/install.sh </dev/null >&2 || n_err "install.sh завершился с ошибкой"
+
+  if [[ -d "$IOF_HOME" ]]; then
+    if [[ -f "$IOF_HOME/migrate.conf" ]] && grep -qxF "id=$id" "$IOF_HOME/migrate.conf"; then
+      rm -rf "$IOF_HOME"
+    else
+      mv "$IOF_HOME" "$IOF_HOME.before-migrate-$ts"
+      echo "[$(hostname)] прежняя папка iof сохранена в $IOF_HOME.before-migrate-$ts" >&2
+    fi
+  fi
+  mv "$inbox/data" "$IOF_HOME"
+  chown -R root:root "$IOF_HOME"
+  chmod 700 "$IOF_HOME"
+
+  mkdir -p /root/.ssh
+  chmod 700 /root/.ssh
+  for f in iof_ed25519 iof_ed25519.pub; do
+    if [[ -f "/root/.ssh/$f" ]] && ! cmp -s "/root/.ssh/$f" "$inbox/ssh/$f"; then
+      mv "/root/.ssh/$f" "/root/.ssh/$f.before-migrate-$ts"
+    fi
+  done
+  install -m 600 "$inbox/ssh/iof_ed25519" /root/.ssh/iof_ed25519
+  install -m 644 "$inbox/ssh/iof_ed25519.pub" /root/.ssh/iof_ed25519.pub
+  # Ключи узлов, которым доверял старый сервер: иначе первый вход на каждый узел был бы вслепую
+  if [[ -s "$inbox/ssh/known_hosts" ]]; then
+    touch /root/.ssh/known_hosts
+    chmod 600 /root/.ssh/known_hosts
+    grep -vxF -f /root/.ssh/known_hosts "$inbox/ssh/known_hosts" >> /root/.ssh/known_hosts || true
+  fi
+  rm -rf "$inbox"
+
+  # Панель запущена install.sh до того, как появился web.env
+  systemctl restart iof-web || echo "[$(hostname)] iof-web не перезапустился: journalctl -u iof-web -n 30" >&2
+  echo "received $(git -C /opt/iof log -1 --format=%h 2>/dev/null || echo '?')"
+}
+
+# Снимает с сервера роль управляющего: задания cron по шаблону $1, панель и команды iof.
+# Данные в $IOF_HOME и клон в /opt/iof не трогает
+n_migrate_uninstall() {
+  local re="$1" cron
+  cron="$(crontab -l -u root 2>/dev/null || true)"
+  if grep -qE "$re" <<<"$cron"; then
+    { grep -vE "$re" <<<"$cron" || true; } | crontab -u root -
+    echo "[$(hostname)] из cron убраны задания iof" >&2
+  fi
+  systemctl disable --now iof-web >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/iof-web.service /usr/local/bin/iof /usr/local/sbin/iof-nightly
+  rm -rf /opt/iof-web
+  systemctl daemon-reload
+}
+
+# Старый управляющий сервер в конце переноса: остаётся узлом, данные iof и ключ уходят в папку
+# $IOF_HOME.moved-<время>, её путь печатается. Номер переноса $1 защищает от ошибки: снимается
+# только сервер, с которого начат именно этот перенос
+n_migrate_demote() {
+  local id="$1" re="$2" dest
+  n_defaults
+  [[ $EUID -eq 0 ]] || n_err "нужны права root"
+  if [[ ! -f "$IOF_HOME/migrate.conf" ]] || ! grep -qxF "role=source" "$IOF_HOME/migrate.conf" \
+     || ! grep -qxF "id=$id" "$IOF_HOME/migrate.conf"; then
+    n_err "отсюда не начат этот перенос (нет $IOF_HOME/migrate.conf с id=$id), ничего не менял"
+  fi
+  n_migrate_uninstall "$re"
+  dest="$IOF_HOME.moved-$(date +%Y%m%d-%H%M%S)"
+  mv "$IOF_HOME" "$dest"
+  mv /root/.ssh/iof_ed25519 /root/.ssh/iof_ed25519.pub "$dest"/ 2>/dev/null || true
+  chmod 700 "$dest"
+  echo "[$(hostname)] управление снято, сервер остался узлом" >&2
+  printf '%s\n' "$dest"
+}
+
+# Отмена переноса на новом сервере: убирает iof, копию данных и ключ iof. Ключ iof в authorized_keys
+# остаётся при $2 = 1: значит, сервер ещё и узел старого и тот заходит на него этим ключом
+n_migrate_abort() {
+  local id="$1" keep="$2" inbox="$3" re="$4" pub user home
+  n_defaults
+  [[ $EUID -eq 0 ]] || n_err "нужны права root"
+  rm -rf "$inbox"
+  if [[ ! -f "$IOF_HOME/migrate.conf" ]] || ! grep -qxF "id=$id" "$IOF_HOME/migrate.conf"; then
+    echo "[$(hostname)] копии этого переноса здесь нет" >&2
+    return 0
+  fi
+  n_migrate_uninstall "$re"
+  pub="$(cat /root/.ssh/iof_ed25519.pub 2>/dev/null || true)"
+  rm -rf "$IOF_HOME"
+  rm -f /root/.ssh/iof_ed25519 /root/.ssh/iof_ed25519.pub
+  user="${SUDO_USER:-root}"
+  home="$(getent passwd "$user" | cut -d: -f6 || true)"
+  if [[ "$keep" != "1" && -n "$pub" && -f "$home/.ssh/authorized_keys" ]]; then
+    grep -vxF "$pub" "$home/.ssh/authorized_keys" > "$home/.ssh/authorized_keys.iof-tmp" || true
+    cat "$home/.ssh/authorized_keys.iof-tmp" > "$home/.ssh/authorized_keys"
+    rm -f "$home/.ssh/authorized_keys.iof-tmp"
+  fi
+  echo "[$(hostname)] iof и копия данных удалены" >&2
+}
+
 # Всё, что run_on передаёт на узел
 NODE_FUNCS=(
   n_defaults n_err n_yaml_value n_urlencode
@@ -817,6 +968,7 @@ NODE_FUNCS=(
   n_awg_clients n_awg_backup n_awg_add n_awg_del
   n_status
   n_free_ports n_relay_apply n_relay_status
+  n_migrate_check n_migrate_receive n_migrate_uninstall n_migrate_demote n_migrate_abort
 )
 
 
@@ -1494,6 +1646,65 @@ push_key_job() {
   fi
 }
 
+ensure_ssh_key() {
+  if [[ ! -f "$SSH_KEY" ]]; then
+    mkdir -p "$(dirname "$SSH_KEY")"
+    ssh-keygen -t ed25519 -N "" -f "$SSH_KEY" -C "iof@$(hostname)" >/dev/null || die "не удалось создать SSH-ключ"
+  fi
+  [[ -s "$SSH_KEY.pub" ]] || die "нет публичного ключа $SSH_KEY.pub"
+}
+
+# sshpass нужен только для входа по паролю
+ensure_sshpass() {
+  if have sshpass; then return 0; fi
+  echo "Ставлю sshpass..."
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq sshpass >/dev/null 2>&1 \
+    || { apt-get update -qq >/dev/null 2>&1; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq sshpass >/dev/null 2>&1; } \
+    || die "не удалось установить sshpass"
+}
+
+# Пароль или ключ для первого входа на сервер (iof node add, iof migrate start):
+# read_auth <ask|password-stdin|key-file|key-stdin|installed> <файл ключа> <пользователь> <хост>.
+# Результат: AUTH_MODE (password, key или installed), AUTH_PASS, AUTH_KEY (временная копия ключа,
+# после входа её надо удалить). Варианты со stdin нужны веб-панели: так пароль и ключ не видны
+# в списке процессов
+read_auth() {
+  local auth="$1" keyfile="$2" user="$3" host="$4" tmp
+  AUTH_PASS=""
+  AUTH_KEY=""
+  case "$auth" in
+    installed) ;;
+    ask)
+      read -rsp "Пароль $user для $host: " AUTH_PASS
+      echo ;;
+    password-stdin)
+      IFS= read -r AUTH_PASS || true ;;
+    key-file|key-stdin)
+      mkdir -p "$BASE"
+      tmp="$(mktemp -d "$BASE/.key.XXXXXX")"
+      PM_DIRS+=("$tmp")
+      AUTH_KEY="$tmp/key"
+      # Переводы строк Windows и отсутствие последнего перевода строки ssh не принимает
+      if [[ "$auth" == "key-file" ]]; then
+        [[ -r "$keyfile" ]] || die "нет файла ключа $keyfile"
+        (umask 077; printf '%s\n' "$(tr -d '\r' < "$keyfile")" > "$AUTH_KEY")
+      else
+        (umask 077; printf '%s\n' "$(tr -d '\r')" > "$AUTH_KEY")
+      fi
+      if grep -q 'PuTTY-User-Key-File' "$AUTH_KEY"; then
+        die "это ключ PuTTY (.ppk). Сконвертируй в PuTTYgen: Conversions -> Export OpenSSH key"
+      fi
+      grep -q -- '-----BEGIN .*PRIVATE KEY-----' "$AUTH_KEY" || die "нужен приватный ключ OpenSSH (-----BEGIN ... PRIVATE KEY-----), а не .pub"
+      ssh-keygen -y -P "" -f "$AUTH_KEY" >/dev/null 2>&1 \
+        || die "ключ не читается: защищён паролем или повреждён. Снять пароль: ssh-keygen -p -f <ключ>" ;;
+  esac
+  # Дальше stdin не нужен: ssh в фоновых задачах не должен его читать
+  exec </dev/null
+  AUTH_MODE="password"
+  if [[ -n "$AUTH_KEY" ]]; then AUTH_MODE="key"; elif [[ "$auth" == "installed" ]]; then AUTH_MODE="installed"; fi
+  if [[ "$AUTH_MODE" == "password" && -z "$AUTH_PASS" ]]; then die "пароль пустой"; fi
+}
+
 # Раздаёт ключ на узлы из массивов IM_NAME IM_HOST IM_ADDR IM_USER IM_PORT IM_TITLE, способ
 # входа в IM_MODE: password (IM_PASS), key (файл ключа в IM_KEY) или installed (ключ iof уже
 # положен вручную). Удачные узлы дописывает в nodes.conf.
@@ -1503,18 +1714,8 @@ onboard_nodes() {
   local failed=()
   mkdir -p "$BASE"
   chmod 700 "$BASE"
-  if [[ ! -f "$SSH_KEY" ]]; then
-    mkdir -p "$(dirname "$SSH_KEY")"
-    ssh-keygen -t ed25519 -N "" -f "$SSH_KEY" -C "iof@$(hostname)" >/dev/null || die "не удалось создать SSH-ключ"
-  fi
-  [[ -s "$SSH_KEY.pub" ]] || die "нет публичного ключа $SSH_KEY.pub"
-  # sshpass нужен только для входа по паролю
-  if [[ " ${IM_MODE[*]} " == *" password "* ]] && ! have sshpass; then
-    echo "Ставлю sshpass..."
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq sshpass >/dev/null 2>&1 \
-      || { apt-get update -qq >/dev/null 2>&1; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq sshpass >/dev/null 2>&1; } \
-      || die "не удалось установить sshpass"
-  fi
+  ensure_ssh_key
+  if [[ " ${IM_MODE[*]} " == *" password "* ]]; then ensure_sshpass; fi
   touch "$NODES_FILE"
 
   echo "Раздаю SSH-ключ на узлы: ${#IM_NAME[@]}, одновременно до $PARALLEL"
@@ -1577,10 +1778,9 @@ cmd_node_import() {
 
 # iof node add <имя> <хост> [подпись] [ssh_порт] [--user имя] [--addr адрес_для_клиентов]
 #   [--key файл | --key-stdin | --password-stdin | --key-installed]
-# Без них пароль спрашивается в терминале. --key-installed: ключ iof уже добавлен на сервер вручную. Варианты со stdin нужны веб-панели:
-# так пароль и ключ не видны в списке процессов
+# Без них пароль спрашивается в терминале. --key-installed: ключ iof уже добавлен на сервер вручную
 cmd_node_add() {
-  local pos=() user="root" addr="" auth="ask" keyfile="" pw="" tmp="" key="" name host title port
+  local pos=() user="root" addr="" auth="ask" keyfile="" name host title port
   while (( $# > 0 )); do
     case "$1" in
       --user|--addr|--key)
@@ -1613,43 +1813,12 @@ cmd_node_add() {
     if node_index "$name" >/dev/null; then die "узел '$name' уже есть"; fi
   fi
 
-  case "$auth" in
-    installed) ;;
-    ask)
-      read -rsp "Пароль $user для $host: " pw
-      echo ;;
-    password-stdin)
-      IFS= read -r pw || true ;;
-    key-file|key-stdin)
-      mkdir -p "$BASE"
-      tmp="$(mktemp -d "$BASE/.key.XXXXXX")"
-      PM_DIRS+=("$tmp")
-      key="$tmp/key"
-      # Переводы строк Windows и отсутствие последнего перевода строки ssh не принимает
-      if [[ "$auth" == "key-file" ]]; then
-        [[ -r "$keyfile" ]] || die "нет файла ключа $keyfile"
-        (umask 077; printf '%s\n' "$(tr -d '\r' < "$keyfile")" > "$key")
-      else
-        (umask 077; printf '%s\n' "$(tr -d '\r')" > "$key")
-      fi
-      if grep -q 'PuTTY-User-Key-File' "$key"; then
-        die "это ключ PuTTY (.ppk). Сконвертируй в PuTTYgen: Conversions -> Export OpenSSH key"
-      fi
-      grep -q -- '-----BEGIN .*PRIVATE KEY-----' "$key" || die "нужен приватный ключ OpenSSH (-----BEGIN ... PRIVATE KEY-----), а не .pub"
-      ssh-keygen -y -P "" -f "$key" >/dev/null 2>&1 \
-        || die "ключ не читается: защищён паролем или повреждён. Снять пароль: ssh-keygen -p -f <ключ>" ;;
-  esac
-  # Дальше stdin не нужен: ssh в фоновых задачах не должен его читать
-  exec </dev/null
-  local mode="password"
-  if [[ -n "$key" ]]; then mode="key"; elif [[ "$auth" == "installed" ]]; then mode="installed"; fi
-  if [[ "$mode" == "password" && -z "$pw" ]]; then die "пароль пустой"; fi
-
-  IM_NAME=("$name"); IM_HOST=("$host"); IM_ADDR=("$addr"); IM_USER=("$user"); IM_MODE=("$mode")
-  IM_PASS=("$pw"); IM_KEY=("$key"); IM_TITLE=("${title:-$name}"); IM_PORT=("$((10#$port))")
+  read_auth "$auth" "$keyfile" "$user" "$host"
+  IM_NAME=("$name"); IM_HOST=("$host"); IM_ADDR=("$addr"); IM_USER=("$user"); IM_MODE=("$AUTH_MODE")
+  IM_PASS=("$AUTH_PASS"); IM_KEY=("$AUTH_KEY"); IM_TITLE=("${title:-$name}"); IM_PORT=("$((10#$port))")
   local rc=0
   onboard_nodes || rc=1
-  if [[ -n "$key" ]] && have shred; then shred -u "$key" 2>/dev/null || true; fi
+  if [[ -n "$AUTH_KEY" ]] && have shred; then shred -u "$AUTH_KEY" 2>/dev/null || true; fi
   (( rc == 0 )) || exit 1
   echo "Дальше: sudo iof hy2 install $name"
 }
@@ -1856,10 +2025,19 @@ hy2_status() {
 
 hy2_install_job() { run_on "${N_SSH[$1]}" n_hy2_install "$HY2_INST_TPL" "$HY2_INST_CN" "$HY2_INST_FORCE"; }
 
+# CN сертификата, на который ссылается шаблон Hysteria2 $1. Пусто, если сертификата нет
+hy2_template_cn() {
+  local cert
+  cert="$(awk '/^[[:space:]]*cert:/{print $2; exit}' "$1" | tr -d "\"'")"
+  if [[ -n "$cert" && -f "$cert" ]]; then
+    openssl x509 -noout -subject -in "$cert" 2>/dev/null | sed -nE 's/.*CN[[:space:]]*=[[:space:]]*([^,/]+).*/\1/p' || true
+  fi
+}
+
 # Установка на узлы. Шаблон: конфиг Hysteria2 управляющего сервера (или $HY2_TEMPLATE),
-# CN сертификата берётся из его сертификата
+# CN сертификата берётся из его сертификата (или $HY2_CN, если сертификата здесь нет)
 hy2_install() {
-  local force=0 a i out tplsrc cert
+  local force=0 a i out tplsrc
   local args=() installed=() skipped=() failed=()
   for a in "$@"; do
     if [[ "$a" == "--force" ]]; then force=1; else args+=("$a"); fi
@@ -1872,11 +2050,8 @@ hy2_install() {
   [[ -f "$tplsrc" ]] || die "нет шаблона $tplsrc (конфиг Hysteria2 на управляющем сервере)"
   HY2_INST_TPL="$(base64 -w0 "$tplsrc")"
   HY2_INST_FORCE="$force"
-  HY2_INST_CN=""
-  cert="$(awk '/^[[:space:]]*cert:/{print $2; exit}' "$tplsrc" | tr -d "\"'")"
-  if [[ -n "$cert" && -f "$cert" ]]; then
-    HY2_INST_CN="$(openssl x509 -noout -subject -in "$cert" 2>/dev/null | sed -nE 's/.*CN[[:space:]]*=[[:space:]]*([^,/]+).*/\1/p')"
-  fi
+  HY2_INST_CN="${HY2_CN:-}"
+  if [[ -z "$HY2_INST_CN" ]]; then HY2_INST_CN="$(hy2_template_cn "$tplsrc")"; fi
   HY2_INST_CN="${HY2_INST_CN:-bing.com}"
 
   echo "Шаблон конфига: $tplsrc (пароль, порт и маскировка будут как на этом сервере)"
@@ -2453,6 +2628,335 @@ cmd_relay() {
   esac
 }
 
+
+# Перенос управляющего сервера: iof migrate start | finish | cancel | status
+# start на старом сервере ставит iof на новый и копирует туда данные, а у себя запрещает изменения.
+# finish на новом снимает роль управляющего со старого (тот остаётся узлом) и ставит задания cron.
+# cancel на старом отменяет перенос. Состояние в migrate.conf (key=value): role=source на старом,
+# role=target на новом, общий номер переноса id, peer — адрес SSH другого сервера
+
+# Задания cron, которые переезжают вместе с управлением: iof check, iof-nightly
+MIGRATE_CRON_RE='(^|[[:space:]/])iof(-nightly)?([[:space:]]|$)'
+
+# Значение ключа $2 из строк key=value в $1
+kv_get() { awk -F= -v k="$2" '$1 == k { sub(/^[^=]*=/, ""); print; exit }' <<<"$1"; }
+
+# Значение ключа $1 из migrate.conf, пусто, если переноса нет
+migrate_get() {
+  if [[ -f "$MIGRATE_FILE" ]]; then kv_get "$(cat "$MIGRATE_FILE")" "$1"; fi
+}
+
+# Пока идёт перенос отсюда, изменения здесь не попали бы на новый сервер, поэтому они запрещены
+migrate_guard() {
+  if [[ "$(migrate_get role)" != "source" ]]; then return 0; fi
+  die "идёт перенос управления на $(migrate_get peer), здесь изменения заблокированы.
+  Завершить: в панели нового сервера (Перенос) или на нём: sudo iof migrate finish
+  Отменить:  sudo iof migrate cancel"
+}
+
+# Один и тот же адрес SSH: root@host и root@host:22
+ssh_same() { [[ "${1%:22}" == "${2%:22}" ]]; }
+
+# Задаёт KEY=значение в файле окружения (iof.env, web.env), прежние строки с этим ключом убирает
+env_set() {
+  local file="$1" key="$2" value="$3"
+  touch "$file"
+  { grep -v "^[[:space:]]*$key=" "$file" || true; printf '%s=%s\n' "$key" "$value"; } > "$file.tmp"
+  chmod 600 "$file.tmp"
+  mv "$file.tmp" "$file"
+}
+
+# Как новый сервер будет заходить на этот: root@<адрес узла local>[:порт sshd]
+migrate_self_default() {
+  local i port
+  for i in "${!N_NAME[@]}"; do
+    if [[ "${N_SSH[$i]}" != "local" ]]; then continue; fi
+    port="$(sshd -T 2>/dev/null | awk '$1 == "port" { print $2; exit }' || true)"
+    if [[ -n "$port" && "$port" != "22" ]]; then
+      printf 'root@%s:%s' "${N_ADDR[$i]}" "$port"
+    else
+      printf 'root@%s' "${N_ADDR[$i]}"
+    fi
+    return 0
+  done
+  return 1
+}
+
+# Ключ iof в authorized_keys пользователя из $1 (user@host[:port]) на этом сервере:
+# после переноса новый сервер заходит сюда как на обычный узел
+migrate_trust_self() {
+  local user="${1%%@*}" home pub f
+  home="$(getent passwd "$user" | cut -d: -f6 || true)"
+  [[ -n "$home" ]] || die "на этом сервере нет пользователя $user (--self)"
+  pub="$(cat "$SSH_KEY.pub")"
+  f="$home/.ssh/authorized_keys"
+  (umask 077; mkdir -p "$home/.ssh"; touch "$f")
+  if grep -qxF "$pub" "$f"; then return 0; fi
+  # Без перевода строки в конце файла ключ склеился бы с последней строкой
+  if [[ -s "$f" && -n "$(tail -c 1 "$f")" ]]; then echo >> "$f"; fi
+  printf '%s\n' "$pub" >> "$f"
+  if [[ "$user" != "root" ]]; then chown "$user:" "$home/.ssh" "$f"; fi
+}
+
+# nodes.conf для нового сервера ($1, правится на месте): узел local становится $2 (так новый
+# сервер заходит на этот), а узел с адресом SSH нового сервера ($3), если он был, становится local
+migrate_nodes_conf() {
+  local file="$1" self="$2" target="$3"
+  [[ -f "$file" ]] || return 0
+  awk -F'|' -v self="$self" -v target="${target%:22}" '
+    function trim(s) { gsub(/^[[:space:]]+|[[:space:]]+$/, "", s); return s }
+    /^[[:space:]]*(#|$)/ { print; next }
+    {
+      t = trim($3); n = t; sub(/:22$/, "", n)
+      if (t == "" || t == "local") t = self
+      else if (n == target) t = "local"
+      else { print; next }
+      line = trim($1) " | " trim($2) " | " t " | " trim($4)
+      sub(/[[:space:]]+$/, "", line)
+      print line
+    }' "$file" > "$file.tmp"
+  mv "$file.tmp" "$file"
+}
+
+# Собирает в папке $1 всё, что нужно новому серверу: data (копия $BASE с правками для него),
+# ssh (ключ iof и known_hosts), src (клон репозитория $IOF_SRC)
+migrate_bundle() {
+  local stage="$1" id="$2" self="$3" target="$4" tpl cn
+  mkdir -p "$stage/ssh"
+  cp -a "$BASE" "$stage/data"
+  rm -rf "$stage/data/migrate.conf" "$stage/data/.migrate-probe" "$stage/data"/.key.*
+  cp -a "$IOF_SRC" "$stage/src"
+  cp -p "$SSH_KEY" "$SSH_KEY.pub" "$stage/ssh/"
+  if [[ -f /root/.ssh/known_hosts ]]; then cp -p /root/.ssh/known_hosts "$stage/ssh/"; fi
+
+  migrate_nodes_conf "$stage/data/nodes.conf" "$self" "$target"
+
+  # Шаблон Hysteria2 переезжает в папку iof. Сертификата, на который он ссылается, на новом
+  # сервере нет, поэтому CN записывается явно. HY2_TEMPLATE нужен и iof, и панели
+  tpl="${HY2_TEMPLATE:-/etc/hysteria/config.yaml}"
+  if [[ -f "$tpl" ]]; then
+    install -m 600 "$tpl" "$stage/data/hy2-template.yaml"
+    env_set "$stage/data/iof.env" HY2_TEMPLATE "$BASE/hy2-template.yaml"
+    env_set "$stage/data/web.env" HY2_TEMPLATE "$BASE/hy2-template.yaml"
+    cn="${HY2_CN:-$(hy2_template_cn "$tpl")}"
+    if [[ "$cn" =~ ^[A-Za-z0-9*._-]+$ ]]; then env_set "$stage/data/iof.env" HY2_CN "$cn"; fi
+  else
+    echo "   Внимание: нет шаблона Hysteria2 $tpl, на новом сервере iof hy2 install не заработает, пока не задашь HY2_TEMPLATE"
+  fi
+
+  # Задания cron ставятся на новом сервере только в iof migrate finish, иначе ночное
+  # обслуживание и проверки шли бы с двух серверов
+  { crontab -l -u root 2>/dev/null || true; } | { grep -E "$MIGRATE_CRON_RE" || true; } > "$stage/data/migrate-cron"
+
+  printf 'role=target\nid=%s\npeer=%s\nstarted=%s\n' "$id" "$self" "$(date '+%F %T')" > "$stage/data/migrate.conf"
+  chmod 600 "$stage/data/migrate.conf" "$stage/data/migrate-cron"
+}
+
+# iof migrate start <хост> [ssh_порт] [--user имя] [--key файл | --key-stdin | --password-stdin | --key-installed]
+#   [--self user@host[:port]]
+# На старом сервере. Вход как у iof node add. --self: как новый сервер будет заходить на этот,
+# по умолчанию root@<адрес узла local>. Повторный запуск с тем же сервером безопасен
+migrate_start() {
+  local pos=() user="root" auth="ask" keyfile="" self="" host port target id role peer started
+  local self_host self_port out err probe stage status total bad=()
+  while (( $# > 0 )); do
+    case "$1" in
+      --user|--key|--self)
+        [[ $# -ge 2 ]] || die "после $1 нужно значение"
+        case "$1" in
+          --user) user="$2" ;;
+          --key)  auth="key-file"; keyfile="$2" ;;
+          --self) self="$2" ;;
+        esac
+        shift 2 ;;
+      --key-stdin)      auth="key-stdin"; shift ;;
+      --password-stdin) auth="password-stdin"; shift ;;
+      --key-installed)  auth="installed"; shift ;;
+      -*) die "неизвестный параметр $1" ;;
+      *)  pos+=("$1"); shift ;;
+    esac
+  done
+  host="${pos[0]:-}"; port="${pos[1]:-22}"
+  [[ -n "$host" ]] || die "используй: iof migrate start <хост> [ssh_порт] [--user имя] [--key файл]"
+  host_ok "$host" || die "хост '$host': нужен IPv4 или имя хоста (латиница, цифры, точка, дефис)"
+  user_ok "$user" || die "пользователь '$user': строчная латиница, цифры, _ и -"
+  port_ok "$port" || die "ssh-порт '$port' вне 1-65535"
+  port="$((10#$port))"
+  target="$user@$host"
+  if (( port != 22 )); then target="$target:$port"; fi
+
+  read_nodes
+  [[ -d "$IOF_SRC/.git" ]] || die "нет клона репозитория в $IOF_SRC, из него iof ставится на новый сервер"
+  [[ -s "$SSH_KEY" && -s "$SSH_KEY.pub" ]] || die "нет ключа iof $SSH_KEY"
+  role="$(migrate_get role)"
+  peer="$(migrate_get peer)"
+  if [[ "$role" == "target" ]]; then die "этот сервер сам принимает управление от $peer, сначала: sudo iof migrate finish"; fi
+  if [[ "$role" == "source" ]] && ! ssh_same "$peer" "$target"; then
+    die "уже идёт перенос на $peer. Отменить его: sudo iof migrate cancel"
+  fi
+  id="$(migrate_get id)"
+  if [[ -z "$id" ]]; then id="$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')"; fi
+  started="$(migrate_get started)"
+  started="${started:-$(date '+%F %T')}"
+
+  if [[ -z "$self" ]]; then
+    self="$(migrate_self_default)" \
+      || die "этот сервер не узел (в nodes.conf нет local): укажи, как новый сервер будет заходить сюда, --self root@адрес[:порт]"
+  fi
+  [[ "$self" =~ ^([a-z_][a-z0-9_-]*)@([^:@]+)(:([0-9]+))?$ ]] || die "--self '$self': нужен вид root@адрес[:порт]"
+  self_host="${BASH_REMATCH[2]}"
+  self_port="${BASH_REMATCH[4]:-22}"
+  host_ok "$self_host" && port_ok "$self_port" || die "--self '$self': нужен вид root@адрес[:порт]"
+
+  echo "== Вход на $target"
+  read_auth "$auth" "$keyfile" "$user" "$host"
+  if [[ "$AUTH_MODE" == "password" ]]; then ensure_sshpass; fi
+  IM_HOST=("$host"); IM_PORT=("$port"); IM_USER=("$user"); IM_MODE=("$AUTH_MODE")
+  IM_PASS=("$AUTH_PASS"); IM_KEY=("$AUTH_KEY")
+  local rc=0
+  err="$(push_key_job 0 2>&1 >/dev/null)" || rc=1
+  if [[ -n "$AUTH_KEY" ]] && have shred; then shred -u "$AUTH_KEY" 2>/dev/null || true; fi
+  (( rc == 0 )) || die "вход на $target: ${err:-не удался}"
+  echo "   ключ iof работает"
+
+  echo "== Проверка $target"
+  probe="$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  PM_DIRS+=("$BASE/.migrate-probe")
+  printf '%s\n' "$probe" > "$BASE/.migrate-probe"
+  out="$(run_on "$target" n_migrate_check)" || die "не удалось проверить $target"
+  rm -f "$BASE/.migrate-probe"
+  [[ "$(kv_get "$out" probe)" != "$probe" ]] || die "$target — это этот же сервер"
+  [[ "$(kv_get "$out" apt)" == "yes" ]] || die "на $target нет apt-get ($(kv_get "$out" os)), нужен Ubuntu или Debian"
+  if [[ "$(kv_get "$out" role)" == "source" ]]; then die "с $target самого идёт перенос, сначала отмени его там"; fi
+  if [[ "$(kv_get "$out" nodes)" != "0" && "$(kv_get "$out" id)" != "$id" ]]; then
+    die "на $target уже есть свои узлы iof ($(kv_get "$out" nodes) в /root/iof/nodes.conf), перенос их затрёт. Если они не нужны, убери их там: sudo mv /root/iof /root/iof.old"
+  fi
+  echo "   $(kv_get "$out" os), можно переносить"
+
+  # С этого момента изменения здесь запрещены (migrate_guard), иначе они не попали бы на новый сервер
+  printf 'role=source\nid=%s\npeer=%s\nself=%s\nstarted=%s\n' "$id" "$target" "$self" "$started" > "$MIGRATE_FILE"
+  chmod 600 "$MIGRATE_FILE"
+  migrate_trust_self "$self"
+
+  echo "== Копирую на $target данные iof, ключ iof и клон репозитория"
+  stage="$(mktemp -d)"
+  PM_DIRS+=("$stage")
+  migrate_bundle "$stage" "$id" "$self" "$target"
+  tar -czf - -C "$stage" . \
+    | ssh_cmd "$target" "$(remote_sudo "$target")bash -c 'rm -rf $MIGRATE_INBOX && mkdir -m 700 $MIGRATE_INBOX && tar -xzf - -C $MIGRATE_INBOX'" \
+    || die "не удалось передать данные на $target. Повторить: та же команда, отменить перенос: sudo iof migrate cancel"
+
+  echo "== Ставлю iof на $target"
+  out="$(run_on "$target" n_migrate_receive "$id" "$MIGRATE_INBOX")" \
+    || die "$target не принял управление, причина выше. Повторить: та же команда, отменить перенос: sudo iof migrate cancel"
+  echo "   готово, версия ${out#received }"
+
+  echo "== Проверка: видит ли новый сервер все узлы"
+  status="$(ssh_cmd "$target" "$(remote_sudo "$target")/usr/local/bin/iof api status")" || die "iof на $target не отвечает"
+  mapfile -t bad < <(awk '/^== /{ n = substr($0, 4) } /^reachable=no$/{ print n }' <<<"$status")
+  total="$(grep -c '^== ' <<<"$status" || true)"
+  echo "Узлов: $total, на связи с $host: $(( total - ${#bad[@]} ))"
+  if (( ${#bad[@]} > 0 )); then
+    echo "Ошибки (${#bad[@]}): нет связи с нового сервера"
+    printf '  %s\n' "${bad[@]}"
+    echo "Обычно это файрвол у хостера (SSH открыт только для IP этого сервера) или запрет входа root по ключу."
+    echo "Почини и проверь на новом сервере: sudo iof status"
+  fi
+
+  echo
+  echo "Управление скопировано на $target. Этот сервер пока управляющий, но изменения на нём заблокированы."
+  echo "Дальше открой панель нового сервера: ssh -p $port -L 8089:127.0.0.1:8088 $user@$host"
+  echo "и http://127.0.0.1:8089/ → Перенос → «Завершить перенос». Или на нём: sudo iof migrate finish"
+  echo "Отменить перенос: sudo iof migrate cancel"
+}
+
+# iof migrate finish [--skip-old]: на новом сервере. Снимает роль управляющего со старого
+# (он остаётся узлом) и ставит задания cron. --skip-old: старый сервер недоступен, он пропускается
+migrate_finish() {
+  local skip=0 id peer dest="" cur add
+  if [[ "${1:-}" == "--skip-old" ]]; then skip=1; elif [[ -n "${1:-}" ]]; then die "неизвестный параметр $1"; fi
+  [[ "$(migrate_get role)" == "target" ]] || die "этот сервер не принимает управление (нет $MIGRATE_FILE с role=target)"
+  id="$(migrate_get id)"
+  peer="$(migrate_get peer)"
+  exec </dev/null
+
+  if (( skip )); then
+    echo "Старый сервер $peer пропускаю. Если он ещё работает, сними с него iof вручную, иначе ночное обслуживание пойдёт и оттуда:"
+    echo "  sudo crontab -e   (убрать строки с iof)"
+    echo "  sudo systemctl disable --now iof-web && sudo rm /usr/local/bin/iof /usr/local/sbin/iof-nightly"
+  else
+    echo "== Снимаю управление со старого сервера $peer"
+    dest="$(run_on "$peer" n_migrate_demote "$id" "$MIGRATE_CRON_RE")" \
+      || die "не удалось снять управление с $peer, причина выше. Если он недоступен совсем: sudo iof migrate finish --skip-old"
+  fi
+
+  if [[ -s "$BASE/migrate-cron" ]]; then
+    cur="$(crontab -l -u root 2>/dev/null || true)"
+    add="$(grep -vxF -f <(printf '%s\n' "$cur") "$BASE/migrate-cron" || true)"
+    if [[ -n "$add" ]]; then
+      { if [[ -n "$cur" ]]; then printf '%s\n' "$cur"; fi; printf '%s\n' "$add"; } | crontab -u root -
+      echo "В cron добавлено:"
+      sed 's/^/  /' <<<"$add"
+    fi
+  else
+    echo "На старом сервере заданий iof в cron не было. Ночное обслуживание: sudo crontab -e, строка: 0 4 * * * /usr/local/sbin/iof-nightly"
+  fi
+  rm -f "$BASE/migrate-cron" "$MIGRATE_FILE"
+
+  echo
+  echo "Перенос завершён, управляющий сервер теперь этот."
+  if [[ -n "$dest" ]]; then
+    echo "Старый сервер остался узлом. Его прежние данные iof: $dest, удали их, когда убедишься, что всё работает."
+  fi
+}
+
+# iof migrate cancel: на старом сервере. Снимает блокировку и убирает с нового сервера iof и копию данных
+migrate_cancel() {
+  local id peer keep=0 i
+  [[ "$(migrate_get role)" == "source" ]] || die "отсюда перенос не начат"
+  id="$(migrate_get id)"
+  peer="$(migrate_get peer)"
+  exec </dev/null
+  read_nodes
+  # Если новый сервер ещё и узел этого, ключ iof на нём нужен
+  for i in "${!N_SSH[@]}"; do
+    if ssh_same "${N_SSH[$i]}" "$peer"; then keep=1; fi
+  done
+  echo "== Убираю копию с $peer"
+  # Строку «Ошибки (» панель показывает как «готово с ошибками»
+  if ! run_on "$peer" n_migrate_abort "$id" "$keep" "$MIGRATE_INBOX" "$MIGRATE_CRON_RE"; then
+    echo "Ошибки (1): $peer недоступен, там могли остаться iof, копия данных и ключ iof. Удали их на нём:"
+    echo "  sudo systemctl disable --now iof-web; sudo rm -rf /root/iof /root/.iof-migrate /root/.ssh/iof_ed25519 /root/.ssh/iof_ed25519.pub"
+  fi
+  rm -f "$MIGRATE_FILE"
+  echo "Перенос отменён, этот сервер снова управляющий без ограничений."
+}
+
+migrate_status() {
+  case "$(migrate_get role)" in
+    source)
+      echo "Идёт перенос управления отсюда на $(migrate_get peer), начат $(migrate_get started)."
+      echo "Изменения здесь заблокированы. Завершить: на новом сервере sudo iof migrate finish. Отменить: sudo iof migrate cancel" ;;
+    target)
+      echo "Этот сервер принимает управление от $(migrate_get peer), начато $(migrate_get started)."
+      echo "Проверь, что все узлы на связи (sudo iof status), затем: sudo iof migrate finish" ;;
+    *)
+      echo "Переноса нет. Начать: sudo iof migrate start <хост> [ssh_порт]" ;;
+  esac
+}
+
+cmd_migrate() {
+  local action="${1:-status}"
+  if [[ $# -gt 0 ]]; then shift; fi
+  case "$action" in
+    start)  migrate_start "$@" ;;
+    finish) migrate_finish "$@" ;;
+    cancel) migrate_cancel ;;
+    status) migrate_status ;;
+    *)      die "используй: iof migrate start | finish | cancel | status" ;;
+  esac
+}
+
 usage() {
   cat <<'EOF'
 Island of Freedom управление VPN-серверами // by meldevlp
@@ -2506,6 +3010,14 @@ VLESS
   iof relay list              ретрансляторы и их состояние
   iof relay apply             заново применить правила
 
+Перенос управляющего сервера (этот остаётся VPN-узлом, клиенты ничего не заметят)
+  iof migrate start хост [порт]   на старом: поставить iof на новый сервер и скопировать туда данные
+      --user, --key, --key-installed  вход как у node add
+      --self root@адрес[:порт]    как новый сервер будет заходить сюда (по умолчанию адрес узла local)
+  iof migrate finish          на новом: снять управление со старого (--skip-old, если тот недоступен)
+  iof migrate cancel          на старом: отменить перенос
+  iof migrate status          идёт ли перенос
+
 Выбор узлов: -n перед командой ограничивает status, check, exec, hy2 status, awg status, awg clients
   iof -n 'de-*' status
   iof -n de-1,de-2 exec "apt update"
@@ -2527,12 +3039,19 @@ done
 cmd="${1:-}"
 if [[ $# -gt 0 ]]; then shift; fi
 
+# Пока идёт перенос отсюда, команды, которые что-то меняют, запрещены
+case "$cmd:${1:-}" in
+  init:*|refresh:*|node:add|node:import|node:del|relay:add|relay:del|relay:apply) migrate_guard ;;
+  hy2:add|hy2:del|hy2:refresh|hy2:install|awg:add|awg:del|awg:refresh) migrate_guard ;;
+esac
+
 case "$cmd" in
   hy2)     cmd_hy2 "$@" ;;
   awg)     cmd_awg "$@" ;;
   vless)   cmd_vless "$@" ;;
   node)    cmd_node "$@" ;;
   relay)   cmd_relay "$@" ;;
+  migrate) cmd_migrate "$@" ;;
   status)  cmd_status ;;
   check)   cmd_check ;;
   exec)    cmd_exec "$@" ;;

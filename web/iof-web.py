@@ -4,8 +4,8 @@
 Работает на управляющем сервере от root. Состояние узлов берёт из `iof api status`,
 списки ретрансляторов, групп Hysteria2 и клиентов AWG читает из /root/iof напрямую.
 Ссылки Hysteria2 (в них пароль) отдаёт на странице hy2, ключи и конфиги AWG не отдаёт.
-Меняет что-то только через команды iof (добавление сервера: iof node add, iof hy2 install),
-по одной задаче за раз, с логом выполнения.
+Меняет что-то только через команды iof (добавление сервера: iof node add, iof hy2 install;
+перенос управляющего сервера: iof migrate), по одной задаче за раз, с логом выполнения.
 
 Без зависимостей, нужен только python3. По умолчанию слушает 127.0.0.1:8088,
 снаружи заходить через SSH-туннель:  ssh -L 8088:127.0.0.1:8088 admin@сервер
@@ -47,6 +47,8 @@ STATIC_FILES = {
     "/hy2.js": ("hy2.js", "text/javascript; charset=utf-8"),
     "/add.html": ("add.html", "text/html; charset=utf-8"),
     "/add.js": ("add.js", "text/javascript; charset=utf-8"),
+    "/migrate.html": ("migrate.html", "text/html; charset=utf-8"),
+    "/migrate.js": ("migrate.js", "text/javascript; charset=utf-8"),
     "/app.css": ("app.css", "text/css; charset=utf-8"),
     "/favicon.svg": ("favicon.svg", "image/svg+xml"),
 }
@@ -305,6 +307,21 @@ def read_awg_clients(base):
     return clients
 
 
+def read_migrate(base):
+    """migrate.conf (key=value, ведёт iof migrate) -> {role, peer, self, started} или None, если
+    переноса нет. role: source на старом управляющем сервере, target на новом; self (только на старом):
+    как новый сервер заходит на старый. Номер переноса не отдаётся."""
+    try:
+        lines = (base / "migrate.conf").read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    kv = dict(line.split("=", 1) for line in lines if "=" in line)
+    if kv.get("role") not in ("source", "target"):
+        return None
+    return {"role": kv["role"], "peer": kv.get("peer", ""), "self": kv.get("self", ""),
+            "started": kv.get("started", "")}
+
+
 # Задачи: команды iof, которые что-то меняют. Одна за раз, лог хранится в памяти
 
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
@@ -329,13 +346,14 @@ class Jobs:
         with self.lock:
             return [dict(j, log=list(j["log"])) for j in reversed(self.items)]
 
-    def start(self, title, steps):
-        """steps: [(подпись для лога, argv, stdin bytes или None)]. None, если занято."""
+    def start(self, title, steps, kind):
+        """steps: [(подпись для лога, argv, stdin bytes или None)], kind: node или migrate,
+        по нему страница находит свои задачи. None, если занято."""
         with self.lock:
             if self.running:
                 return None
             self.running = True
-            job = {"id": secrets.token_hex(6), "title": title, "state": "running",
+            job = {"id": secrets.token_hex(6), "kind": kind, "title": title, "state": "running",
                    "started": time.time(), "finished": None, "log": []}
             self.items = (self.items + [job])[-self.KEEP:]
         threading.Thread(target=self.run, args=(job, steps), daemon=True).start()
@@ -367,7 +385,8 @@ class Jobs:
                         line = ANSI.sub("", raw.decode("utf-8", "replace")).rstrip("\n").split("\r")[-1]
                         if line.strip():
                             self.say(job, line)
-                        # hy2 install завершается с кодом 0, даже если на узле не получилось
+                        # hy2 install завершается с кодом 0, даже если на узле не получилось,
+                        # migrate start тоже, если новый сервер видит не все узлы
                         if line.startswith("Ошибки ("):
                             state = "warn"
                     rc = p.wait()
@@ -388,36 +407,30 @@ class Jobs:
             self.on_done()
 
 
-# Проверки полей нового сервера, те же, что делает iof node add, чтобы ошибки было видно
+# Проверки полей формы, те же, что делает iof (node add, migrate start), чтобы ошибки было видно
 # сразу в форме. iof всё равно проверяет их ещё раз сам
 NODE_NAME = re.compile(r"^[A-Za-z0-9._-]{1,40}$")
 NODE_HOST = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
 NODE_USER = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
+SSH_TARGET = re.compile(r"^[a-z_][a-z0-9_-]{0,31}@[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?(:[0-9]{1,5})?$")
 
 
-def node_add_steps(iof, body, existing):
-    """Поля формы -> (заголовок задачи, шаги для Jobs). ValueError с текстом для формы."""
-    def text(key, limit):
-        v = body.get(key, "")
-        if not isinstance(v, str):
-            raise ValueError(f"поле {key}: нужна строка")
-        v = v.strip()
-        if len(v) > limit:
-            raise ValueError(f"поле {key}: слишком длинное")
-        return v
+def text_field(body, key, limit):
+    v = body.get(key, "")
+    if not isinstance(v, str):
+        raise ValueError(f"поле {key}: нужна строка")
+    v = v.strip()
+    if len(v) > limit:
+        raise ValueError(f"поле {key}: слишком длинное")
+    return v
 
-    name, host, addr = text("name", 40), text("host", 253), text("addr", 253)
-    title, user, auth = text("title", 64), text("user", 32) or "root", text("auth", 16)
-    if not NODE_NAME.match(name):
-        raise ValueError("имя узла: латиница, цифры, точка, дефис, подчёркивание")
-    if name in existing:
-        raise ValueError(f"узел {name} уже есть в nodes.conf")
+
+def login_fields(body):
+    """Хост, SSH-порт, пользователь и способ входа из формы -> (host, port, user, аргументы iof
+    для способа входа, stdin). Пароль и ключ уходят в iof через stdin, в аргументах их нет."""
+    host, user, auth = text_field(body, "host", 253), text_field(body, "user", 32) or "root", text_field(body, "auth", 16)
     if not NODE_HOST.match(host):
         raise ValueError("хост: IPv4 или имя хоста (латиница, цифры, точка, дефис)")
-    if addr and not NODE_HOST.match(addr):
-        raise ValueError("адрес для клиентов: IPv4 или имя хоста")
-    if "|" in title:
-        raise ValueError("подпись не может содержать |")
     if not NODE_USER.match(user):
         raise ValueError("пользователь: строчная латиница, цифры, _ и -")
     try:
@@ -427,31 +440,70 @@ def node_add_steps(iof, body, existing):
     if not 1 <= port <= 65535:
         raise ValueError("SSH-порт: число от 1 до 65535")
 
-    argv = [iof, "node", "add", name, host, title, str(port), "--user", user, "--addr", addr or host]
-    stdin = None
     if auth == "password":
         password = body.get("password", "")
         if not isinstance(password, str) or not password or len(password) > 1024 or "\n" in password:
             raise ValueError("пароль: обязателен, одной строкой")
-        argv.append("--password-stdin")
-        stdin = (password + "\n").encode("utf-8")
-    elif auth == "key":
+        return host, port, user, ["--password-stdin"], (password + "\n").encode("utf-8")
+    if auth == "key":
         key = body.get("key", "")
         if (not isinstance(key, str) or len(key) > 16384
                 or ("PRIVATE KEY" not in key and "PuTTY" not in key)):
             raise ValueError("ключ: вставь приватный ключ OpenSSH целиком (-----BEGIN ... PRIVATE KEY-----)")
-        argv.append("--key-stdin")
-        stdin = key.encode("utf-8")
-    elif auth == "installed":
-        argv.append("--key-installed")
-    else:
-        raise ValueError("способ входа: пароль, ключ или ключ iof уже добавлен")
+        return host, port, user, ["--key-stdin"], key.encode("utf-8")
+    if auth == "installed":
+        return host, port, user, ["--key-installed"], None
+    raise ValueError("способ входа: пароль, ключ или ключ iof уже добавлен")
 
+
+def node_add_steps(iof, body, existing):
+    """Поля формы -> (заголовок задачи, шаги для Jobs). ValueError с текстом для формы."""
+    name, addr, title = text_field(body, "name", 40), text_field(body, "addr", 253), text_field(body, "title", 64)
+    if not NODE_NAME.match(name):
+        raise ValueError("имя узла: латиница, цифры, точка, дефис, подчёркивание")
+    if name in existing:
+        raise ValueError(f"узел {name} уже есть в nodes.conf")
+    host, port, user, auth_args, stdin = login_fields(body)
+    if addr and not NODE_HOST.match(addr):
+        raise ValueError("адрес для клиентов: IPv4 или имя хоста")
+    if "|" in title:
+        raise ValueError("подпись не может содержать |")
+
+    argv = [iof, "node", "add", name, host, title, str(port), "--user", user, "--addr", addr or host, *auth_args]
     # В лог идёт команда без пароля и ключа: они уходят в iof через stdin
     steps = [(shlex.join(["iof", *argv[1:]]), argv, stdin)]
     if body.get("install_hy2"):
         steps.append((f"iof hy2 install {name}", [iof, "hy2", "install", name], None))
     return f"Добавление сервера {name} ({host})", steps
+
+
+def migrate_steps(iof, body, migrate):
+    """Кнопка на странице «Перенос» -> (заголовок задачи, шаги для Jobs). migrate — состояние
+    из read_migrate. ValueError с текстом для формы."""
+    action = body.get("action")
+    role = migrate["role"] if migrate else ""
+    if action == "start":
+        if role == "target":
+            raise ValueError("этот сервер сам принимает управление, сначала заверши тот перенос")
+        host, port, user, auth_args, stdin = login_fields(body)
+        self_target = text_field(body, "self", 300)
+        if self_target and not SSH_TARGET.match(self_target):
+            raise ValueError("адрес этого сервера: вид root@адрес или root@адрес:порт")
+        argv = [iof, "migrate", "start", host, str(port), "--user", user, *auth_args]
+        if self_target:
+            argv += ["--self", self_target]
+        return f"Перенос управления на {host}", [(shlex.join(["iof", *argv[1:]]), argv, stdin)]
+    if action == "finish":
+        if role != "target":
+            raise ValueError("этот сервер не принимает управление")
+        argv = [iof, "migrate", "finish", *(["--skip-old"] if body.get("skip_old") else [])]
+        return "Завершение переноса", [(shlex.join(["iof", *argv[1:]]), argv, None)]
+    if action == "cancel":
+        if role != "source":
+            raise ValueError("отсюда перенос не начат")
+        argv = [iof, "migrate", "cancel"]
+        return "Отмена переноса", [(shlex.join(["iof", *argv[1:]]), argv, None)]
+    raise ValueError("неизвестное действие")
 
 
 # HTTP
@@ -484,6 +536,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.hy2_qr(query.get("g", ""), query.get("i", ""))
         if url.path == "/api/nodes/add-info":
             return self.add_info()
+        if url.path == "/api/migrate":
+            return self.migrate_info()
         if url.path == "/api/jobs":
             return self.send_json({"jobs": self.server.jobs.list()})
         if url.path in STATIC_FILES:
@@ -493,19 +547,24 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self.host_allowed() or not self.authorized() or not self.same_origin():
             return
-        if urlsplit(self.path).path != "/api/nodes":
+        path = urlsplit(self.path).path
+        if path not in ("/api/nodes", "/api/migrate"):
             return self.send_json({"error": "не найдено"}, HTTPStatus.NOT_FOUND)
         body = self.read_json()
         if body is None:
             return
         try:
-            title, steps = node_add_steps(self.server.iof, body, self.node_names())
+            if path == "/api/nodes":
+                kind = "node"
+                title, steps = node_add_steps(self.server.iof, body, self.node_names())
+                if body.get("install_hy2") and not self.server.hy2_template.is_file():
+                    raise ValueError(f"нет шаблона {self.server.hy2_template} для установки Hysteria2")
+            else:
+                kind = "migrate"
+                title, steps = migrate_steps(self.server.iof, body, read_migrate(self.server.base))
         except ValueError as e:
             return self.send_json({"error": str(e)}, HTTPStatus.BAD_REQUEST)
-        if body.get("install_hy2") and not self.server.hy2_template.is_file():
-            return self.send_json({"error": f"нет шаблона {self.server.hy2_template} для установки Hysteria2"},
-                                  HTTPStatus.BAD_REQUEST)
-        job = self.server.jobs.start(title, steps)
+        job = self.server.jobs.start(title, steps, kind)
         if job is None:
             return self.send_json({"error": "уже идёт другая задача, дождись её окончания"}, HTTPStatus.CONFLICT)
         self.send_json({"job": job["id"]}, HTTPStatus.ACCEPTED)
@@ -548,15 +607,31 @@ class Handler(BaseHTTPRequestHandler):
     def node_names(self):
         return {r[0] for r in read_conf(self.server.base / "nodes.conf", 4)}
 
-    def add_info(self):
+    def pubkey(self):
         try:
-            pubkey = self.server.ssh_pub.read_text(encoding="utf-8").strip()
+            return self.server.ssh_pub.read_text(encoding="utf-8").strip()
         except OSError:
-            pubkey = ""
+            return ""
+
+    def add_info(self):
         self.send_json({
             "nodes": sorted(self.node_names()),
-            "pubkey": pubkey,
+            "pubkey": self.pubkey(),
             "hy2_template": self.server.hy2_template.is_file(),
+            "busy": self.server.jobs.busy(),
+            "migrate": read_migrate(self.server.base),
+        })
+
+    # Справка для страницы «Перенос»: состояние переноса и адрес этого сервера как узла,
+    # по нему новый сервер будет заходить сюда, если в форме не указано другое
+    def migrate_info(self):
+        nodes = read_conf(self.server.base / "nodes.conf", 4)
+        local = [addr for _, addr, ssh, _ in nodes if (ssh or "local") == "local"]
+        self.send_json({
+            "migrate": read_migrate(self.server.base),
+            "self_addr": local[0] if local else "",
+            "nodes": len(nodes),
+            "pubkey": self.pubkey(),
             "busy": self.server.jobs.busy(),
         })
 
@@ -586,6 +661,7 @@ class Handler(BaseHTTPRequestHandler):
             "relays": read_relays(base),
             "hy2_groups": [g for g in read_index(base / "hy2" / "index.tsv") if SAFE_NAME.match(g["name"])],
             "awg_clients": read_awg_clients(base),
+            "migrate": read_migrate(base),
         })
         self.send_json(data)
 
@@ -595,6 +671,7 @@ class Handler(BaseHTTPRequestHandler):
             "generated_at": time.time(),
             "groups": read_hy2_groups(self.server.base),
             "qr": shutil.which("qrencode") is not None,
+            "migrate": read_migrate(self.server.base),
         })
         self.send_json(data)
 
