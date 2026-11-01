@@ -60,6 +60,11 @@ function renderVersion() {
     ["Установлена", fmtVersion(i.version)],
     ["Клон", `<span class="mono">${esc(i.src)}</span>${i.src_version ? `, ${fmtVersion(i.src_version)}` : ' <span class="muted">— git-клона нет</span>'}`],
   ];
+  if (i.update_log) {
+    const when = new Date(i.update_log.at * 1000).toLocaleString("ru-RU", { dateStyle: "short", timeStyle: "short" });
+    rows.push(["Обновлялась", `${when} из панели <details class="more"><summary>вывод iof update</summary>
+      <pre class="code">${esc(i.update_log.lines.join("\n"))}</pre></details>`]);
+  }
   $("#version").innerHTML = kv(rows);
 
   const u = svc.updates;
@@ -203,7 +208,7 @@ async function update() {
   formError("", "#action-error");
   try {
     const id = DEMO ? demoUpdateJob() : (await postJson("api/service", { action: "update" })).job;
-    svc.updating = { id, from: svc.info.version, last: null };
+    svc.updating = { id, from: svc.info.version, last: null, started: Date.now() / 1000 };
     renderVersion();
     $("#job").scrollIntoView({ behavior: "smooth", block: "nearest" });
     pollUpdate();
@@ -249,7 +254,11 @@ async function pollUpdate() {
   $("#job-hide").hidden = false;
   $("#job-title").textContent = "Обновление iof и панели";
   $("#job-state").innerHTML = badge("good", "готово");
-  if (u.last) $("#job-log").textContent = [...u.last.log, "… панель перезапущена"].join("\n");
+  // Полный вывод — из /var/log/iof-update.log: задача успела показать только начало
+  const ul = svc.info.update_log;
+  $("#job-log").textContent = ul && ul.at > u.started - 60
+    ? ["$ iof update", ...ul.lines].join("\n")
+    : [...(u.last ? u.last.log : ["$ iof update"]), "… панель перезапущена"].join("\n");
   jobResult("good", to === u.from
     ? `${icon("good")}<div>Панель перезапущена, версия та же: ${fmtVersion(to)}. Новых коммитов не было.</div>`
     : `${icon("good")}<div>Обновлено: ${fmtVersion(u.from)} → ${fmtVersion(to)}.

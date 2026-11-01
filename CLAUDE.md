@@ -31,6 +31,7 @@ Docker Desktop там не запускается: Kaspersky Standard не да�
 | `web/iof-web.py` | сервер панели, только stdlib python3 | `/opt/iof-web/iof-web.py` |
 | `web/iof-web.service` | systemd-юнит панели | `/etc/systemd/system/iof-web.service` |
 | `web/static/*` | страницы панели: html, js, css | `/opt/iof-web/static/` |
+| `web/design.md` | цвета, шрифты, размеры, брейкпоинты и классы панели | не ставится |
 | `README.md` | инструкция для пользователя | — |
 | `stand/` | тестовый стенд на Docker: `Dockerfile` (Ubuntu 24.04 с systemd и SSH), `compose.yml` (old, node1, node2, new), `stand.sh`, `hy2-template.yaml` | не ставится; попадает в `/opt/iof` как часть клона |
 
@@ -147,7 +148,9 @@ sha1-хэш. Повторный запуск с той же подписью д�
   `iof hy2 install`), `POST /api/migrate` (`action`: start, finish или cancel), `POST /api/hy2`
   (`add|del|refresh`), `POST /api/node` (`restart_hy2|install_hy2|delete`, удаление = `node del` + `refresh`),
   `POST /api/service` (`update`: `iof update` через `systemd-run --pipe --wait`, потому что install.sh
-  перезапускает панель; страница «Сервис» ждёт перезапуска и сравнивает версию).
+  перезапускает панель; вывод через `tee -p` ещё и в `/var/log/iof-update.log`, без этого `iof update`
+  падал с кодом 1 на записи в оборванную трубу. Страница «Сервис» ждёт перезапуска, сравнивает
+  версию и показывает вывод из этого файла).
   Состояние переноса (`read_migrate`, поле `migrate`) есть в ответах dashboard, hy2, add-info
   и migrate; `renderMigrate` в `common.js` показывает по нему плашку `#migrate-banner`.
 - Защита: проверка `Host` против DNS rebinding (`IOF_WEB_HOSTS`). POST принимается только
@@ -158,6 +161,9 @@ sha1-хэш. Повторный запуск с той же подписью д�
 - Пароли и ключи из формы передаются в `iof` через stdin (`--password-stdin`, `--key-stdin`),
   в лог задачи пишется команда без них. Поля формы проверяются и в панели, и в `iof`.
   Поля входа на сервер разбирает `login_fields` (общая для добавления и переноса).
+- **Внешний вид** описан в [`web/design.md`](web/design.md): цвета обеих тем, шрифты, размеры,
+  брейкпоинты, классы. Цвета бери оттуда, а не ищи в `app.css`. Если меняешь их в `app.css`,
+  обнови и `design.md` в том же изменении.
 - Фронтенд на чистом JS. `common.js`: форматирование, иконки, `startPage({url, render, demo, init})`
   с автообновлением. Там же общий код форм с задачей iof: `collectLogin`, `initLoginForm`,
   `showErrors`, `formError`, `postJson`, `pageJob`, `renderJobCard`, `jobResult`, `failReason`.

@@ -21,6 +21,7 @@ const demoState = {
   ],
   deleted: [],
   version: "e741874 2026-11-01",
+  updateLog: null,
   jobs: [
     {
       id: "demo-1", kind: "node", title: "Добавление сервера node-4 (203.0.113.42)", state: "ok",
@@ -144,6 +145,7 @@ function demoService(fetch) {
         "== node-4", "Running as unit: iof-nightly.service", "== node-5", "   код выхода 255", "",
         "Выполнено на 6 узлах, с ошибкой: 1"],
     },
+    update_log: demoState.updateLog,
     nightly_local: {
       steps: ["2026-11-01 04:00:02 управляющий сервер, жду 5 минут", "2026-11-01 04:05:02 обновление", "2026-11-01 04:07:41 перезагрузка"],
       errors: [],
@@ -240,10 +242,11 @@ function demoNodeJob(body) {
 
 // Обновление в демо: после задачи «панель перезапускается», и задача пропадает, как на сервере
 function demoUpdateJob() {
-  return demoRunJob("service", "Обновление iof и панели", [
-    "$ iof update", "Изменения e741874..9c41d2e:", "  9c41d2e iof: hy2 restart проверяет, что сервис поднялся", "  51ab0f7 iof-web: страница узла",
-    "iof: /usr/local/bin/iof (9c41d2e 2026-11-02)", "iof-nightly: /usr/local/sbin/iof-nightly",
-  ], "ok", (job) => {
+  const out = ["Изменения e741874..9c41d2e:", "  9c41d2e iof: hy2 restart проверяет, что сервис поднялся", "  51ab0f7 iof-web: страница узла",
+    "iof: /usr/local/bin/iof (9c41d2e 2026-11-02)", "iof-nightly: /usr/local/sbin/iof-nightly"];
+  // Как на сервере: задача успевает показать только начало, полный вывод остаётся в файле
+  return demoRunJob("service", "Обновление iof и панели", ["$ iof update", ...out.slice(0, 2)], "ok", (job) => {
+    demoState.updateLog = { at: Date.now() / 1000, lines: [...out, "iof-web: работает, http://127.0.0.1:8088/ (с компьютера через SSH-туннель)"] };
     demoState.version = "9c41d2e 2026-11-02";
     demoState.jobs = demoState.jobs.filter((j) => j !== job);
   });

@@ -62,6 +62,8 @@ STATIC_FILES = {
 # Логи ночного обслуживания: запуск с управляющего сервера и сама работа на этом сервере как узле
 NIGHTLY_RUN_LOG = Path("/var/log/iof-nightly-run.log")
 NIGHTLY_LOG = Path("/var/log/iof-nightly.log")
+# Вывод iof update, запущенного из панели: панель перезапускается раньше, чем покажет его целиком
+UPDATE_LOG = Path("/var/log/iof-update.log")
 
 SECURITY_HEADERS = {
     "X-Content-Type-Options": "nosniff",
@@ -391,6 +393,18 @@ def read_nightly_local(path):
             "errors": [line for line in block if line.startswith("E: ")][-5:]}
 
 
+def read_update_log(path):
+    """Последний iof update из панели: {at (unix), lines} или None."""
+    lines = tail_lines(path, 32768)
+    if lines is None:
+        return None
+    try:
+        at = path.stat().st_mtime
+    except OSError:
+        return None
+    return {"at": at, "lines": [ANSI.sub("", line) for line in lines][-120:]}
+
+
 def iof_api(iof, args, timeout):
     """Вывод iof api ... (key=value по строке) -> (словарь, ошибка или None). Повторяющиеся ключи
     cron и commit собираются в списки."""
@@ -671,11 +685,13 @@ def node_steps(iof, body, conf, relays, hy2_template, migrate):
 def service_steps(iof, body):
     """Кнопка «Обновить» на странице «Сервис». install.sh в конце перезапускает панель, а с ней
     и всё, что она запустила, поэтому iof update идёт отдельным юнитом systemd: он доработает,
-    даже когда панель перезапустится. Лог идёт в задачу, пока панель жива."""
+    даже когда панель перезапустится. Лог идёт в задачу, пока панель жива, и в UPDATE_LOG целиком:
+    tee -p продолжает писать в файл, когда читать из трубы уже некому."""
     if body.get("action") != "update":
         raise ValueError("неизвестное действие")
+    script = f"set -o pipefail; {shlex.quote(iof)} update 2>&1 | tee -p {shlex.quote(str(UPDATE_LOG))}"
     argv = ["systemd-run", "--unit=iof-update", "--collect", "--quiet", "--wait", "--pipe",
-            "--setenv=LC_ALL=C.UTF-8", iof, "update"]
+            "--setenv=LC_ALL=C.UTF-8", "/bin/bash", "-c", script]
     return "Обновление iof и панели", [("iof update", argv, None)]
 
 
@@ -905,6 +921,7 @@ class Handler(BaseHTTPRequestHandler):
             "check": read_check(base),
             "nightly": read_nightly_run(NIGHTLY_RUN_LOG),
             "nightly_local": read_nightly_local(NIGHTLY_LOG),
+            "update_log": read_update_log(UPDATE_LOG),
             "busy": self.server.jobs.busy(),
             "migrate": read_migrate(base),
         }
