@@ -5,7 +5,7 @@
 // ход: GET api/jobs. На старом сервере страница начинает и отменяет перенос, на новом завершает
 
 const TARGET_RE = /^[a-z_][a-z0-9_-]{0,31}@[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?(:\d{1,5})?$/;
-const mig = { info: null, jobId: null, timer: null };
+const mig = { info: null };
 
 // root@203.0.113.5:2222 -> { user, host, port }
 function parseTarget(t) {
@@ -98,21 +98,7 @@ function renderJob(job) {
   jobResult(lvl, (results[action] || {})[job.state]);
 }
 
-async function pollJob() {
-  clearTimeout(mig.timer);
-  try {
-    const job = await pageJob("migrate", mig.jobId, demoJobs);
-    renderJob(job);
-    if (job && job.state === "running") {
-      mig.timer = setTimeout(pollJob, 1000);
-    } else if (job && job.id === mig.jobId) {
-      mig.jobId = null;
-      loadInfo();
-    }
-  } catch (e) {
-    mig.timer = setTimeout(pollJob, 3000);
-  }
-}
+const job = watchJob({ kind: "migrate", demoJobs: () => demoJobs(), render: renderJob, done: () => loadInfo() });
 
 
 // Действия
@@ -120,9 +106,9 @@ async function pollJob() {
 async function run(body, errorSel) {
   formError("", errorSel);
   try {
-    mig.jobId = DEMO ? demoRun(body) : (await postJson("api/migrate", body)).job;
+    const id = DEMO ? demoRun(body) : (await postJson("api/migrate", body)).job;
     $("#job").scrollIntoView({ behavior: "smooth", block: "start" });
-    pollJob();
+    job.start(id);
     return true;
   } catch (err) {
     formError(err.message, errorSel);
@@ -182,7 +168,7 @@ document.addEventListener("DOMContentLoaded", () => {
   $("#finish").addEventListener("click", finish);
 
   loadInfo();
-  pollJob();
+  job.poll();
 });
 
 

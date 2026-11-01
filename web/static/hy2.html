@@ -41,6 +41,10 @@
           <span>Перенос</span>
           <span id="nav-migrate" class="nav-badge" hidden></span>
         </a>
+        <a href="service.html">
+          <svg class="nav-ico" viewBox="0 0 20 20" aria-hidden="true"><path d="M12.6 3.3a4 4 0 0 0-5 5.1l-4.3 4.3a1.6 1.6 0 0 0 2.3 2.3l4.3-4.3a4 4 0 0 0 5.1-5l-2.4 2.4-2.1-.3-.3-2.1z"/></svg>
+          <span>Сервис</span>
+        </a>
       </nav>
       <div class="side-foot">
         <p id="demo-chip" class="demo-chip" hidden>Демо-режим: данные выдуманы, сервер не нужен</p>
@@ -85,11 +89,33 @@
       <main>
         <div id="alert" class="alert" role="alert" hidden></div>
         <div id="migrate-banner" class="note warn banner" role="status" hidden></div>
+        <div id="action-error" class="form-error banner" role="alert" hidden></div>
+
+        <section id="job" class="card" hidden>
+          <div class="card-head">
+            <h2 id="job-title">Выполнение</h2>
+            <div class="actions"><span id="job-state"></span><button id="job-hide" class="btn small" type="button" hidden>Скрыть</button></div>
+          </div>
+          <div id="job-result"></div>
+          <pre id="job-log" class="log" aria-live="polite"></pre>
+        </section>
 
         <div class="hy2-layout">
           <section class="card">
-            <div class="card-head"><h2>Группы ссылок <span id="groups-count" class="count"></span></h2></div>
+            <div class="card-head">
+              <h2>Группы ссылок <span id="groups-count" class="count"></span></h2>
+              <button id="new-group-btn" class="btn small" type="button" aria-expanded="false" aria-controls="new-group">Новая группа</button>
+            </div>
+            <form id="new-group" class="inline-form" novalidate autocomplete="off" hidden>
+              <label class="sr-only" for="f-label">Подпись группы</label>
+              <input id="f-label" maxlength="64" placeholder="Подпись, например Family" spellcheck="false">
+              <button class="btn small primary" type="submit" data-lock>Создать</button>
+              <p class="hint">Ссылки на все узлы для одного человека или устройства. Подпись видна в клиенте: «Family | Node 1»</p>
+            </form>
             <div id="groups" class="group-list"></div>
+            <div class="btn-row">
+              <button id="refresh-all" class="btn small" type="button" data-lock>Пересобрать все группы</button>
+            </div>
           </section>
 
           <section id="group" class="card group-detail" aria-live="polite"></section>
@@ -114,10 +140,11 @@
         <section class="card">
           <div class="card-head"><h2>Команды на сервере</h2></div>
           <dl class="cmds">
-            <dt><code>sudo iof hy2 add "Подпись"</code></dt><dd>создать группу ссылок по всем узлам (повтор с той же подписью безопасен)</dd>
+            <dt><code>sudo iof hy2 add "Подпись"</code></dt><dd>создать группу ссылок по всем узлам (повтор с той же подписью пересобирает её)</dd>
             <dt><code>sudo iof hy2 del "Подпись"</code></dt><dd>удалить группу (в режиме userpass удаляет и пользователя)</dd>
             <dt><code>sudo iof hy2 refresh</code></dt><dd>пересобрать все группы после смены узлов, IP, пароля или ретранслятора</dd>
             <dt><code>sudo iof hy2 install all</code></dt><dd>поставить Hysteria2 на новые узлы, затем они попадут в группы</dd>
+            <dt><code>sudo iof hy2 restart all</code></dt><dd>перезапустить Hysteria2 на узлах; на одном узле — кнопкой на его странице</dd>
           </dl>
         </section>
       </main>

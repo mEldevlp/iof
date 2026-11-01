@@ -1,11 +1,27 @@
 "use strict";
 
 // Страница «Hysteria2»: группы ссылок, ссылки с копированием и QR, состояние на узлах.
-// Данные: GET api/hy2, QR: GET api/hy2/qr?g=<логин>&i=<номер|all> (см. iof-web.py)
+// Данные: GET api/hy2, QR: GET api/hy2/qr?g=<логин>&i=<номер|all> (см. iof-web.py),
+// создание, пересборка и удаление групп: POST api/hy2 (задачи iof hy2 add | del | refresh)
 
 // Ёмкость QR на уровне коррекции L около 2950 байт, длинную группу одним кодом не показать
 const QR_MAX_BYTES = 2900;
-const page = { data: null, reveal: false };
+const page = { data: null, reveal: false, running: false };
+
+const job = watchJob({
+  kind: "hy2",
+  demoJobs: () => demoJobs(),
+  all: false,
+  render: renderJob,
+  done(j) {
+    // Новую группу сразу открыть: логин iof печатает в строке «Файл: …/hy2/<логин>.txt»
+    const cmd = j.log[0] || "";
+    const file = j.log.map((l) => /^Файл:\s+\S*\/hy2\/([^/\s]+)\.txt$/.exec(l)).filter(Boolean).pop();
+    if (cmd.startsWith("$ iof hy2 add") && file) location.hash = `#g=${encodeURIComponent(file[1])}`;
+    if (cmd.startsWith("$ iof hy2 del")) history.replaceState(null, "", location.pathname + location.search);
+    pageApi.reload();
+  },
+});
 
 function selectedName(d) {
   const m = /^#g=(.+)$/.exec(location.hash);
@@ -42,6 +58,76 @@ function qrImage(d, g, i, alt) {
 
 function utf8Len(s) {
   return new TextEncoder().encode(s).length;
+}
+
+// Режим доступа на узлах: password (общий пароль), userpass или пусто, если разный или неизвестен
+function authMode(d) {
+  const modes = new Set(d.nodes.filter((n) => n.reachable && n.hy2.installed).map((n) => n.hy2.auth));
+  return modes.size === 1 ? [...modes][0] : "";
+}
+
+
+// Действия с группами: задача iof, ход в карточке #job
+
+async function run(body) {
+  formError("", "#action-error");
+  try {
+    const id = DEMO ? demoHy2Job(body) : (await postJson("api/hy2", body)).job;
+    job.start(id);
+    $("#job").scrollIntoView({ behavior: "smooth", block: "nearest" });
+    return true;
+  } catch (e) {
+    formError(e.message, "#action-error");
+    return false;
+  }
+}
+
+function renderJob(j) {
+  const lvl = renderJobCard(j);
+  page.running = !!j && j.state === "running";
+  lock();
+  if (!j) return;
+  $("#job-hide").hidden = page.running;
+  const why = failReason(j.log);
+  jobResult(lvl, {
+    ok: `${icon("good")}<div>Готово.</div>`,
+    warn: `${icon("warn")}<div>Готово, но не на всех узлах, список в логе. Когда они будут на связи, повтори: дублей не будет.</div>`,
+    error: `${icon("crit")}<div>Не получилось${why ? `: <b>${esc(why)}</b>` : ", причина в логе"}</div>`,
+  }[j.state]);
+}
+
+// Кнопки с data-lock недоступны, пока идёт задача или перенос управления отсюда
+function lock() {
+  const m = page.data && page.data.migrate;
+  const blocked = !!m && m.role === "source";
+  document.querySelectorAll("[data-lock]").forEach((b) => {
+    b.disabled = page.running || blocked;
+    b.title = blocked ? "Идёт перенос управления, изменения здесь заблокированы" : "";
+  });
+}
+
+async function createGroup(e) {
+  e.preventDefault();
+  const input = $("#f-label");
+  const label = input.value.trim();
+  const err = !label ? "введи подпись" : label.includes("|") ? "без символа |" : "";
+  if (err) {
+    input.setAttribute("aria-invalid", "true");
+    formError(`Подпись группы: ${err}`, "#action-error");
+    input.focus();
+    return;
+  }
+  input.removeAttribute("aria-invalid");
+  if (await run({ action: "add", label })) {
+    input.value = "";
+    toggleForm(false);
+  }
+}
+
+function toggleForm(open) {
+  $("#new-group").hidden = !open;
+  $("#new-group-btn").setAttribute("aria-expanded", String(open));
+  if (open) $("#f-label").focus();
 }
 
 
@@ -90,9 +176,11 @@ function renderGroup(d, name) {
       <div class="actions">
         <label class="check"><input id="reveal" type="checkbox"${page.reveal ? " checked" : ""}> показать пароль</label>
         <button id="copy-all" class="btn primary" type="button"${g.links.length ? "" : " disabled"}>Скопировать все (${g.links.length})</button>
+        <button class="btn" type="button" data-hy2="rebuild" data-lock>Пересобрать</button>
+        <button class="btn danger" type="button" data-hy2="del" data-lock>Удалить</button>
       </div>
     </div>
-    ${notes.length ? `<div class="note warn">${icon("warn")}<div>${notes.join(" ")} Пересобери группы: <code>sudo iof hy2 refresh</code></div></div>` : ""}
+    ${notes.length ? `<div class="note warn">${icon("warn")}<div>${notes.join(" ")} Нажми «Пересобрать», чтобы ссылки в группе совпали с узлами.</div></div>` : ""}
     <div class="group-body">
       <ol class="links">
         ${g.links.map((l, i) => `<li class="link">
@@ -119,6 +207,13 @@ function renderGroup(d, name) {
   $("#copy-all").addEventListener("click", async () => {
     toast(await copyText(all) ? `Скопировано ссылок: ${g.links.length}` : "Не удалось скопировать");
   });
+  el.querySelector('[data-hy2="rebuild"]').addEventListener("click", () => run({ action: "add", label: g.label }));
+  el.querySelector('[data-hy2="del"]').addEventListener("click", () => {
+    const keep = authMode(d) === "password"
+      ? "В режиме общего пароля выданные ссылки продолжат работать: отключить их можно только сменой пароля на всех узлах."
+      : "Пользователь группы удалится с узлов, и её ссылки перестанут работать.";
+    if (confirm(`Удалить группу «${g.label}»? ${keep}`)) run({ action: "del", name: g.name });
+  });
   el.querySelectorAll("[data-copy]").forEach((b) => b.addEventListener("click", async () => {
     const l = g.links[Number(b.dataset.copy)];
     toast(await copyText(l.url) ? `Скопирована ссылка: ${l.node || l.title}` : "Не удалось скопировать");
@@ -137,7 +232,7 @@ function renderNodes(d) {
   $("#nodes-count").textContent = nodes.length || "";
   $("#nodes").innerHTML = nodes.map((n) => {
     const head = `<td class="cell-node"><div class="node-cell"><div>
-        <div class="node-name">${esc(n.name)}</div>
+        <div class="node-name"><a class="node-link" href="${nodeHref(n.name)}">${esc(n.name)}</a></div>
         ${n.title && n.title !== n.name ? `<span class="sub-line">${esc(n.title)}</span>` : ""}
       </div></div></td>
       <td data-label="Адрес"><span class="mono">${esc(n.addr)}</span></td>`;
@@ -154,25 +249,32 @@ function renderNodes(d) {
   $("table.nodes").hidden = !nodes.length;
   if (!nodes.length) empty.textContent = d.status_error ? `Не удалось опросить узлы: ${d.status_error}` : "Узлов нет.";
 
-  const modes = new Set(nodes.filter((n) => n.reachable && n.hy2.installed).map((n) => n.hy2.auth));
-  $("#auth-mode").textContent = modes.size !== 1 ? "" : modes.has("password")
+  const mode = authMode(d);
+  $("#auth-mode").textContent = mode === "password"
     ? "Режим общего пароля: у всех групп один пароль, отключить одного человека нельзя"
-    : modes.has("userpass") ? "Режим userpass: каждая группа — отдельный пользователь" : "";
+    : mode === "userpass" ? "Режим userpass: каждая группа — отдельный пользователь" : "";
 }
 
-startPage({
+const pageApi = startPage({
   url: "api/hy2",
   demo: demoHy2,
   init(rerender) {
     window.addEventListener("hashchange", rerender);
+    $("#new-group-btn").addEventListener("click", () => toggleForm($("#new-group").hidden));
+    $("#new-group").addEventListener("submit", createGroup);
+    $("#refresh-all").addEventListener("click", () => run({ action: "refresh" }));
+    $("#job-hide").addEventListener("click", () => job.hide());
+    job.poll();
     $("#qr-close").addEventListener("click", () => $("#qr-dialog").close());
     // Клик по фону закрывает окно с QR
     $("#qr-dialog").addEventListener("click", (e) => { if (e.target === e.currentTarget) e.currentTarget.close(); });
   },
   render(d) {
+    page.data = d;
     const name = selectedName(d);
     renderGroups(d, name);
     renderGroup(d, name);
     renderNodes(d);
+    lock();
   },
 });

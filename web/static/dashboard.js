@@ -2,43 +2,6 @@
 
 // Страница «Обзор». Данные: GET api/dashboard (см. iof-web.py)
 
-// Оценка состояния узла. Пороги те же, что в iof status
-
-function warnings(n) {
-  if (!n.reachable) return [];
-  const w = [];
-  if (n.cpu.pct >= 90) w.push(`ЦП ${n.cpu.pct}%`);
-  if (n.mem.pct >= 90) w.push(`память ${n.mem.pct}%`);
-  if (n.disk.pct >= 80 && n.disk.pct < 90) w.push(`диск ${n.disk.pct}%`);
-  return w;
-}
-
-function nodeLevel(n) {
-  if (!n.reachable || n.issues.length) return "crit";
-  return warnings(n).length ? "warn" : "good";
-}
-
-function awgCell(n) {
-  const a = n.awg;
-  if (a.state === "running") {
-    return badge("good", `работает :${a.port}`) +
-      `<span class="sub-line">${a.peers} ${plural(a.peers, ["клиент", "клиента", "клиентов"])} · онлайн ${a.online}</span>`;
-  }
-  if (a.state === "stopped") return badge("crit", "контейнер остановлен");
-  return '<span class="muted">не установлен</span>';
-}
-
-function meter(label, pct, warnAt, critAt, sub) {
-  const level = critAt && pct >= critAt ? "crit" : pct >= warnAt ? "warn" : "";
-  const width = Math.max(0, Math.min(100, pct));
-  return `<div class="meter" role="meter" aria-label="${esc(label)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}">
-    <div class="top">${level ? icon(level) : ""}<span>${pct}%</span></div>
-    <div class="track"><i class="${level}" data-w="${width}"></i></div>
-    <span class="sub-line">${esc(sub)}</span>
-  </div>`;
-}
-
-
 // Отрисовка
 
 function renderHealth(d) {
@@ -75,7 +38,7 @@ function renderHealth(d) {
     <h2>${esc(title)}</h2>
     <p class="sub">Проблемой считается: Hysteria2 не работает или не слушает порт, остановлен контейнер AWG, диск от 90%, нет связи по SSH.</p>
     ${items.length ? `<ul class="issues">${items.map((i) =>
-      `<li>${icon(i.lvl)}<span><b>${esc(i.n.name)}</b> <span class="muted">${esc(i.n.addr)}</span> — ${esc(i.text)}</span></li>`).join("")}</ul>` : ""}
+      `<li>${icon(i.lvl)}<span><a class="node-link" href="${nodeHref(i.n.name)}"><b>${esc(i.n.name)}</b></a> <span class="muted">${esc(i.n.addr)}</span> — ${esc(i.text)}</span></li>`).join("")}</ul>` : ""}
   </div>`;
 }
 
@@ -129,14 +92,14 @@ function nodeRow(n) {
   const level = nodeLevel(n);
   const tip = [...n.issues, ...warnings(n)].join("; ") || "в порядке";
   const head = `<td class="cell-node"><div class="node-cell"><span title="${esc(tip)}">${icon(level)}</span><div>
-      <div class="node-name">${esc(n.name)}</div>
+      <div class="node-name"><a class="node-link" href="${nodeHref(n.name)}">${esc(n.name)}</a></div>
       ${n.title && n.title !== n.name ? `<span class="sub-line">${esc(n.title)}</span>` : ""}
     </div></div></td>
     <td data-label="Адрес"><span class="mono">${esc(n.addr)}</span></td>`;
   if (!n.reachable) {
-    return `<tr class="is-crit">${head}<td class="cell-wide offline" colspan="7">${badge("crit", "нет связи по SSH")}</td></tr>`;
+    return `<tr class="is-crit" data-href="${nodeHref(n.name)}">${head}<td class="cell-wide offline" colspan="7">${badge("crit", "нет связи по SSH")}</td></tr>`;
   }
-  return `<tr class="${level === "good" ? "" : "is-" + level}">${head}
+  return `<tr class="${level === "good" ? "" : "is-" + level}" data-href="${nodeHref(n.name)}">${head}
     <td data-label="Hysteria2" class="cell-proto">${hy2Cell(n)}</td>
     <td data-label="AmneziaWG" class="cell-proto">${awgCell(n)}</td>
     <td data-label="ЦП">${meter("ЦП", n.cpu.pct, 90, 0, `LA ${n.cpu.load1} · ${n.cpu.cpus} ${plural(n.cpu.cpus, ["ядро", "ядра", "ядер"])}`)}</td>
@@ -156,8 +119,7 @@ function renderNodes(d) {
 
   $("#nodes-count").textContent = list.length === d.nodes.length ? d.nodes.length : `${list.length} из ${d.nodes.length}`;
   $("#nodes").innerHTML = list.map(nodeRow).join("");
-  // Ширина через CSSOM: inline style= запрещён политикой CSP сервера
-  document.querySelectorAll("#nodes .track i[data-w]").forEach((i) => { i.style.width = i.dataset.w + "%"; });
+  applyWidths($("#nodes"));
   const empty = $("#nodes-empty");
   empty.hidden = list.length > 0;
   $("table.nodes").hidden = !list.length;
@@ -202,6 +164,11 @@ startPage({
     $("#onlybad").checked = prefs.get("onlybad", "0") === "1";
     $("#onlybad").addEventListener("change", () => { prefs.set("onlybad", $("#onlybad").checked ? "1" : "0"); rerender(); });
     $("#q").addEventListener("input", rerender);
+    // Строка узла открывает его страницу, если не нажата ссылка и не выделяется текст
+    $("#nodes").addEventListener("click", (e) => {
+      const tr = e.target.closest("tr[data-href]");
+      if (tr && !e.target.closest("a, button") && !String(getSelection())) location.href = tr.dataset.href;
+    });
   },
   render(d) {
     renderHealth(d);

@@ -17,7 +17,11 @@ AWG_LINKS="$BASE/awg"
 AWG_INDEX="$AWG_LINKS/index.tsv"
 MIGRATE_FILE="$BASE/migrate.conf"
 MIGRATE_INBOX="/root/.iof-migrate"   # куда новый управляющий сервер принимает данные при переносе
+CHECK_FILE="$BASE/check.last"        # итог последнего iof check для панели
 SSH_KEY="/root/.ssh/iof_ed25519"
+
+# Коммит и дата этой версии, install.sh подставляет их при установке
+IOF_VERSION="dev"
 
 # Настройки по умолчанию, переопределяются в iof.env
 TG_TOKEN=""
@@ -160,6 +164,19 @@ n_hy2_restart() {
   else
     echo "[$(hostname)] не удалось перезапустить $SERVICE, сделай это вручную" >&2
   fi
+}
+
+# Перезапуск по команде iof hy2 restart: в отличие от n_hy2_restart это ошибка, если сервис не поднялся
+n_hy2_service_restart() {
+  n_defaults
+  [[ $EUID -eq 0 ]] || n_err "нужны права root"
+  systemctl cat "$SERVICE" >/dev/null 2>&1 || n_err "Hysteria2 не установлена"
+  systemctl restart "$SERVICE" || n_err "сервис не перезапустился: journalctl -u $SERVICE -n 30"
+  sleep 2
+  if ! systemctl is-active --quiet "$SERVICE"; then
+    n_err "сервис не работает: $(journalctl -u "$SERVICE" -n 3 --no-pager 2>/dev/null | tail -n 1)"
+  fi
+  echo "ok"
 }
 
 # Готовит доступ и печатает ссылку hy2:// в stdout.
@@ -963,7 +980,8 @@ n_migrate_abort() {
 # Всё, что run_on передаёт на узел
 NODE_FUNCS=(
   n_defaults n_err n_yaml_value n_urlencode
-  n_hy2_port n_hy2_userpass n_hy2_user_add n_hy2_user_del n_hy2_restart n_hy2_add n_hy2_del n_hy2_install
+  n_hy2_port n_hy2_userpass n_hy2_user_add n_hy2_user_del n_hy2_restart n_hy2_service_restart
+  n_hy2_add n_hy2_del n_hy2_install
   n_awg_find n_awg_running n_awg_iface n_awg_table_pubs n_awg_table_add n_awg_table_del n_awg_pubkey
   n_awg_clients n_awg_backup n_awg_add n_awg_del
   n_status
@@ -1484,7 +1502,7 @@ cmd_check() {
   read_nodes
   select_nodes
   mkdir -p "$STATE_DIR"
-  local i state prev bad=0 changes=()
+  local i state prev bad=0 changes=() bad_names=()
   probe_all "${SEL[@]}"
   for i in "${SEL[@]}"; do
     if probe_load "$i"; then
@@ -1502,12 +1520,18 @@ cmd_check() {
       fi
       printf '%s\n' "$state" > "$STATE_DIR/${N_NAME[$i]}"
     fi
-    if [[ "$state" != "ok" ]]; then bad=$((bad + 1)); fi
+    if [[ "$state" != "ok" ]]; then
+      bad=$((bad + 1))
+      bad_names+=("${N_NAME[$i]}")
+    fi
     echo "${N_NAME[$i]}: $state"
   done
   if (( ${#changes[@]} > 0 )); then
     tg_send "$(printf '%s\n' "${changes[@]}")"
   fi
+  # Итог для страницы «Сервис» панели: когда была проверка и что нашла
+  printf 'time=%s\ntotal=%s\nbad=%s\nproblems=%s\nchanges=%s\n' \
+    "$(date '+%F %T')" "${#SEL[@]}" "$bad" "${bad_names[*]}" "${#changes[@]}" > "$CHECK_FILE"
   (( bad == 0 ))
 }
 
@@ -1515,9 +1539,33 @@ cmd_check() {
 # Поля те же, что отдаёт n_status, плюс адрес, подпись, отклик и проблемы через "; "
 cmd_api() {
   case "${1:-}" in
-    status) api_status ;;
-    *)      die "используй: iof api status" ;;
+    status)  api_status ;;
+    service) api_service ;;
+    updates) api_updates ;;
+    *)       die "используй: iof api status | service | updates" ;;
   esac
+}
+
+# Для страницы «Сервис»: версия, клон репозитория, настроен ли Telegram, задания cron iof
+api_service() {
+  printf 'version=%s\nsrc=%s\n' "$IOF_VERSION" "$IOF_SRC"
+  if [[ -d "$IOF_SRC/.git" ]] && have git; then
+    printf 'src_version=%s\n' "$(git -C "$IOF_SRC" log -1 --format='%h %cd' --date=short 2>/dev/null || true)"
+  fi
+  if [[ -n "$TG_TOKEN" && -n "$TG_CHAT" ]]; then echo "tg=yes"; else echo "tg=no"; fi
+  crontab -l -u root 2>/dev/null | grep -v '^[[:space:]]*#' | grep -F 'iof' | sed 's/^/cron=/' || true
+}
+
+# Для страницы «Сервис»: git fetch в клоне, затем коммиты, которые принесёт iof update
+api_updates() {
+  local err
+  [[ -d "$IOF_SRC/.git" ]] || die "нет клона репозитория в $IOF_SRC"
+  have git || die "нет git: apt install git"
+  err="$(GIT_TERMINAL_PROMPT=0 git -C "$IOF_SRC" fetch --quiet 2>&1)" || die "git fetch не прошёл: $(tail -n 1 <<<"$err")"
+  git -C "$IOF_SRC" rev-parse --abbrev-ref '@{u}' >/dev/null 2>&1 \
+    || die "у ветки в $IOF_SRC нет вышестоящей (upstream), iof update не сможет сделать git pull"
+  printf 'branch=%s\n' "$(git -C "$IOF_SRC" rev-parse --abbrev-ref '@{u}')"
+  git -C "$IOF_SRC" log --format='commit=%h%x09%cd%x09%s' --date=short 'HEAD..@{u}'
 }
 
 api_status() {
@@ -1883,6 +1931,8 @@ hy2_del_job() { run_on "${N_SSH[$1]}" n_hy2_del "$HY2_DEL_NAME"; }
 hy2_add() {
   local label="${1:-}"
   [[ -n "$label" ]] || die "укажи подпись: iof hy2 add \"Подпись\""
+  # | разделяет подпись и узел в названии ссылки, табуляция — поля index.tsv
+  title_ok "$label" && [[ "$label" != *$'\t'* ]] || die "подпись не может содержать |, табуляцию и перевод строки"
   read_nodes
   mkdir -p "$HY2_DIR"
   chmod 700 "$HY2_DIR"
@@ -1957,7 +2007,7 @@ hy2_del() {
   done
   echo "Удалено на узлах: $(( ${#N_NAME[@]} - ${#failed[@]} )) из ${#N_NAME[@]}"
   if (( ${#failed[@]} > 0 )); then
-    echo "Ошибки:"
+    echo "Ошибки (${#failed[@]}):"
     report_failures "${failed[@]}"
   fi
   rm -f "$HY2_DIR/$name.txt"
@@ -2000,10 +2050,31 @@ hy2_refresh() {
   while IFS=$'\t' read -r name label created; do
     labels+=("$label")
   done < "$HY2_INDEX"
+  # hy2_add в подшелле: его die завершил бы всю пересборку на первой неудачной группе
   for l in "${labels[@]}"; do
     echo "Hysteria2: пересобираю '$l'"
-    hy2_add "$l" || echo "Не удалось обновить: $l"
+    ( trap pm_cleanup EXIT; hy2_add "$l" ) || echo "Не удалось обновить: $l"
   done
+}
+
+hy2_restart_job() { run_on "${N_SSH[$1]}" n_hy2_service_restart; }
+
+# Перезапуск Hysteria2 на выбранных узлах. Код 1, если где-то сервис не поднялся
+hy2_restart() {
+  local i ok=() failed=()
+  (( $# > 0 )) || die "укажи узлы: iof hy2 restart node-1   или   iof hy2 restart all"
+  read_nodes
+  select_nodes "$@"
+  pmap hy2_restart_job "${SEL[@]}"
+  for i in "${SEL[@]}"; do
+    if pm_ok "$i"; then ok+=("${N_NAME[$i]}"); else failed+=("$i"); fi
+  done
+  echo "Перезапущено: ${#ok[@]}${ok[*]:+ (${ok[*]})}"
+  if (( ${#failed[@]} > 0 )); then
+    echo "Ошибки (${#failed[@]}):"
+    report_failures "${failed[@]}"
+    return 1
+  fi
 }
 
 # Только Hysteria2
@@ -2102,7 +2173,8 @@ cmd_hy2() {
     refresh) hy2_refresh ;;
     status)  hy2_status ;;
     install) hy2_install "$@" ;;
-    *)       die "используй: iof hy2 add | del | list | show | refresh | status | install" ;;
+    restart) hy2_restart "$@" ;;
+    *)       die "используй: iof hy2 add | del | list | show | refresh | status | install | restart" ;;
   esac
 }
 
@@ -2967,8 +3039,9 @@ Island of Freedom управление VPN-серверами // by meldevlp
   iof exec "команда"          выполнить команду на узлах
   iof refresh                 пересобрать все ссылки hy2 и ключи awg
   iof init                    первичная настройка управляющего сервера
-  iof api status              состояние узлов в виде key=value для веб-панели
+  iof api status|service|updates   данные для веб-панели в виде key=value
   iof update [--no-web]       обновить iof и веб-панель с GitHub (клон в /opt/iof)
+  iof version                 установленная версия (коммит и дата)
 
 Узлы
   iof node import файл        добавить много серверов по паролям root (строки: имя | ip | пароль | подпись | ssh_порт)
@@ -2989,6 +3062,7 @@ Hysteria2
   iof hy2 show "Подпись"      показать ссылки группы
   iof hy2 refresh             пересобрать все группы
   iof hy2 status              состояние Hysteria2 на узлах
+  iof hy2 restart узлы        перезапустить Hysteria2 (all — на всех) и проверить, что поднялась
 
 AmneziaWG 2.0
   iof awg add "Имя"           создать клиента на всех узлах и выдать ключи vpn://
@@ -3058,6 +3132,7 @@ case "$cmd" in
   refresh) cmd_refresh ;;
   api)     cmd_api "$@" ;;
   update)  cmd_update "$@" ;;
+  version) echo "iof $IOF_VERSION" ;;
   init)    cmd_init ;;
   *)       usage ;;
 esac

@@ -5,7 +5,7 @@
 // Поля входа на сервер и карточка задачи общие со страницей «Перенос», они в common.js
 
 const NAME_RE = /^[A-Za-z0-9._-]{1,40}$/;
-const add = { info: null, jobId: null, timer: null, nameTouched: false };
+const add = { info: null, nameTouched: false };
 
 // Имя узла по умолчанию из хоста, пока его не меняли руками: 203.0.113.44 -> node-203-0-113-44
 function suggestName(host) {
@@ -55,25 +55,18 @@ function nameFromTitle(title) {
   return m ? m[1] : "<имя>";
 }
 
-async function pollJob() {
-  clearTimeout(add.timer);
-  try {
-    const job = await pageJob("node", add.jobId, demoJobs);
-    renderJob(job);
-    if (job && job.state === "running") {
-      add.timer = setTimeout(pollJob, 1000);
-    } else if (job && job.id === add.jobId) {
-      add.jobId = null;
-      if (job.state !== "error") {
-        $("#form").reset();
-        add.nameTouched = false;
-      }
-      loadInfo();
+const job = watchJob({
+  kind: "node",
+  demoJobs: () => demoJobs(),
+  render: renderJob,
+  done(j) {
+    if (j.state !== "error") {
+      $("#form").reset();
+      add.nameTouched = false;
     }
-  } catch (e) {
-    add.timer = setTimeout(pollJob, 3000);
-  }
-}
+    loadInfo();
+  },
+});
 
 
 // Справка для формы: известные узлы, ключ iof, есть ли шаблон Hysteria2, идёт ли перенос
@@ -115,10 +108,10 @@ async function submit(e) {
 
   $("#submit").disabled = true;
   try {
-    add.jobId = DEMO ? demoStart(data) : (await postJson("api/nodes", data)).job;
+    const id = DEMO ? demoStart(data) : (await postJson("api/nodes", data)).job;
     clearSecrets();
     $("#job").scrollIntoView({ behavior: "smooth", block: "start" });
-    pollJob();
+    job.start(id);
   } catch (err) {
     formError(err.message);
     $("#submit").disabled = false;
@@ -134,7 +127,7 @@ document.addEventListener("DOMContentLoaded", () => {
   $("#form").addEventListener("submit", submit);
 
   loadInfo();
-  pollJob();
+  job.poll();
 });
 
 

@@ -146,6 +146,52 @@ function hy2Access(h) {
   return h.auth === "password" ? "общий пароль" : h.auth === "userpass" ? `${h.users} польз.` : "";
 }
 
+// Оценка состояния узла и его ячейки, общие для «Обзора» и страницы узла. Пороги те же, что в iof status
+
+function warnings(n) {
+  if (!n.reachable) return [];
+  const w = [];
+  if (n.cpu.pct >= 90) w.push(`ЦП ${n.cpu.pct}%`);
+  if (n.mem.pct >= 90) w.push(`память ${n.mem.pct}%`);
+  if (n.disk.pct >= 80 && n.disk.pct < 90) w.push(`диск ${n.disk.pct}%`);
+  return w;
+}
+
+function nodeLevel(n) {
+  if (!n.reachable || n.issues.length) return "crit";
+  return warnings(n).length ? "warn" : "good";
+}
+
+function awgCell(n) {
+  const a = n.awg;
+  if (a.state === "running") {
+    return badge("good", `работает :${a.port}`) +
+      `<span class="sub-line">${a.peers} ${plural(a.peers, ["клиент", "клиента", "клиентов"])} · онлайн ${a.online}</span>`;
+  }
+  if (a.state === "stopped") return badge("crit", "контейнер остановлен");
+  return '<span class="muted">не установлен</span>';
+}
+
+function meter(label, pct, warnAt, critAt, sub) {
+  const level = critAt && pct >= critAt ? "crit" : pct >= warnAt ? "warn" : "";
+  const width = Math.max(0, Math.min(100, pct));
+  return `<div class="meter" role="meter" aria-label="${esc(label)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}">
+    <div class="top">${level ? icon(level) : ""}<span>${pct}%</span></div>
+    <div class="track"><i class="${level}" data-w="${width}"></i></div>
+    <span class="sub-line">${esc(sub)}</span>
+  </div>`;
+}
+
+// Ширина полосок meter через CSSOM: inline style= запрещён политикой CSP сервера
+function applyWidths(root) {
+  root.querySelectorAll(".track i[data-w]").forEach((i) => { i.style.width = i.dataset.w + "%"; });
+}
+
+// Ссылка на страницу узла
+function nodeHref(name) {
+  return `node.html${DEMO ? "?demo" : ""}#n=${encodeURIComponent(name)}`;
+}
+
 function emptyList(text, cmd) {
   return `<p class="empty">${esc(text)}${cmd ? `<br><code>${esc(cmd)}</code>` : ""}</p>`;
 }
@@ -345,9 +391,38 @@ function jobResult(lvl, html) {
   $("#job-result").innerHTML = html || "";
 }
 
-// Причина из вывода iof: строка после «Не удалось (N)…» или «Ошибка: …»
+// Задача страницы и её опрос раз в секунду, пока идёт. render(job) получает задачу или undefined,
+// done(job) вызывается, когда закончилась задача, запущенная с этой страницы (start).
+// all: показывать последнюю задачу этого вида, иначе только идущую или запущенную отсюда
+function watchJob({ kind, demoJobs, render, done, all = true }) {
+  const w = { id: null, shown: null, timer: null };
+  async function poll() {
+    clearTimeout(w.timer);
+    try {
+      const job = await pageJob(typeof kind === "function" ? kind() : kind, w.id, demoJobs);
+      const visible = job && (all || job.state === "running" || job.id === w.shown);
+      if (visible) w.shown = job.id;
+      render(visible ? job : undefined);
+      if (job && job.state === "running") {
+        w.timer = setTimeout(poll, 1000);
+      } else if (job && job.id === w.id) {
+        w.id = null;
+        done(job);
+      }
+    } catch {
+      w.timer = setTimeout(poll, 3000);
+    }
+  }
+  return {
+    poll,
+    start(id) { w.id = id; w.shown = id; poll(); },
+    hide() { w.shown = null; render(undefined); },
+  };
+}
+
+// Причина из вывода iof: строка после «Не удалось (N)…» или «Ошибки (N):», иначе «Ошибка: …»
 function failReason(log) {
-  const i = log.findIndex((l) => l.startsWith("Не удалось ("));
+  const i = log.findIndex((l) => l.startsWith("Не удалось (") || l.startsWith("Ошибки ("));
   if (i >= 0 && log[i + 1]) return log[i + 1].trim().split(/\s{2,}/).pop();
   const err = log.find((l) => l.startsWith("Ошибка: "));
   return err ? err.slice(8) : "";
@@ -355,7 +430,8 @@ function failReason(log) {
 
 
 // Загрузка данных страницы, кнопка «Обновить», автообновление и строка состояния.
-// page: { url, demo() -> Promise<data>, render(data) }
+// page: { url (строка или функция), demo() -> Promise<data>, render(data), init(rerender) }.
+// Возвращает { state, reload }: reload() загружает данные заново, например после задачи
 
 function startPage(page) {
   const state = { data: null, error: null, loading: false, timer: null };
@@ -395,7 +471,9 @@ function startPage(page) {
       if (DEMO) {
         state.data = await page.demo();
       } else {
-        const r = await fetch(`${page.url}${force ? "?force=1" : ""}`, { cache: "no-store", credentials: "same-origin" });
+        const url = typeof page.url === "function" ? page.url() : page.url;
+        const r = await fetch(force ? `${url}${url.includes("?") ? "&" : "?"}force=1` : url,
+          { cache: "no-store", credentials: "same-origin" });
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         state.data = await r.json();
       }
@@ -424,5 +502,5 @@ function startPage(page) {
     schedule();
   });
 
-  return state;
+  return { state, reload: () => load() };
 }

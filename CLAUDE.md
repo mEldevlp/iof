@@ -63,6 +63,7 @@ Docker Desktop там не запускается: Kaspersky Standard не да�
 | `awg/<логин>/<Подпись>.conf` | конфиг клиента для узла, с **приватным ключом клиента** (больше нигде его нет) |
 | `awg/<логин>/<Подпись>.pub` | `публичный_ключ контейнер` |
 | `awg/<логин>/*_via_*.conf`, `keys.txt` | пересобираются при каждом `awg keys`/`refresh` |
+| `check.last` | итог последнего `iof check` для панели: `time`, `total`, `bad`, `problems` (имена через пробел), `changes` |
 | `migrate.conf` | только во время переноса: `role` (source на старом, target на новом), `id`, `peer` (адрес SSH другого сервера), `self` (на старом: как новый заходит на него), `started` |
 | `migrate-cron` | на новом сервере до `migrate finish`: задания cron старого сервера |
 | `hy2-template.yaml` | на сервере, получившем управление переносом: шаблон Hysteria2 (в `iof.env` и `web.env` на него указывает `HY2_TEMPLATE`) |
@@ -121,8 +122,9 @@ sha1-хэш. Повторный запуск с той же подписью д�
   (список в `case "$cmd:${1:-}"`); `exec`, `check`, `status`, `update` и просмотр разрешены.
   При добавлении новой меняющей команды её нужно внести в этот список.
 
-Команды: `status`, `check` (для cron, Telegram), `exec`, `refresh`, `init`, `api status`, `update`,
-`node add|import|del|list`, `hy2 install|add|del|list|show|refresh|status`,
+Команды: `status`, `check` (для cron, Telegram, пишет `check.last`), `exec`, `refresh`, `init`,
+`api status|service|updates`, `update`, `version` (версию подставляет `install.sh` в `IOF_VERSION`),
+`node add|import|del|list`, `hy2 install|add|del|list|show|refresh|status|restart`,
 `awg add|keys|del|show|export|list|clients|refresh|status`, `relay add|del|list|apply`,
 `migrate start|finish|cancel|status`, `vless` (заглушка, WIP). Полный список в `usage()`.
 
@@ -132,15 +134,20 @@ sha1-хэш. Повторный запуск с той же подписью д�
   Слушать не на loopback без `IOF_WEB_PASSWORD` откажется (HTTP Basic, имя пользователя любое).
 - **Читает** файлы `/root/iof` напрямую. **Меняет** что-либо только через команды `iof`
   в классе `Jobs`: одна задача за раз, лог в памяти (10 задач, 600 строк, 900 с на шаг).
-  У задачи есть вид `kind` (`node` или `migrate`): по нему страница находит свои задачи.
+  У задачи есть вид `kind` (`node` — добавление, `migrate`, `hy2`, `service`, `node:<имя>` — действия
+  с узлом): по нему страница находит свои задачи. Ссылки `hy2://` в логе задачи без пароля (`HY2_SECRET`).
   По завершении задачи кэш статуса сбрасывается. Если в выводе есть строка, начинающаяся
   с `Ошибки (`, задача получает состояние `warn`: так поступают `hy2 install`, `migrate start`
-  и `migrate cancel`.
+  и `migrate cancel`. То же для строк из `WARN_LINES` (`hy2 add/del/refresh` не на всех узлах).
 - Статус узлов: `StatusCache` запускает `iof api status`, держит ответ `IOF_WEB_TTL` секунд
   (по умолчанию 20). `force` обновляет не чаще раза в 5 с, таймаут 180 с.
 - API: `GET /api/dashboard`, `/api/hy2`, `/api/hy2/qr?g=<логин>&i=<n|all>`, `/api/nodes/add-info`,
-  `/api/migrate`, `/api/jobs`; `POST /api/nodes` (добавление сервера, при необходимости
-  `iof hy2 install`), `POST /api/migrate` (`action`: start, finish или cancel).
+  `/api/migrate`, `/api/node?n=<имя>`, `/api/service[?fetch=1]` (через `iof api service|updates` и логи
+  `/var/log/iof-nightly*.log`), `/api/jobs`; `POST /api/nodes` (добавление сервера, при необходимости
+  `iof hy2 install`), `POST /api/migrate` (`action`: start, finish или cancel), `POST /api/hy2`
+  (`add|del|refresh`), `POST /api/node` (`restart_hy2|install_hy2|delete`, удаление = `node del` + `refresh`),
+  `POST /api/service` (`update`: `iof update` через `systemd-run --pipe --wait`, потому что install.sh
+  перезапускает панель; страница «Сервис» ждёт перезапуска и сравнивает версию).
   Состояние переноса (`read_migrate`, поле `migrate`) есть в ответах dashboard, hy2, add-info
   и migrate; `renderMigrate` в `common.js` показывает по нему плашку `#migrate-banner`.
 - Защита: проверка `Host` против DNS rebinding (`IOF_WEB_HOSTS`). POST принимается только
@@ -155,7 +162,9 @@ sha1-хэш. Повторный запуск с той же подписью д�
   с автообновлением. Там же общий код форм с задачей iof: `collectLogin`, `initLoginForm`,
   `showErrors`, `formError`, `postJson`, `pageJob`, `renderJobCard`, `jobResult`, `failReason`.
   У каждой страницы своя пара `*.html` + `*.js`. Страницы: Обзор (`index.html`, `dashboard.js`),
-  Hysteria2 (`hy2.*`), Добавить сервер (`add.*`), Перенос (`migrate.*`). Ключи и конфиги AWG
+  Hysteria2 (`hy2.*`), Добавить сервер (`add.*`), Перенос (`migrate.*`), Узел (`node.*`, `node.html#n=<имя>`,
+  открывается кликом по строке таблицы узлов), Сервис (`service.*`). Опрос задачи страницы — `watchJob`
+  в `common.js`, оценка узла и `meter` — тоже там. Ключи и конфиги AWG
   панель не показывает.
 - Каркас страницы: `.shell` = боковое меню `aside#sidebar` (логотип, разделы «Мониторинг» и
   «Управление», внизу переключатель темы и плашка демо) + `.content` (шапка `.page-head` с `h1`,

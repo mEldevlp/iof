@@ -19,8 +19,16 @@ if [[ "${1:-}" == "--no-web" ]]; then WEB=0; fi
 # Сначала проверка синтаксиса, при ошибке рабочие iof и iof-nightly остаются как были
 bash -n "$SRC/iof.sh" || die "iof.sh не проходит bash -n, ничего не менял"
 bash -n "$SRC/iof-nightly" || die "iof-nightly не проходит bash -n, ничего не менял"
-install -m 700 "$SRC/iof.sh" /usr/local/bin/iof
-echo "iof: /usr/local/bin/iof ($(git -C "$SRC" log -1 --format='%h %cd' --date=short 2>/dev/null || echo 'без git'))"
+# Версия (коммит и дата) подставляется в iof: её показывают iof version и страница «Сервис» панели
+VERSION="$(git -C "$SRC" log -1 --format='%h %cd' --date=short 2>/dev/null || echo 'без git')"
+if [[ "$VERSION" != "без git" ]] && ! git -C "$SRC" diff --quiet HEAD -- 2>/dev/null; then
+  VERSION="$VERSION с правками"
+fi
+TMP="$(mktemp)"
+sed "s|^IOF_VERSION=.*|IOF_VERSION=\"$VERSION\"|" "$SRC/iof.sh" > "$TMP"
+install -m 700 "$TMP" /usr/local/bin/iof
+rm -f "$TMP"
+echo "iof: /usr/local/bin/iof ($VERSION)"
 
 # Ночное обслуживание. Расписание в crontab root не трогаем, только подсказываем
 install -m 700 "$SRC/iof-nightly" /usr/local/sbin/iof-nightly

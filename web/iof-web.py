@@ -5,7 +5,9 @@
 списки ретрансляторов, групп Hysteria2 и клиентов AWG читает из /root/iof напрямую.
 Ссылки Hysteria2 (в них пароль) отдаёт на странице hy2, ключи и конфиги AWG не отдаёт.
 Меняет что-то только через команды iof (добавление сервера: iof node add, iof hy2 install;
-перенос управляющего сервера: iof migrate), по одной задаче за раз, с логом выполнения.
+группы ссылок: iof hy2 add | del | refresh; действия с узлом: iof hy2 restart | install, iof node del;
+обновление: iof update; перенос управляющего сервера: iof migrate), по одной задаче за раз,
+с логом выполнения.
 
 Без зависимостей, нужен только python3. По умолчанию слушает 127.0.0.1:8088,
 снаружи заходить через SSH-туннель:  ssh -L 8088:127.0.0.1:8088 admin@сервер
@@ -49,9 +51,17 @@ STATIC_FILES = {
     "/add.js": ("add.js", "text/javascript; charset=utf-8"),
     "/migrate.html": ("migrate.html", "text/html; charset=utf-8"),
     "/migrate.js": ("migrate.js", "text/javascript; charset=utf-8"),
+    "/node.html": ("node.html", "text/html; charset=utf-8"),
+    "/node.js": ("node.js", "text/javascript; charset=utf-8"),
+    "/service.html": ("service.html", "text/html; charset=utf-8"),
+    "/service.js": ("service.js", "text/javascript; charset=utf-8"),
     "/app.css": ("app.css", "text/css; charset=utf-8"),
     "/favicon.svg": ("favicon.svg", "image/svg+xml"),
 }
+
+# Логи ночного обслуживания: запуск с управляющего сервера и сама работа на этом сервере как узле
+NIGHTLY_RUN_LOG = Path("/var/log/iof-nightly-run.log")
+NIGHTLY_LOG = Path("/var/log/iof-nightly.log")
 
 SECURITY_HEADERS = {
     "X-Content-Type-Options": "nosniff",
@@ -322,9 +332,99 @@ def read_migrate(base):
             "started": kv.get("started", "")}
 
 
+def read_check(base):
+    """check.last (итог последнего iof check, key=value) -> {at, total, bad, problems, changes} или None.
+    at — время проверки (unix), по времени изменения файла: так браузеру не важен часовой пояс сервера."""
+    path = base / "check.last"
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        at = path.stat().st_mtime
+    except OSError:
+        return None
+    kv = dict(line.split("=", 1) for line in lines if "=" in line)
+    return {"at": at, "total": to_int(kv.get("total")), "bad": to_int(kv.get("bad")),
+            "problems": kv.get("problems", "").split(), "changes": to_int(kv.get("changes"))}
+
+
+def tail_lines(path, limit=65536):
+    """Последние строки файла (не больше limit байт), None, если файла нет."""
+    try:
+        with open(path, "rb") as f:
+            size = f.seek(0, os.SEEK_END)
+            f.seek(max(0, size - limit))
+            data = f.read()
+    except OSError:
+        return None
+    lines = data.decode("utf-8", "replace").splitlines()
+    # Первая строка могла попасть не целиком
+    return lines[1:] if size > limit else lines
+
+
+RUN_HEAD = re.compile(r"^== (\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)$")
+
+
+def read_nightly_run(path):
+    """Последний запуск iof-nightly: блок от строки "== дата" до конца. Внутри вывод iof exec:
+    "== узел" и итог "Выполнено на N узлах, с ошибкой: M"."""
+    lines = tail_lines(path)
+    starts = [i for i, line in enumerate(lines or []) if RUN_HEAD.match(line)]
+    if not starts:
+        return None
+    block = lines[starts[-1]:]
+    summary = next((line for line in reversed(block) if line.startswith("Выполнено на ")), "")
+    return {"started": RUN_HEAD.match(block[0]).group(1), "summary": summary, "log": block[1:][-80:]}
+
+
+def read_nightly_local(path):
+    """Последнее обслуживание этого сервера как узла: строки "== дата шаг" и ошибки apt (E:)."""
+    lines = tail_lines(path) or []
+    heads = [i for i, line in enumerate(lines) if line.startswith("== ")]
+    updates = [k for k, i in enumerate(heads) if "обновление" in lines[i]]
+    if not updates:
+        return None
+    k = updates[-1]
+    # У управляющего сервера перед обновлением ещё строка «жду 5 минут»
+    if k > 0 and "жду" in lines[heads[k - 1]]:
+        k -= 1
+    block = lines[heads[k]:]
+    return {"steps": [line[3:] for line in block if line.startswith("== ")],
+            "errors": [line for line in block if line.startswith("E: ")][-5:]}
+
+
+def iof_api(iof, args, timeout):
+    """Вывод iof api ... (key=value по строке) -> (словарь, ошибка или None). Повторяющиеся ключи
+    cron и commit собираются в списки."""
+    env = dict(os.environ, LC_ALL="C.UTF-8", LANG="C.UTF-8", GIT_TERMINAL_PROMPT="0")
+    try:
+        p = subprocess.run([iof, *args], capture_output=True, timeout=timeout, env=env, stdin=subprocess.DEVNULL)
+    except FileNotFoundError:
+        return {}, f"не найден {iof}"
+    except subprocess.TimeoutExpired:
+        return {}, f"iof {' '.join(args)} не уложился в {timeout} секунд"
+    if p.returncode != 0:
+        err = p.stderr.decode("utf-8", "replace").strip().splitlines()
+        return {}, (err[-1] if err else f"iof завершился с кодом {p.returncode}").removeprefix("Ошибка: ")
+    out = {"cron": [], "commit": []}
+    for line in p.stdout.decode("utf-8", "replace").splitlines():
+        k, sep, v = line.partition("=")
+        if not sep:
+            continue
+        if k in ("cron", "commit"):
+            out[k].append(v)
+        else:
+            out[k] = v
+    return out, None
+
+
 # Задачи: команды iof, которые что-то меняют. Одна за раз, лог хранится в памяти
 
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+# hy2 add печатает ссылки группы с паролем, в лог задачи они идут без него
+HY2_SECRET = re.compile(r"(hy2://)[^@\s]+@")
+# Строки, после которых задача считается выполненной с ошибками, хотя код 0: hy2 install и hy2 del,
+# если на части узлов не получилось, migrate start, если новый сервер видит не все узлы,
+# hy2 add и hy2 refresh, если ссылку выдали не все узлы
+WARN_LINES = ("Ошибки (", "Не выдали ссылку (", "Не удалось обновить: ")
 
 
 class Jobs:
@@ -347,8 +447,8 @@ class Jobs:
             return [dict(j, log=list(j["log"])) for j in reversed(self.items)]
 
     def start(self, title, steps, kind):
-        """steps: [(подпись для лога, argv, stdin bytes или None)], kind: node или migrate,
-        по нему страница находит свои задачи. None, если занято."""
+        """steps: [(подпись для лога, argv, stdin bytes или None)], kind: по нему страница находит
+        свои задачи (node, migrate, hy2, service, node:<имя>). None, если занято."""
         with self.lock:
             if self.running:
                 return None
@@ -383,11 +483,10 @@ class Jobs:
                             pass
                     for raw in p.stdout:
                         line = ANSI.sub("", raw.decode("utf-8", "replace")).rstrip("\n").split("\r")[-1]
+                        line = HY2_SECRET.sub(r"\1••••••••@", line)
                         if line.strip():
                             self.say(job, line)
-                        # hy2 install завершается с кодом 0, даже если на узле не получилось,
-                        # migrate start тоже, если новый сервер видит не все узлы
-                        if line.startswith("Ошибки ("):
+                        if line.startswith(WARN_LINES):
                             state = "warn"
                     rc = p.wait()
                 finally:
@@ -506,6 +605,80 @@ def migrate_steps(iof, body, migrate):
     raise ValueError("неизвестное действие")
 
 
+def step(iof, *args):
+    """Шаг задачи без stdin: команда iof с аргументами и она же для лога."""
+    return shlex.join(["iof", *args]), [iof, *args], None
+
+
+# iof и так откажет, пока отсюда идёт перенос, но так ошибка видна сразу
+def not_migrating(migrate):
+    if migrate and migrate["role"] == "source":
+        raise ValueError("идёт перенос управления на другой сервер, изменения здесь заблокированы")
+
+
+def hy2_steps(iof, body, groups, migrate):
+    """Кнопки групп на странице «Hysteria2» -> (заголовок задачи, шаги). groups — из read_index."""
+    not_migrating(migrate)
+    action = body.get("action")
+    if action == "add":
+        label = text_field(body, "label", 64)
+        if not label:
+            raise ValueError("подпись: обязательна")
+        if any(c in label for c in "|\t\r\n"):
+            raise ValueError("подпись не может содержать |")
+        # Повтор с той же подписью пересобирает группу, как и в терминале
+        verb = "Пересборка" if any(g["label"] == label for g in groups) else "Создание"
+        return f"{verb} группы «{label}»", [step(iof, "hy2", "add", label)]
+    if action == "del":
+        name = text_field(body, "name", 100)
+        group = next((g for g in groups if g["name"] == name), None)
+        if not group or not SAFE_NAME.match(name):
+            raise ValueError("нет такой группы")
+        return f"Удаление группы «{group['label']}»", [step(iof, "hy2", "del", name)]
+    if action == "refresh":
+        return "Пересборка всех групп Hysteria2", [step(iof, "hy2", "refresh")]
+    raise ValueError("неизвестное действие")
+
+
+def node_steps(iof, body, conf, relays, hy2_template, migrate):
+    """Кнопки на странице узла -> (имя узла, заголовок задачи, шаги). conf — строки nodes.conf."""
+    name = text_field(body, "name", 40)
+    if name not in {row[0] for row in conf}:
+        raise ValueError(f"узла {name} нет в nodes.conf")
+    action = body.get("action")
+    # iof hy2 install и restart принимают шаблоны узлов, а all значит «все»
+    if name == "all" and action != "delete":
+        raise ValueError("узел с именем all так не выбрать, используй терминал")
+    if action == "restart_hy2":
+        return name, f"Перезапуск Hysteria2 на {name}", [step(iof, "hy2", "restart", name)]
+    not_migrating(migrate)
+    if action == "install_hy2":
+        if not hy2_template.is_file():
+            raise ValueError(f"нет шаблона {hy2_template} для установки Hysteria2")
+        force = bool(body.get("force"))
+        verb = "Переустановка" if force else "Установка"
+        return name, f"{verb} Hysteria2 на {name}", [step(iof, "hy2", "install", name, *(["--force"] if force else []))]
+    if action == "delete":
+        used = next((r for r in relays if name in (r["node"], r["via"])), None)
+        if used:
+            raise ValueError(f"узел участвует в ретрансляторе {used['node']} через {used['via']}, "
+                             f"сначала убери его: sudo iof relay del {used['node']} {used['via']}")
+        # После удаления из nodes.conf ссылки и ключи AWG пересобираются уже без узла
+        return name, f"Удаление узла {name}", [step(iof, "node", "del", name), step(iof, "refresh")]
+    raise ValueError("неизвестное действие")
+
+
+def service_steps(iof, body):
+    """Кнопка «Обновить» на странице «Сервис». install.sh в конце перезапускает панель, а с ней
+    и всё, что она запустила, поэтому iof update идёт отдельным юнитом systemd: он доработает,
+    даже когда панель перезапустится. Лог идёт в задачу, пока панель жива."""
+    if body.get("action") != "update":
+        raise ValueError("неизвестное действие")
+    argv = ["systemd-run", "--unit=iof-update", "--collect", "--quiet", "--wait", "--pipe",
+            "--setenv=LC_ALL=C.UTF-8", iof, "update"]
+    return "Обновление iof и панели", [("iof update", argv, None)]
+
+
 # HTTP
 
 def host_only(value):
@@ -538,6 +711,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.add_info()
         if url.path == "/api/migrate":
             return self.migrate_info()
+        if url.path == "/api/node":
+            return self.node_info(query.get("n", ""), force)
+        if url.path == "/api/service":
+            return self.service_info(query.get("fetch") == "1")
         if url.path == "/api/jobs":
             return self.send_json({"jobs": self.server.jobs.list()})
         if url.path in STATIC_FILES:
@@ -548,26 +725,39 @@ class Handler(BaseHTTPRequestHandler):
         if not self.host_allowed() or not self.authorized() or not self.same_origin():
             return
         path = urlsplit(self.path).path
-        if path not in ("/api/nodes", "/api/migrate"):
+        if path not in ("/api/nodes", "/api/migrate", "/api/hy2", "/api/node", "/api/service"):
             return self.send_json({"error": "не найдено"}, HTTPStatus.NOT_FOUND)
         body = self.read_json()
         if body is None:
             return
         try:
-            if path == "/api/nodes":
-                kind = "node"
-                title, steps = node_add_steps(self.server.iof, body, self.node_names())
-                if body.get("install_hy2") and not self.server.hy2_template.is_file():
-                    raise ValueError(f"нет шаблона {self.server.hy2_template} для установки Hysteria2")
-            else:
-                kind = "migrate"
-                title, steps = migrate_steps(self.server.iof, body, read_migrate(self.server.base))
+            kind, title, steps = self.job_for(path, body)
         except ValueError as e:
             return self.send_json({"error": str(e)}, HTTPStatus.BAD_REQUEST)
         job = self.server.jobs.start(title, steps, kind)
         if job is None:
             return self.send_json({"error": "уже идёт другая задача, дождись её окончания"}, HTTPStatus.CONFLICT)
         self.send_json({"job": job["id"]}, HTTPStatus.ACCEPTED)
+
+    def job_for(self, path, body):
+        """POST -> (вид задачи, заголовок, шаги). ValueError с текстом для страницы."""
+        srv = self.server
+        migrate = read_migrate(srv.base)
+        if path == "/api/nodes":
+            not_migrating(migrate)
+            title, steps = node_add_steps(srv.iof, body, self.node_names())
+            if body.get("install_hy2") and not srv.hy2_template.is_file():
+                raise ValueError(f"нет шаблона {srv.hy2_template} для установки Hysteria2")
+            return "node", title, steps
+        if path == "/api/migrate":
+            return ("migrate", *migrate_steps(srv.iof, body, migrate))
+        if path == "/api/hy2":
+            return ("hy2", *hy2_steps(srv.iof, body, read_index(srv.base / "hy2" / "index.tsv"), migrate))
+        if path == "/api/node":
+            name, title, steps = node_steps(srv.iof, body, read_conf(srv.base / "nodes.conf", 4),
+                                            read_relays(srv.base), srv.hy2_template, migrate)
+            return f"node:{name}", title, steps
+        return ("service", *service_steps(srv.iof, body))
 
     # Защита от DNS rebinding: чужой домен, указывающий на 127.0.0.1, не получит ответ панели
     def host_allowed(self):
@@ -673,6 +863,58 @@ class Handler(BaseHTTPRequestHandler):
             "qr": shutil.which("qrencode") is not None,
             "migrate": read_migrate(self.server.base),
         })
+        self.send_json(data)
+
+    # Страница узла: его состояние из общего опроса, строка nodes.conf, ретрансляторы с ним
+    # и есть ли в группах Hysteria2 ссылка на него. Ссылки (в них пароль) не отдаются
+    def node_info(self, name, force):
+        base = self.server.base
+        data = self.server.cache.get(force)
+        nodes = data.pop("nodes")
+        conf = next(({"name": n, "addr": a, "ssh": s or "local", "title": t or n}
+                     for n, a, s, t in read_conf(base / "nodes.conf", 4) if n == name), None)
+        title = conf["title"] if conf else name
+        groups = [{"name": g["name"], "label": g["label"], "created": g["created"],
+                   "has_link": any(not link["relay"] and link["node"] == title for link in g["links"])}
+                  for g in read_hy2_groups(base)]
+        data.update({
+            "generated_at": time.time(),
+            "name": name,
+            "conf": conf,
+            "node": next((n for n in nodes if n["name"] == name), None),
+            "relays": [r for r in read_relays(base) if name in (r["node"], r["via"])],
+            "hy2_groups": groups,
+            "hy2_template": self.server.hy2_template.is_file(),
+            "busy": self.server.jobs.busy(),
+            "migrate": read_migrate(base),
+        })
+        self.send_json(data)
+
+    # Страница «Сервис»: версия, клон, Telegram и cron от iof, итог iof check и логи ночного
+    # обслуживания из файлов. fetch: ещё и git fetch, чтобы узнать, есть ли обновления
+    def service_info(self, fetch):
+        base = self.server.base
+        info, error = iof_api(self.server.iof, ["api", "service"], 20)
+        data = {
+            "version": info.get("version", ""),
+            "src": info.get("src", ""),
+            "src_version": info.get("src_version", ""),
+            "tg": info.get("tg") == "yes",
+            "cron": info.get("cron", []),
+            "error": error,
+            "check": read_check(base),
+            "nightly": read_nightly_run(NIGHTLY_RUN_LOG),
+            "nightly_local": read_nightly_local(NIGHTLY_LOG),
+            "busy": self.server.jobs.busy(),
+            "migrate": read_migrate(base),
+        }
+        if fetch:
+            upd, err = iof_api(self.server.iof, ["api", "updates"], 60)
+            data["updates"] = {
+                "error": err,
+                "branch": upd.get("branch", ""),
+                "commits": [dict(zip(("hash", "date", "subject"), c.split("\t", 2))) for c in upd.get("commit", [])],
+            }
         self.send_json(data)
 
     # QR одной ссылки (i = номер строки) или всей группы (i = all), как iof hy2 show
