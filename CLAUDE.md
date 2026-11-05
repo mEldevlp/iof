@@ -30,7 +30,8 @@ Docker Desktop там не запускается: Kaspersky Standard не да�
 | `install.sh` | установка и обновление из клона; `--no-web` ставит без панели | — |
 | `web/iof-web.py` | сервер панели, только stdlib python3 | `/opt/iof-web/iof-web.py` |
 | `web/iof-web.service` | systemd-юнит панели | `/etc/systemd/system/iof-web.service` |
-| `web/static/*` | страницы панели: html, js, css | `/opt/iof-web/static/` |
+| `web/static/*` | страницы панели: html, js, css. Без подкаталогов: `install.sh` копирует `web/static/*` плоско | `/opt/iof-web/static/` |
+| `web/static/xterm.js`, `xterm-fit.js`, `xterm.css` | сторонний код для терминала: `@xterm/xterm` 6.0.0 и `@xterm/addon-fit` 0.11.0 из npm, см. «Терминал» | `/opt/iof-web/static/` |
 | `web/design.md` | цвета, шрифты, размеры, брейкпоинты и классы панели | не ставится |
 | `docs/panel-*.png` | скриншоты панели для README, сняты в демо-режиме (см. «Проверка изменений») | не ставится |
 | `README.md` | инструкция для пользователя | — |
@@ -60,7 +61,7 @@ Docker Desktop там не запускается: Kaspersky Standard не да�
 | `nodes.conf` | `имя \| адрес для клиентов \| ssh (local или user@host[:port]) \| подпись`, `#` = комментарий |
 | `relays.conf` | `узел \| через узел \| hy2 порт ретранслятора \| hy2 порт узла \| awg порт ретранслятора \| awg порт узла`, `-` = протокол не ретранслируется |
 | `iof.env` | bash, читается через `source`: `TG_TOKEN`, `TG_CHAT`, `PARALLEL`, `IOF_SRC`, `HY2_TEMPLATE`, `HY2_CN` (CN сертификата для `hy2 install`, если сертификата из шаблона здесь нет) |
-| `web.env` | EnvironmentFile панели: `IOF_WEB_PASSWORD`, `IOF_WEB_HOSTS`, `IOF_WEB_TTL`, а также `HY2_TEMPLATE`, `IOF_BIN`, `IOF_BASE`, `IOF_SSH_KEY` |
+| `web.env` | EnvironmentFile панели: `IOF_WEB_PASSWORD`, `IOF_WEB_HOSTS`, `IOF_WEB_TTL`, `IOF_WEB_TERMINAL` (`1` включает терминал), а также `HY2_TEMPLATE`, `IOF_BIN`, `IOF_BASE`, `IOF_SSH_KEY` |
 | `state/<узел>` | последнее состояние для `iof check`: `ok` или текст проблем |
 | `hy2/index.tsv` | `логин<TAB>подпись<TAB>создан` |
 | `hy2/<логин>.txt` | ссылки группы по строке: узлы, затем ретрансляторы; внутри пароли |
@@ -141,6 +142,7 @@ sha1-хэш. Повторный запуск с той же подписью д�
   Слушать не на loopback без `IOF_WEB_PASSWORD` откажется (HTTP Basic, имя пользователя любое).
 - **Читает** файлы `/root/iof` напрямую. **Меняет** что-либо только через команды `iof`
   в классе `Jobs`: одна задача за раз, лог в памяти (10 задач, 600 строк, 900 с на шаг).
+  Единственное исключение — терминал на узел (`Terminals`, см. ниже), он выключен без `IOF_WEB_TERMINAL=1`.
   У задачи есть вид `kind` (`node` — добавление, `migrate`, `hy2`, `service`, `node:<имя>` — действия
   с узлом): по нему страница находит свои задачи. Ссылки `hy2://` в логе задачи без пароля (`HY2_SECRET`).
   По завершении задачи кэш статуса сбрасывается. Если в выводе есть строка, начинающаяся
@@ -150,9 +152,11 @@ sha1-хэш. Повторный запуск с той же подписью д�
   (по умолчанию 20). `force` обновляет не чаще раза в 5 с, таймаут 180 с.
 - API: `GET /api/dashboard`, `/api/hy2`, `/api/hy2/qr?g=<логин>&i=<n|all>`, `/api/nodes/add-info`,
   `/api/migrate`, `/api/node?n=<имя>`, `/api/service[?fetch=1]` (через `iof api service|updates` и логи
-  `/var/log/iof-nightly*.log`), `/api/jobs`; `POST /api/nodes` (добавление сервера, при необходимости
+  `/var/log/iof-nightly*.log`), `/api/jobs`, `/api/term/ws?t=<билет>` (WebSocket терминала);
+  `POST /api/nodes` (добавление сервера, при необходимости
   `iof hy2 install`), `POST /api/migrate` (`action`: start, finish или cancel), `POST /api/hy2`
   (`add|del|refresh`), `POST /api/node` (`restart_hy2|install_hy2|delete`, удаление = `node del` + `refresh`),
+  `POST /api/term` (`{name, cols, rows}` → одноразовый билет терминала),
   `POST /api/service` (`update`: `iof update` через `systemd-run --pipe --wait`, потому что install.sh
   перезапускает панель; вывод через `tee -p` ещё и в `/var/log/iof-update.log`, без этого `iof update`
   падал с кодом 1 на записи в оборванную трубу. Страница «Сервис» ждёт перезапуска, сравнивает
@@ -165,6 +169,28 @@ sha1-хэш. Повторный запуск с той же подписью д�
   внешних CDN тоже нет.
 - Статика отдаётся **только из словаря `STATIC_FILES`**: новую страницу надо добавить туда
   (`ci/lint.sh` сверяет словарь с `web/static` и ищет в статике то, что запрещает CSP).
+- **Терминал** на странице узла (кнопка «Терминал», `term.js`, на сервере класс `Terminals`):
+  - Страница берёт билет `POST /api/term` (обычная защита от CSRF; билет на 30 с, одноразовый, привязан
+    к узлу и размеру окна) и открывает WebSocket `/api/term/ws?t=`. Пароль панели там не проверяется,
+    вместо него билет. Проверяются `Host` и `Origin`. Билет в журнал панели не пишется (`TICKET_IN_URL`).
+  - WebSocket (RFC 6455) написан вручную, класс `WebSocket`: сообщения целиком, ping, close, до 1 МБ.
+    От браузера: двоичные сообщения — ввод, текстовые — JSON `resize` или `ping` (раз в 25 с). К браузеру:
+    двоичные — вывод, текстовое `{"type":"exit","code"}` — процесс завершился. 90 с тишины = связь пропала.
+  - Процесс: `os.openpty` + `subprocess.Popen` (не `pty.fork`: панель многопоточная), команда
+    `setsid -c` (своя сессия, управляющий терминал) + `ssh -t` с ключом iof и опциями как у `ssh_cmd`
+    или `<оболочка root> -l` для `local`. Под systemd ещё `systemd-run --scope` (юнит `iof-term-<узел>-<hex>`):
+    перезапуск панели не убивает запущенное через nohup или tmux. Окружение собирается с нуля
+    (`Terminals.environment`): в окружении панели лежит `web.env` с паролем.
+  - Закрытие окна или вкладки = SIGHUP группе процессов, через 3 с SIGKILL. Не больше 4 терминалов
+    вместе с невыкупленными билетами. В журнал (`journalctl -u iof-web`) — только открытие и закрытие.
+  - xterm.js сам создаёт элементы `<style>`, а CSP их блокирует (терминал выходит чёрным). `term.js`
+    (`adoptScriptStyles`) подменяет `document.createElement("style")` на `<template>` и переносит текст в
+    `document.adoptedStyleSheets`: на constructable stylesheets CSP не распространяется. xterm.js грузится
+    лениво, при первом открытии; `xterm.css` подключён в `node.html`.
+  - Сторонние файлы обновляются только целиком: `npm pack @xterm/xterm@<версия> @xterm/addon-fit@<версия>`,
+    `lib/xterm.js` → `xterm.js`, `lib/addon-fit.js` → `xterm-fit.js`, `css/xterm.css` → `xterm.css`;
+    в начало — комментарий с пакетом, версией и текстом лицензии MIT, строка `sourceMappingURL` убирается.
+    `ci/lint.sh` не проверяет их по правилам CSP (массив `VENDOR`), но требует первую строку с пакетом и версией.
 - Пароли и ключи из формы передаются в `iof` через stdin (`--password-stdin`, `--key-stdin`),
   в лог задачи пишется команда без них. Поля формы проверяются и в панели, и в `iof`.
   Поля входа на сервер разбирает `login_fields` (общая для добавления и переноса).
@@ -176,7 +202,7 @@ sha1-хэш. Повторный запуск с той же подписью д�
   `showErrors`, `formError`, `postJson`, `pageJob`, `renderJobCard`, `jobResult`, `failReason`.
   У каждой страницы своя пара `*.html` + `*.js`. Страницы: Обзор (`index.html`, `dashboard.js`),
   Hysteria2 (`hy2.*`), Добавить сервер (`add.*`), Перенос (`migrate.*`), Узел (`node.*`, `node.html#n=<имя>`,
-  открывается кликом по строке таблицы узлов), Сервис (`service.*`). Опрос задачи страницы — `watchJob`
+  открывается кликом по строке таблицы узлов; терминал на нём — `term.js`), Сервис (`service.*`). Опрос задачи страницы — `watchJob`
   в `common.js`, оценка узла и `meter` — тоже там. Ключи и конфиги AWG
   панель не показывает.
 - Каркас страницы: `.shell` = боковое меню `aside#sidebar` (логотип, разделы «Мониторинг» и
@@ -191,7 +217,8 @@ sha1-хэш. Повторный запуск с той же подписью д�
   (`@container content`), а не под окно: часть ширины занимает меню. Таблица узлов на «Обзоре»
   переходит в карточки, когда содержимое уже 1000px (её минимальная ширина около 996px).
 - **Демо-режим** `?demo`: данные из `demo.js` или из функций `demo*` в js страницы, сервер не нужен.
-  На «Переносе» `?demo=source` и `?demo=target` показывают идущий перенос. Демо надо
+  На «Переносе» `?demo=source` и `?demo=target` показывают идущий перенос. Терминал в демо —
+  выдуманная оболочка (`demoShell` в `term.js`, команда `help`). Демо надо
   поддерживать при изменении страниц.
 
 ## Конвенции
@@ -232,7 +259,9 @@ pipx). Задача `stand` поднимает на раннере стенд и
 сервера открывает `PROBE_URL` через туннель, ссылка с неверным паролем получает отказ авторизации),
 ретранслятор (`relay add`, туннель через него, `relay del`), `hy2 restart`, панель (страницы,
 `/api/dashboard`, отказ при чужом `Host`, без `X-IOF-Request` и с чужим `Origin`, создание и удаление
-группы задачей панели). Всё созданное удаляет, в том числе при обрыве. Узлы в `nodes.conf` должны
+группы задачей панели), терминал на каждый узел (WebSocket, размер окна при открытии и после resize,
+команда, код выхода; отказ при повторном билете, неверном билете и чужом `Origin`; терминал включает
+`stand.sh setup`). Всё созданное удаляет, в том числе при обрыве. Узлы в `nodes.conf` должны
 называться как контейнеры. Интерфейс проверяется в демо-режиме (`index.html?demo` и другие страницы). Встроенный браузер не открывает `file://`,
 поэтому `web/static` надо раздать любым статическим сервером на Node; удобно отдавать ту же CSP,
 что у `iof-web`, тогда сразу видны inline-стили.
@@ -259,7 +288,7 @@ wsl -d Ubuntu-24.04 -u root --cd /mnt/c/dev/repos/iof -- bash stand/stand.sh up
 
 ```bash
 bash stand/stand.sh up        # собрать и поднять; up old node1 — только эти серверы, как в CI
-bash stand/stand.sh setup     # iof из рабочей копии на old, поднятые узлы, Hysteria2, группа ссылок, cron
+bash stand/stand.sh setup     # iof из рабочей копии на old, поднятые узлы, Hysteria2, группа ссылок, cron, терминал
 bash stand/stand.sh test      # проверка iof на стенде (stand/test.sh); после переноса: test new
 bash stand/stand.sh sync      # после правок: залить рабочую копию на серверы, где стоит iof
 bash stand/stand.sh tunnel    # панели: old http://localhost:8081/, new http://localhost:8082/

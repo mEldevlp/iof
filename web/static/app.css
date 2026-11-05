@@ -24,6 +24,11 @@
   --crit-bg: rgba(208, 59, 59, 0.09);
   --shadow: 0 1px 2px rgba(11, 11, 11, 0.04);
   --mono: ui-monospace, "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
+  /* Терминал на странице узла тёмный в обеих темах, как окно PuTTY. Цвета берёт term.js */
+  --term-bg: #0d0d0d;
+  --term-fg: #f0efec;
+  --term-cursor: #f0efec;
+  --term-sel: rgba(57, 135, 229, 0.4);
   /* Каркас: ширина бокового меню, поля и ширина содержимого */
   --side-w: 236px;
   --gutter: 28px;
@@ -497,6 +502,20 @@ pre.log {
 
 .grid2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; align-items: start; }
 
+/* Терминал на странице узла (term.js). Отступ внутри задан у .xterm: его учитывает подгонка
+   размера xterm.js, а отступ у .term-box она бы не учла */
+.term-target { margin-left: 6px; font-size: 12px; font-weight: 400; color: var(--ink-2); }
+.term-box {
+  height: 440px; margin: 0 16px; overflow: hidden;
+  border: 1px solid var(--ring); border-radius: 8px; background: var(--term-bg);
+}
+.term-box .xterm { height: 100%; padding: 6px 0 6px 10px; }
+.term-hint { padding: 10px 16px 14px; }
+.term-card:fullscreen { display: flex; flex-direction: column; border-radius: 0; border: 0; }
+.term-card:fullscreen .term-body { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.term-card:fullscreen .term-box { flex: 1; height: auto; min-height: 0; margin-bottom: 16px; }
+.term-card:fullscreen .term-hint { display: none; }
+
 /* Форма новой группы в карточке групп */
 .inline-form { display: flex; flex-wrap: wrap; gap: 8px; padding: 0 16px 12px; }
 .inline-form input {
@@ -611,4 +630,5 @@ pre.log {
   .kv dd { margin-bottom: 8px; }
   .seg { display: flex; }
   .seg label { flex: 1; text-align: center; }
+  .term-box { height: 360px; margin: 0 10px; }
 }

@@ -2,7 +2,8 @@
 
 # Проверка iof на поднятом стенде, её же запускает CI на каждый push. Управляющий сервер видит
 # узлы и выполняет на них команды, ссылки Hysteria2 из iof работают с другого сервера, ретранслятор
-# пересылает трафик, панель отвечает, отбивает чужие запросы и выполняет задачи. Созданные группы
+# пересылает трафик, панель отвечает, отбивает чужие запросы, выполняет задачи и открывает терминал
+# на каждый узел (stand.sh setup включает его в web.env). Созданные группы
 # ссылок и ретранслятор удаляются, стенд остаётся как был.
 #   bash stand/stand.sh test [сервер]   сервер — управляющий, по умолчанию old (после переноса: new)
 # Имена узлов в nodes.conf совпадают с именами контейнеров, как после stand.sh setup. Узлов нужно
@@ -283,11 +284,12 @@ check_restart() {
 }
 
 # Панель на управляющем сервере: страницы и API, защита от DNS rebinding и CSRF, задача iof
-# из панели (создать и удалить группу ссылок). Проверяет python3 на сервере, он там есть для панели
+# из панели (создать и удалить группу ссылок), терминал на каждый узел через WebSocket.
+# Проверяет python3 на сервере, он там есть для панели
 check_panel() {
   local out rc line
   out="$(on_in "$M" python3 - "$PANEL_GROUP" "${NAMES[*]}" 2>&1 <<'PY'
-import json, sys, time, urllib.error, urllib.request
+import base64, json, os, socket, struct, sys, time, urllib.error, urllib.request
 
 BASE = "http://127.0.0.1:8088"
 label, nodes = sys.argv[1], set(sys.argv[2].split())
@@ -330,6 +332,96 @@ def group(data):
     return next((g for g in data.get("groups", []) if g["label"] == label), None)
 
 
+def ws_open(path, origin=BASE):
+    """Рукопожатие WebSocket с панелью: (сокет, код ответа). Заголовки читаются по байту,
+    чтобы не съесть первый кадр."""
+    s = socket.create_connection(("127.0.0.1", 8088), timeout=20)
+    key = base64.b64encode(os.urandom(16)).decode()
+    s.sendall((f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1:8088\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+               f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\nOrigin: {origin}\r\n\r\n").encode())
+    head = b""
+    while b"\r\n\r\n" not in head:
+        c = s.recv(1)
+        if not c:
+            break
+        head += c
+    parts = head.split(b" ", 2)
+    return s, int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+
+
+def ws_send(s, opcode, data):
+    # От клиента кадры только с маской
+    mask, n = os.urandom(4), len(data)
+    head = bytes([0x80 | opcode]) + (bytes([0x80 | n]) if n < 126 else bytes([0x80 | 126]) + struct.pack(">H", n))
+    s.sendall(head + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+
+
+def ws_recv(s):
+    def exact(n):
+        buf = b""
+        while len(buf) < n:
+            c = s.recv(n - len(buf))
+            if not c:
+                raise EOFError
+            buf += c
+        return buf
+    b1, b2 = exact(2)
+    n = b2 & 0x7F
+    if n == 126:
+        n = struct.unpack(">H", exact(2))[0]
+    elif n == 127:
+        n = struct.unpack(">Q", exact(8))[0]
+    return b1 & 0x0F, exact(n)
+
+
+def ticket(node):
+    code, resp = req("/api/term", "POST", {"name": node, "cols": 100, "rows": 30}, POST)
+    if code != 200:
+        report(False, f"терминал {node}: билет не выдан ({code} {resp.decode('utf-8', 'replace')[:200]})")
+        return None
+    return json.loads(resp)["ticket"]
+
+
+# Терминал на узел: размер окна при открытии и после resize доходит до оболочки, команда выполняется,
+# по exit приходит код выхода. В выводе ищется 42, а не набранное $((6*7)): так эхо ввода не засчитается
+def terminal(node):
+    t = ticket(node)
+    if t is None:
+        return
+    s, code = ws_open(f"/api/term/ws?t={t}")
+    if code != 101:
+        report(False, f"терминал {node}: WebSocket не открылся ({code})")
+        return
+    out, exit_msg = b"", None
+    try:
+        ws_send(s, 2, b"stty size\r")
+        time.sleep(1.5)
+        ws_send(s, 1, json.dumps({"type": "resize", "cols": 120, "rows": 40}).encode())
+        time.sleep(1.5)
+        ws_send(s, 2, b"stty size; echo iof-term-$((6*7)); exit\r")
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            op, data = ws_recv(s)
+            if op == 2:
+                out += data
+            elif op == 1:
+                exit_msg = json.loads(data)
+            elif op == 8:
+                break
+    except (EOFError, OSError):
+        pass
+    s.close()
+    text = out.decode("utf-8", "replace")
+    good = "30 100" in text and "40 120" in text and "iof-term-42" in text and exit_msg == {"type": "exit", "code": 0}
+    report(good, f"терминал {node}: команда выполнилась, размер окна дошёл, выход {exit_msg}")
+    if not good:
+        print("\n".join("      " + line for line in text.replace("\r", "").splitlines()[-10:]))
+    # По тому же билету второй раз не войти
+    s, code = ws_open(f"/api/term/ws?t={t}")
+    s.close()
+    report(code == 403, f"терминал {node}: повторный вход по билету отклонён ({code})")
+
+
 code, body = req("/")
 report(code == 200 and b"</html>" in body, f"панель: GET / ({code})")
 code, body = req("/app.css")
@@ -361,6 +453,20 @@ if g:
     job({"action": "del", "name": g["name"]}, f"панель: удалить группу «{label}»")
     code, body = req("/api/hy2")
     report(code == 200 and group(json.loads(body)) is None, f"панель: группы «{label}» больше нет")
+
+# Терминал: stand.sh setup включает его в web.env (IOF_WEB_TERMINAL=1)
+for node in sorted(nodes):
+    terminal(node)
+code, _ = req("/api/term", "POST", {"name": "нет-такого", "cols": 80, "rows": 24}, POST)
+report(code == 400, f"терминал: билет на неизвестный узел не выдан ({code})")
+s, code = ws_open("/api/term/ws?t=wrong")
+s.close()
+report(code == 403, f"терминал: WebSocket с неверным билетом отклонён ({code})")
+t = ticket(sorted(nodes)[0])
+if t:
+    s, code = ws_open(f"/api/term/ws?t={t}", origin="http://evil.example")
+    s.close()
+    report(code == 403, f"терминал: WebSocket с чужим Origin отклонён ({code})")
 PY
 )"
   rc=$?

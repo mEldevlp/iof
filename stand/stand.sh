@@ -11,7 +11,7 @@
 #
 #   bash stand/stand.sh up [сервер...]   собрать образ и поднять серверы (по умолчанию все, CI: old node1)
 #   bash stand/stand.sh setup         поставить iof на old из рабочей копии, подключить поднятые node1
-#                                     и node2, Hysteria2, группу ссылок, задания cron
+#                                     и node2, Hysteria2, группу ссылок, задания cron, терминал в панели
 #   bash stand/stand.sh test [сервер] проверить, что iof работает (stand/test.sh); сервер — управляющий,
 #                                     по умолчанию old
 #   bash stand/stand.sh sync [сервер] обновить iof из рабочей копии (по умолчанию на old и new, где он стоит)
@@ -118,6 +118,12 @@ mkdir -p /etc/hysteria /root/iof
 chmod 700 /root/iof
 [[ -f /etc/hysteria/config.yaml ]] || cp /opt/iof/stand/hy2-template.yaml /etc/hysteria/config.yaml
 [[ -f /root/iof/nodes.conf ]] || printf 'old | 172.30.0.10 | local | Old\n' > /root/iof/nodes.conf
+
+echo "== old: терминал в панели (IOF_WEB_TERMINAL=1)"
+if ! grep -qx 'IOF_WEB_TERMINAL=1' /root/iof/web.env 2>/dev/null; then
+  (umask 077; echo 'IOF_WEB_TERMINAL=1' >> /root/iof/web.env)
+  systemctl restart iof-web
+fi
 
 for n in $NODES; do
   name="${n%%:*}"

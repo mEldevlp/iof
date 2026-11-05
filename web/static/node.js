@@ -2,7 +2,7 @@
 
 // Страница узла: состояние, Hysteria2, AmneziaWG, группы ссылок и ретрансляторы с этим узлом, действия.
 // Данные: GET api/node?n=<имя>, действия: POST api/node (задачи iof hy2 restart | install, iof node del + refresh).
-// Узел в адресе: node.html#n=<имя>
+// Кнопка «Терминал» открывает окно терминала на узел (term.js). Узел в адресе: node.html#n=<имя>
 
 const nd = { data: null, running: false };
 
@@ -198,7 +198,7 @@ function render(d) {
   renderHead(d);
   renderHealth(d);
   const known = !!d.conf;
-  ["#node-body", "#node-more", "#danger"].forEach((sel) => { $(sel).hidden = !known; });
+  ["#node-body", "#node-more", "#danger", "#term-open"].forEach((sel) => { $(sel).hidden = !known; });
   if (known) {
     renderHy2(d);
     renderAwg(d);
@@ -259,8 +259,12 @@ const pageApi = startPage({
   url: () => `api/node?n=${encodeURIComponent(nodeName())}`,
   demo: () => demoNode(nodeName()),
   init() {
-    // Другой узел в адресе: другие данные и свои задачи
-    window.addEventListener("hashchange", () => { job.hide(); pageApi.reload(); job.poll(); });
+    // Другой узел в адресе: другие данные и свои задачи, терминал прошлого узла закрывается
+    window.addEventListener("hashchange", () => { Term.close(); job.hide(); pageApi.reload(); job.poll(); });
+    $("#term-open").addEventListener("click", () => {
+      const d = nd.data;
+      if (d && d.conf) Term.open({ name: d.name, ssh: d.conf.ssh, enabled: !!d.terminal });
+    });
     document.querySelector("main").addEventListener("click", (e) => {
       const b = e.target.closest("[data-act]");
       if (b && !b.disabled) act(b.dataset.act);

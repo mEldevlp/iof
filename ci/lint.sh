@@ -9,6 +9,10 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT" || exit 1
 SHELL_FILES=(iof.sh iof-nightly install.sh stand/stand.sh stand/test.sh ci/lint.sh)
+# Сторонний код в web/static: xterm.js для терминала на странице узла. Правила CSP к нему не применяются:
+# свои <style> он создаёт скриптом, и term.js переносит их в adoptedStyleSheets. Файлы берутся из npm
+# целиком, первая строка называет пакет и версию (CLAUDE.md, «Веб-панель»)
+VENDOR=(web/static/xterm.js web/static/xterm-fit.js web/static/xterm.css)
 FAILED=0
 
 ok()   { echo "ok    $*"; }
@@ -23,6 +27,16 @@ missing() {
 }
 # Строки grep вида файл:номер:текст без комментариев js и css: в них правила можно упоминать
 code_only() { grep -vE '^[^:]+:[0-9]+:[[:space:]]*(//|/?\*)'; }
+# Аргументы, кроме стороннего кода из VENDOR, по строке
+own_files() {
+  local f v
+  for f in "$@"; do
+    for v in "${VENDOR[@]}"; do
+      if [[ "$f" == "$v" ]]; then continue 2; fi
+    done
+    echo "$f"
+  done
+}
 
 check_bash() {
   local f out
@@ -106,18 +120,35 @@ check_static() {
 # CSP панели default-src 'self': встроенные скрипты, атрибуты style= и on...=, javascript: и внешние
 # адреса браузер не выполнит. Стили из кода — только через CSSOM (element.style.width)
 check_csp() {
-  local found
+  local found html code all
+  mapfile -t html < <(own_files web/static/*.html)
+  mapfile -t code < <(own_files web/static/*.html web/static/*.js)
+  mapfile -t all < <(own_files web/static/*)
   found="$(
-    grep -nE '<script\b' web/static/*.html | grep -v 'src='
+    grep -nE '<script\b' "${html[@]}" | grep -v 'src='
     grep -nE '<style\b|[[:space:]]style=|setAttribute\(["'"'"']style|[[:space:]]on[a-z]+=["'"'"']|javascript:' \
-      web/static/*.html web/static/*.js | code_only
-    grep -nE '(src|href)=["'"'"']?(https?:)?//|url\(["'"'"']?(https?:)?//|@import' web/static/* | code_only
+      "${code[@]}" | code_only
+    grep -nE '(src|href)=["'"'"']?(https?:)?//|url\(["'"'"']?(https?:)?//|@import' "${all[@]}" | code_only
   )"
   if [[ -z "$found" ]]; then
     ok "CSP: нет встроенных скриптов, style=, обработчиков on...= и внешних адресов"
   else
     fail "CSP: такое панель не выполнит (см. CLAUDE.md, «Веб-панель»)"
     details "$found"
+  fi
+}
+
+# Сторонний код на месте и с заголовком: какой пакет npm и какая версия
+check_vendor() {
+  local f head bad=""
+  for f in "${VENDOR[@]}"; do
+    head="$(head -n 1 "$f" 2>/dev/null)"
+    if [[ "$head" != *"@xterm/"*" "[0-9]* ]]; then bad+="$f "; fi
+  done
+  if [[ -z "$bad" ]]; then
+    ok "сторонний код: $(head -n 1 web/static/xterm.js | grep -oE '@xterm/[a-z-]+ [0-9.]+'), $(head -n 1 web/static/xterm-fit.js | grep -oE '@xterm/[a-z-]+ [0-9.]+')"
+  else
+    fail "сторонний код: нет файла или первой строки с пакетом и версией: $bad"
   fi
 }
 
@@ -136,6 +167,7 @@ check_js
 check_node_funcs
 check_static
 check_csp
+check_vendor
 check_eol
 
 echo

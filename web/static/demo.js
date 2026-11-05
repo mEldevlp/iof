@@ -125,6 +125,7 @@ function demoNode(name) {
     })),
     hy2_template: true,
     busy: false,
+    terminal: true,
     migrate: null,
   });
 }

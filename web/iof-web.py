@@ -7,7 +7,8 @@
 Меняет что-то только через команды iof (добавление сервера: iof node add, iof hy2 install;
 группы ссылок: iof hy2 add | del | refresh; действия с узлом: iof hy2 restart | install, iof node del;
 обновление: iof update; перенос управляющего сервера: iof migrate), по одной задаче за раз,
-с логом выполнения.
+с логом выполнения. Исключение — терминал на узел со страницы узла (ssh с ключом iof через
+WebSocket): он включается отдельно, IOF_WEB_TERMINAL=1.
 
 Без зависимостей, нужен только python3. По умолчанию слушает 127.0.0.1:8088,
 снаружи заходить через SSH-туннель:  ssh -L 8088:127.0.0.1:8088 admin@сервер
@@ -19,16 +20,23 @@
 
 import argparse
 import base64
+import fcntl
+import hashlib
 import hmac
 import ipaddress
 import json
 import os
+import pwd
 import re
 import secrets
 import shlex
 import shutil
+import signal
+import socket
+import struct
 import subprocess
 import sys
+import termios
 import threading
 import time
 from http import HTTPStatus
@@ -55,6 +63,10 @@ STATIC_FILES = {
     "/node.js": ("node.js", "text/javascript; charset=utf-8"),
     "/service.html": ("service.html", "text/html; charset=utf-8"),
     "/service.js": ("service.js", "text/javascript; charset=utf-8"),
+    "/term.js": ("term.js", "text/javascript; charset=utf-8"),
+    "/xterm.js": ("xterm.js", "text/javascript; charset=utf-8"),
+    "/xterm-fit.js": ("xterm-fit.js", "text/javascript; charset=utf-8"),
+    "/xterm.css": ("xterm.css", "text/css; charset=utf-8"),
     "/app.css": ("app.css", "text/css; charset=utf-8"),
     "/favicon.svg": ("favicon.svg", "image/svg+xml"),
 }
@@ -695,6 +707,308 @@ def service_steps(iof, body):
     return "Обновление iof и панели", [("iof update", argv, None)]
 
 
+# Терминал на узел со страницы узла: xterm.js в браузере, WebSocket к панели, на сервере ssh на узел
+# (для local — оболочка root) в псевдотерминале. Выключен, пока в web.env нет IOF_WEB_TERMINAL=1:
+# это root-доступ ко всем узлам из браузера
+
+# Адрес SSH из nodes.conf: [пользователь@]хост[:порт], как его разбирает split_target в iof
+TERM_SSH = re.compile(r"^((?:[a-z_][a-z0-9_-]{0,31}@)?[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?)(?::([0-9]{1,5}))?$")
+# Билет терминала в адресе WebSocket: в журнал панели он не попадает
+TICKET_IN_URL = re.compile(r"([?&]t=)[^&\s\"]+")
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+WS_TEXT, WS_BINARY, WS_CLOSE, WS_PING, WS_PONG = 0x1, 0x2, 0x8, 0x9, 0xA
+
+
+def ws_accept(key):
+    """Sec-WebSocket-Accept для ключа из рукопожатия (RFC 6455, 4.2.2)."""
+    return base64.b64encode(hashlib.sha1((key + WS_GUID).encode()).digest()).decode()
+
+
+def ws_unmask(data, mask):
+    # Кадры от браузера всегда под маской из 4 байт. XOR сразу всего кадра как одного большого числа:
+    # цикл по байтам на вставке длинного текста заметно медленнее
+    n = len(data)
+    if not n:
+        return data
+    key = (mask * (n // 4 + 1))[:n]
+    return (int.from_bytes(data, "little") ^ int.from_bytes(key, "little")).to_bytes(n, "little")
+
+
+class WebSocket:
+    """WebSocket поверх соединения обработчика после рукопожатия, ровно то, что нужно терминалу:
+    сообщения целиком, ping и close. Отправлять можно из двух потоков сразу."""
+
+    MAX_MESSAGE = 1 << 20
+
+    def __init__(self, rfile, wfile):
+        self.rfile, self.wfile = rfile, wfile
+        self.lock = threading.Lock()
+        self.closed = False
+
+    def read(self, n):
+        data = self.rfile.read(n)
+        if len(data) < n:
+            raise EOFError
+        return data
+
+    def recv(self):
+        """Следующее сообщение (opcode, байты) или None: соединение закрыто, оборвалось или
+        молчит дольше таймаута сокета."""
+        opcode, parts, size = None, [], 0
+        try:
+            while True:
+                b1, b2 = self.read(2)
+                op, n = b1 & 0x0F, b2 & 0x7F
+                if n == 126:
+                    n = struct.unpack(">H", self.read(2))[0]
+                elif n == 127:
+                    n = struct.unpack(">Q", self.read(8))[0]
+                size += n
+                # Кадр без маски браузер не пришлёт (RFC 6455, 5.1)
+                if not b2 & 0x80 or size > self.MAX_MESSAGE:
+                    self.close(1002 if not b2 & 0x80 else 1009)
+                    return None
+                mask = self.read(4)
+                payload = ws_unmask(self.read(n), mask)
+                # Управляющие кадры могут прийти и между частями сообщения
+                if op == WS_CLOSE:
+                    self.close()
+                    return None
+                if op == WS_PING:
+                    self.send(WS_PONG, payload)
+                    continue
+                if op == WS_PONG:
+                    continue
+                if op:
+                    opcode = op
+                parts.append(payload)
+                if b1 & 0x80:
+                    return opcode, b"".join(parts)
+        except (EOFError, OSError, struct.error):
+            return None
+
+    def send(self, opcode, payload=b""):
+        n = len(payload)
+        if n < 126:
+            head = struct.pack(">BB", 0x80 | opcode, n)
+        elif n < 1 << 16:
+            head = struct.pack(">BBH", 0x80 | opcode, 126, n)
+        else:
+            head = struct.pack(">BBQ", 0x80 | opcode, 127, n)
+        with self.lock:
+            if self.closed:
+                return False
+            try:
+                self.wfile.write(head + payload)
+            except OSError:
+                self.closed = True
+                return False
+            if opcode == WS_CLOSE:
+                self.closed = True
+            return True
+
+    def send_json(self, obj):
+        return self.send(WS_TEXT, json.dumps(obj, ensure_ascii=False).encode("utf-8"))
+
+    def close(self, code=1000):
+        self.send(WS_CLOSE, struct.pack(">H", code))
+
+
+def term_size_ok(cols, rows):
+    return isinstance(cols, int) and isinstance(rows, int) and 2 <= cols <= 500 and 2 <= rows <= 200
+
+
+def set_winsize(fd, cols, rows):
+    # Ядро само пришлёт SIGWINCH процессам терминала: ssh передаст новый размер на узел
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+
+
+def write_all(fd, data):
+    while data:
+        data = data[os.write(fd, data):]
+
+
+class Terminals:
+    """Терминалы со страницы узла. Браузер берёт одноразовый билет запросом POST /api/term (там
+    обычная защита панели от CSRF, а на WebSocket браузер свой заголовок поставить не даёт) и с ним
+    открывает WebSocket /api/term/ws. От браузера: двоичные сообщения — нажатия клавиш, текстовые —
+    JSON resize или ping. К браузеру: двоичные — вывод терминала, текстовое exit — процесс завершился.
+    Что набирают в терминале, панель не записывает: в журнал идут только открытие и закрытие."""
+
+    MAX = 4          # терминалов одновременно, вместе с выданными билетами
+    TICKET_TTL = 30  # секунд на то, чтобы открыть WebSocket по билету
+    ALIVE = 90       # секунд без сообщений от браузера (ping он шлёт раз в 25 с): связь пропала
+
+    def __init__(self, enabled, ssh_key):
+        self.enabled = enabled
+        self.ssh_key = ssh_key
+        self.lock = threading.Lock()
+        self.tickets = {}
+        self.active = 0
+
+    def issue(self, name, ssh, cols, rows):
+        """Билет на терминал узла. ValueError с текстом для страницы."""
+        if ssh != "local" and not TERM_SSH.match(ssh):
+            raise ValueError(f"у узла {name} в nodes.conf непонятный адрес SSH: {ssh}")
+        now = time.time()
+        with self.lock:
+            self.tickets = {t: s for t, s in self.tickets.items() if s["expires"] > now}
+            if self.active + len(self.tickets) >= self.MAX:
+                raise ValueError(f"открыто уже {self.MAX} терминала, закрой лишний")
+            ticket = secrets.token_urlsafe(24)
+            self.tickets[ticket] = {"name": name, "ssh": ssh, "cols": cols, "rows": rows,
+                                    "expires": now + self.TICKET_TTL}
+        return ticket
+
+    def take(self, ticket):
+        """Билет погашается сразу, повторно по нему не войти."""
+        with self.lock:
+            s = self.tickets.pop(ticket, None)
+            if s is None or s["expires"] < time.time():
+                return None
+            self.active += 1
+            return s
+
+    def release(self):
+        with self.lock:
+            self.active -= 1
+
+    def command(self, s, pw):
+        """argv терминала: ssh с ключом iof и теми же настройками, что ssh_cmd в iof, или оболочка root."""
+        if s["ssh"] == "local":
+            cmd = [pw.pw_shell or "/bin/bash", "-l"]
+        else:
+            target, port = TERM_SSH.match(s["ssh"]).groups()
+            cmd = ["ssh", "-t", "-i", self.ssh_key, "-p", port or "22",
+                   "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "ServerAliveInterval=15",
+                   "-o", "StrictHostKeyChecking=accept-new", "-o", "LogLevel=ERROR", "--", target]
+        # setsid -c: своя сессия, и псевдотерминал становится управляющим, иначе в оболочке
+        # нет job control, а размер окна не доходит до программ
+        cmd = ["setsid", "-c", *cmd]
+        # Под systemd терминал уходит в свой scope: при перезапуске панели (iof update) запущенное
+        # из терминала через nohup или tmux останется жить, как после закрытия окна PuTTY
+        if os.environ.get("INVOCATION_ID") and shutil.which("systemd-run"):
+            unit = re.sub(r"[^A-Za-z0-9_.-]", "_", s["name"])
+            cmd = ["systemd-run", "--scope", "--quiet", "--collect",
+                   f"--unit=iof-term-{unit}-{secrets.token_hex(3)}", *cmd]
+        return cmd
+
+    @staticmethod
+    def environment(pw):
+        # Окружение с нуля: в окружении панели лежит web.env, в том числе пароль панели
+        return {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "HOME": pw.pw_dir, "USER": pw.pw_name, "LOGNAME": pw.pw_name, "SHELL": pw.pw_shell or "/bin/bash",
+                "TERM": "xterm-256color", "COLORTERM": "truecolor", "LANG": "C.UTF-8"}
+
+    def run(self, s, ws, sock):
+        """Терминал по билету s поверх WebSocket ws, пока его не закроет одна из сторон."""
+        try:
+            self.session(s, ws, sock)
+        finally:
+            self.release()
+
+    def session(self, s, ws, sock):
+        pw = pwd.getpwuid(os.getuid())
+        master, slave = os.openpty()
+        try:
+            try:
+                set_winsize(master, s["cols"], s["rows"])
+                # IUTF8: стирание кириллицы символами, а не байтами; ssh передаст это и на узел
+                attrs = termios.tcgetattr(slave)
+                attrs[0] |= getattr(termios, "IUTF8", 0)
+                termios.tcsetattr(slave, termios.TCSANOW, attrs)
+                proc = subprocess.Popen(self.command(s, pw), stdin=slave, stdout=slave, stderr=slave,
+                                        env=self.environment(pw), cwd=pw.pw_dir)
+            finally:
+                os.close(slave)
+        except OSError as e:
+            os.close(master)
+            ws.send_json({"type": "exit", "error": f"не удалось запустить терминал: {e}"})
+            ws.close(1011)
+            return
+
+        started = time.time()
+        log(f"терминал {s['name']} ({s['ssh']}): открыт")
+        stopped = threading.Event()
+        reader = threading.Thread(target=self.pump, args=(master, proc, ws, sock, stopped), daemon=True)
+        reader.start()
+        sock.settimeout(self.ALIVE)
+        try:
+            while True:
+                msg = ws.recv()
+                if msg is None:
+                    break
+                op, data = msg
+                if op == WS_BINARY:
+                    write_all(master, data)
+                elif op == WS_TEXT:
+                    self.control(master, data)
+        except OSError:
+            pass
+        finally:
+            stopped.set()
+            self.stop(proc)
+            reader.join(5)
+            os.close(master)
+            log(f"терминал {s['name']}: закрыт через {int(time.time() - started)} с, код {proc.returncode}")
+
+    @staticmethod
+    def pump(master, proc, ws, sock, stopped):
+        """Вывод терминала в браузер. Когда процесс закрыл терминал, сообщает код выхода и закрывает
+        WebSocket; если браузер не ответил на close, будит чтение в обработчике."""
+        while True:
+            try:
+                data = os.read(master, 65536)
+            except OSError:  # EIO: терминал закрыли все процессы на той стороне
+                break
+            if not data or not ws.send(WS_BINARY, data):
+                break
+        if stopped.is_set():
+            return
+        try:
+            code = proc.wait(5)
+        except subprocess.TimeoutExpired:
+            code = None
+        ws.send_json({"type": "exit", "code": code})
+        ws.close()
+        if not stopped.wait(3):
+            try:
+                sock.shutdown(socket.SHUT_RD)
+            except OSError:
+                pass
+
+    @staticmethod
+    def control(master, data):
+        # ping ничего не делает: любое сообщение и так продлевает ALIVE
+        try:
+            msg = json.loads(data.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return
+        if isinstance(msg, dict) and msg.get("type") == "resize" and term_size_ok(msg.get("cols"), msg.get("rows")):
+            set_winsize(master, msg["cols"], msg["rows"])
+
+    @staticmethod
+    def stop(proc):
+        """Как закрытие окна PuTTY: SIGHUP процессам терминала, через 3 секунды SIGKILL."""
+        for sig, wait in ((signal.SIGHUP, 3), (signal.SIGKILL, 2)):
+            if proc.poll() is not None:
+                return
+            try:
+                os.killpg(proc.pid, sig)
+            except OSError:
+                proc.send_signal(sig)
+            try:
+                proc.wait(wait)
+                return
+            except subprocess.TimeoutExpired:
+                pass
+
+
+def log(text):
+    sys.stderr.write(text + "\n")
+    sys.stderr.flush()
+
+
 # HTTP
 
 def host_only(value):
@@ -712,10 +1026,16 @@ class Handler(BaseHTTPRequestHandler):
     sys_version = ""
 
     def do_GET(self):
-        if not self.host_allowed() or not self.authorized():
+        if not self.host_allowed():
             return
         url = urlsplit(self.path)
         query = {k: v[0] for k, v in parse_qs(url.query).items()}
+        # Вместо пароля панели здесь одноразовый билет: его выдаёт POST /api/term, уже с паролем.
+        # Заголовок Authorization на WebSocket браузеры отправляют не всегда
+        if url.path == "/api/term/ws":
+            return self.term_ws(query.get("t", ""))
+        if not self.authorized():
+            return
         force = query.get("force") == "1"
         if url.path == "/api/dashboard":
             return self.dashboard(force)
@@ -741,11 +1061,13 @@ class Handler(BaseHTTPRequestHandler):
         if not self.host_allowed() or not self.authorized() or not self.same_origin():
             return
         path = urlsplit(self.path).path
-        if path not in ("/api/nodes", "/api/migrate", "/api/hy2", "/api/node", "/api/service"):
+        if path not in ("/api/nodes", "/api/migrate", "/api/hy2", "/api/node", "/api/service", "/api/term"):
             return self.send_json({"error": "не найдено"}, HTTPStatus.NOT_FOUND)
         body = self.read_json()
         if body is None:
             return
+        if path == "/api/term":
+            return self.term_ticket(body)
         try:
             kind, title, steps = self.job_for(path, body)
         except ValueError as e:
@@ -902,9 +1224,51 @@ class Handler(BaseHTTPRequestHandler):
             "hy2_groups": groups,
             "hy2_template": self.server.hy2_template.is_file(),
             "busy": self.server.jobs.busy(),
+            "terminal": self.server.terms.enabled,
             "migrate": read_migrate(base),
         })
         self.send_json(data)
+
+    # POST /api/term {name, cols, rows}: одноразовый билет на WebSocket терминала узла
+    def term_ticket(self, body):
+        terms = self.server.terms
+        if not terms.enabled:
+            return self.send_json({"error": "терминал выключен: добавь IOF_WEB_TERMINAL=1 в /root/iof/web.env "
+                                            "и перезапусти панель: sudo systemctl restart iof-web"}, HTTPStatus.FORBIDDEN)
+        try:
+            name = text_field(body, "name", 40)
+            row = next((r for r in read_conf(self.server.base / "nodes.conf", 4) if r[0] == name), None)
+            if row is None:
+                raise ValueError(f"узла {name} нет в nodes.conf")
+            if not term_size_ok(body.get("cols"), body.get("rows")):
+                raise ValueError("размер терминала: cols от 2 до 500, rows от 2 до 200")
+            ticket = terms.issue(name, row[2] or "local", body["cols"], body["rows"])
+        except ValueError as e:
+            return self.send_json({"error": str(e)}, HTTPStatus.BAD_REQUEST)
+        self.send_json({"ticket": ticket})
+
+    # GET /api/term/ws?t=<билет>: рукопожатие WebSocket, затем терминал до закрытия. Origin браузер
+    # ставит на WebSocket всегда, по нему отсекаются чужие сайты
+    def term_ws(self, ticket):
+        origin = self.headers.get("Origin")
+        if not origin or host_only(origin) not in self.server.hosts:
+            return self.send_json({"error": "запрос не со страницы панели"}, HTTPStatus.FORBIDDEN)
+        key = self.headers.get("Sec-WebSocket-Key", "")
+        if (self.headers.get("Upgrade", "").lower() != "websocket"
+                or self.headers.get("Sec-WebSocket-Version") != "13" or len(key) != 24):
+            return self.send_json({"error": "здесь только WebSocket"}, HTTPStatus.BAD_REQUEST)
+        session = self.server.terms.take(ticket)
+        if session is None:
+            return self.send_json({"error": "билет терминала неверный или устарел"}, HTTPStatus.FORBIDDEN)
+        self.close_connection = True
+        try:
+            self.wfile.write(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                              f"Sec-WebSocket-Accept: {ws_accept(key)}\r\n\r\n").encode())
+        except OSError:
+            self.server.terms.release()
+            return
+        self.log_request(101)
+        self.server.terms.run(session, WebSocket(self.rfile, self.wfile), self.connection)
 
     # Страница «Сервис»: версия, клон, Telegram и cron от iof, итог iof check и логи ночного
     # обслуживания из файлов. fetch: ещё и git fetch, чтобы узнать, есть ли обновления
@@ -975,7 +1339,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def log_message(self, fmt, *args):
-        sys.stderr.write("%s %s\n" % (self.address_string(), fmt % args))
+        sys.stderr.write("%s %s\n" % (self.address_string(), TICKET_IN_URL.sub(r"\1***", fmt % args)))
 
 
 def main():
@@ -1010,11 +1374,13 @@ def main():
     srv.iof = args.iof
     srv.password = password
     srv.hosts = hosts
-    srv.ssh_pub = Path(os.environ.get("IOF_SSH_KEY", "/root/.ssh/iof_ed25519") + ".pub")
+    ssh_key = os.environ.get("IOF_SSH_KEY", "/root/.ssh/iof_ed25519")
+    srv.ssh_pub = Path(ssh_key + ".pub")
     srv.hy2_template = Path(os.environ.get("HY2_TEMPLATE", "/etc/hysteria/config.yaml"))
     srv.cache = StatusCache(args.iof, args.ttl)
     srv.jobs = Jobs(on_done=srv.cache.invalidate)
-    print(f"iof-web: http://{args.listen}/", file=sys.stderr)
+    srv.terms = Terminals(os.environ.get("IOF_WEB_TERMINAL", "").strip() == "1", ssh_key)
+    print(f"iof-web: http://{args.listen}/" + ("  (терминал включён)" if srv.terms.enabled else ""), file=sys.stderr)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

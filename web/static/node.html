@@ -5,9 +5,11 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Узел · Island of Freedom</title>
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="xterm.css">
   <link rel="stylesheet" href="app.css">
   <script src="common.js"></script>
   <script src="demo.js" defer></script>
+  <script src="term.js" defer></script>
   <script src="node.js" defer></script>
 </head>
 <body>
@@ -83,6 +85,10 @@
             <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9M13.5 2.5v3h-3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
             <span>Обновить</span>
           </button>
+          <button id="term-open" class="btn" type="button" aria-controls="term" hidden>
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 4.5L6.5 8 3 11.5M8.5 12h4.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            <span>Терминал</span>
+          </button>
         </div>
       </header>
 
@@ -101,6 +107,23 @@
         </section>
 
         <section id="health" class="health" aria-live="polite"></section>
+
+        <section id="term" class="card term-card" aria-label="Терминал" hidden>
+          <div class="card-head">
+            <h2>Терминал <span id="term-target" class="term-target mono"></span></h2>
+            <div class="actions">
+              <span id="term-state"></span>
+              <button id="term-full" class="btn small" type="button">Во весь экран</button>
+              <button id="term-close" class="btn small" type="button">Закрыть</button>
+            </div>
+          </div>
+          <div id="term-note" class="note" role="status" hidden></div>
+          <div id="term-body" class="term-body">
+            <div id="term-box" class="term-box"></div>
+            <p class="hint term-hint">Копировать: выдели текст и Ctrl+Shift+C, вставить: Ctrl+Shift+V. Ctrl+C прерывает команду
+              на узле. Сессия закроется вместе со страницей и при перезапуске панели, запущенное через nohup или tmux продолжит работать.</p>
+          </div>
+        </section>
 
         <div id="node-body" class="grid3">
           <section class="card">
