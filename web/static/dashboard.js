@@ -124,8 +124,8 @@ function renderNodes(d) {
   empty.hidden = list.length > 0;
   $("table.nodes").hidden = !list.length;
   if (!list.length) {
-    empty.innerHTML = d.nodes.length ? "Под фильтр не подходит ни один узел." :
-      d.status_error ? "Данных об узлах нет, см. ошибку выше." : "Узлов нет.";
+    empty.innerHTML = d.nodes.length ? "Под фильтр не подходит ни один узел" :
+      d.status_error ? "Данных об узлах нет, см. ошибку выше" : "Узлов нет";
   }
 }
 
@@ -146,7 +146,7 @@ function renderHy2(d) {
   $("#hy2").innerHTML = d.hy2_groups.length ? d.hy2_groups.map((g) => `<a class="item item-link" href="hy2.html${DEMO ? "?demo" : ""}#g=${encodeURIComponent(g.name)}">
       <div class="item-head"><span class="item-title">${esc(g.label)}</span><span class="item-meta">${fmtCreated(g.created)}</span></div>
       <span class="sub-line">логин <span class="mono">${esc(g.name)}</span></span>
-    </a>`).join("") : emptyList("Групп ссылок пока нет.", 'sudo iof hy2 add "Подпись"');
+    </a>`).join("") : emptyList("Групп ссылок пока нет", 'sudo iof hy2 add "Подпись"');
 }
 
 function renderAwg(d) {
@@ -154,7 +154,7 @@ function renderAwg(d) {
   $("#awg").innerHTML = d.awg_clients.length ? d.awg_clients.map((c) => `<div class="item">
       <div class="item-head"><span class="item-title">${esc(c.label)}</span><span class="item-meta">${fmtCreated(c.created)}</span></div>
       ${c.configs.length ? `<div class="chips">${c.configs.map((f) => `<span class="chip">${esc(f.replace(/_/g, " "))}</span>`).join("")}</div>` : ""}
-    </div>`).join("") : emptyList("Клиентов, созданных через iof, пока нет.", 'sudo iof awg add "Имя"');
+    </div>`).join("") : emptyList("Клиентов, созданных через iof, пока нет", 'sudo iof awg add "Имя"');
 }
 
 startPage({

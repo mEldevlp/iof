@@ -7,7 +7,18 @@
 
 ![Веб-панель: обзор всех серверов](docs/panel-overview.png)
 
-![Веб-панель: страница сервера в тёмной теме](docs/panel-node.png)
+![Веб-панель: страница сервера](docs/panel-node.png)
+
+<details>
+<summary>Ещё скриншоты: ссылки Hysteria2, терминал, добавление сервера</summary>
+
+![Веб-панель: группы ссылок Hysteria2](docs/panel-hy2.png)
+
+![Веб-панель: терминал на сервер в браузере](docs/panel-terminal.png)
+
+![Веб-панель: добавление сервера](docs/panel-add.png)
+
+</details>
 
 <sub>Скриншоты сняты в демо-режиме панели, данные выдуманы. Открыть его самому:
 <code>web/static/index.html?demo</code> через любой статический сервер.</sub>

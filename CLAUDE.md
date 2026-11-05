@@ -33,7 +33,7 @@ Docker Desktop там не запускается: Kaspersky Standard не да�
 | `web/static/*` | страницы панели: html, js, css. Без подкаталогов: `install.sh` копирует `web/static/*` плоско | `/opt/iof-web/static/` |
 | `web/static/xterm.js`, `xterm-fit.js`, `xterm.css` | сторонний код для терминала: `@xterm/xterm` 6.0.0 и `@xterm/addon-fit` 0.11.0 из npm, см. «Терминал» | `/opt/iof-web/static/` |
 | `web/design.md` | цвета, шрифты, размеры, брейкпоинты и классы панели | не ставится |
-| `docs/panel-*.png` | скриншоты панели для README, сняты в демо-режиме (см. «Проверка изменений») | не ставится |
+| `docs/panel-*.png` | скриншоты панели для README в тёмной теме: два на виду, три под спойлером; сняты в демо-режиме (см. «Проверка изменений») | не ставится |
 | `README.md` | инструкция для пользователя | — |
 | `stand/` | тестовый стенд на Docker: `Dockerfile` (Ubuntu 24.04 с systemd и SSH), `compose.yml` (old, node1, node2, new), `stand.sh`, `test.sh` (проверка iof на стенде), `hy2-template.yaml` | не ставится; попадает в `/opt/iof` как часть клона |
 | `ci/lint.sh` | статические проверки: `bash -n`, shellcheck, разбор и pyflakes для `iof-web.py`, `node --check`, правила проекта (NODE_FUNCS, STATIC_FILES, CSP, LF) | не ставится |
@@ -215,7 +215,7 @@ sha1-хэш. Повторный запуск с той же подписью д�
   `iof-web.theme`, атрибут `data-theme` на html) ставится до первой отрисовки. Остальные скрипты с defer.
 - Раскладки внутри `main` подстраиваются под его ширину через container queries
   (`@container content`), а не под окно: часть ширины занимает меню. Таблица узлов на «Обзоре»
-  переходит в карточки, когда содержимое уже 1000px (её минимальная ширина около 996px).
+  переходит в карточки, когда содержимое уже 1000px (её минимальная ширина около 972px).
 - **Демо-режим** `?demo`: данные из `demo.js` или из функций `demo*` в js страницы, сервер не нужен.
   На «Переносе» `?demo=source` и `?demo=target` показывают идущий перенос. Терминал в демо —
   выдуманная оболочка (`demoShell` в `term.js`, команда `help`). Демо надо
@@ -266,14 +266,23 @@ pipx). Задача `stand` поднимает на раннере стенд и
 поэтому `web/static` надо раздать любым статическим сервером на Node; удобно отдавать ту же CSP,
 что у `iof-web`, тогда сразу видны inline-стили.
 
-Скриншоты для README (`docs/panel-overview.png` светлый, `docs/panel-node.png` тёмный) снимаются
-Chrome без окна с демо-страниц, раздаваемых статическим сервером. Окно 1360×860 (так таблица узлов
-ещё не превращается в карточки), масштаб 1.5. Тему задаёт `--blink-settings=preferredColorScheme=1`
-(светлая) или `--force-dark-mode` (тёмная), а `--virtual-time-budget` даёт демо-данным загрузиться:
+Скриншоты для README все в тёмной теме. На виду `docs/panel-overview.png` (`index.html?demo`) и
+`docs/panel-node.png` (`node.html?demo#n=node-4`), под спойлером `<details>` — `panel-hy2.png`
+(`hy2.html?demo`), `panel-terminal.png` и `panel-add.png` (`add.html?demo`). Снимаются Chrome без окна
+с демо-страниц, раздаваемых статическим сервером. Окно 1360×860 (так таблица узлов ещё не превращается
+в карточки), масштаб 1.5, тёмную тему задаёт `--force-dark-mode`, а `--virtual-time-budget` даёт
+демо-данным загрузиться:
 
 ```bash
-chrome --headless=new --hide-scrollbars --window-size=1360,860 --force-device-scale-factor=1.5 --virtual-time-budget=5000 --blink-settings=preferredColorScheme=1 --screenshot=docs/panel-overview.png "http://localhost:8099/index.html?demo"
+chrome --headless=new --hide-scrollbars --window-size=1360,860 --force-device-scale-factor=1.5 --virtual-time-budget=5000 --force-dark-mode --screenshot=docs/panel-overview.png "http://localhost:8099/index.html?demo"
 ```
+
+Терминал так не снять: его надо открыть и набрать команды. Для `panel-terminal.png` Chrome запускается
+с `--remote-debugging-port`, и через DevTools Protocol на `node.html?demo#n=node-2` с теми же размером
+и масштабом (`Emulation.setDeviceMetricsOverride`, тема — `Emulation.setEmulatedMedia`) нажимается
+`#term-open`, в демо-оболочку вводятся `uptime`, `df -h`, `free -h`, `ls` (`Input.dispatchKeyEvent`),
+карточка `#term` прокручивается в окно, затем `Page.captureScreenshot`. Node 22+ умеет это без пакетов
+(встроенные `fetch` и `WebSocket`).
 
 **Тестовый стенд** (`stand/`, Docker Engine в WSL Ubuntu-24.04) — для проверки по-настоящему:
 четыре «сервера» Ubuntu 24.04 с systemd и SSH в сети 172.30.0.0/24, пароль root `stand`.

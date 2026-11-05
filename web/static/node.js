@@ -165,7 +165,7 @@ function renderGroups(d) {
         <span class="item-meta">${x.has_link ? badge("good", "есть ссылка") : installed ? badge("warn", "нет ссылки") : '<span class="muted">нет ссылки</span>'}</span></div>
     </a>`).join("") + (installed && missing.length
     ? `<p class="hint">Новые ссылки появятся после пересборки групп на странице <a href="hy2.html${demo}">Hysteria2</a></p>` : "")
-    : emptyList("Групп ссылок пока нет.", 'sudo iof hy2 add "Подпись"');
+    : emptyList("Групп ссылок пока нет", 'sudo iof hy2 add "Подпись"');
 }
 
 function renderRelays(d) {
@@ -177,7 +177,7 @@ function renderRelays(d) {
       <div class="item-head"><span class="item-title">${esc(x.label)}</span>
         <span class="item-meta">${x.node === d.name ? "узел за ретранслятором" : "ретранслятор"}</span></div>
       <div class="route">${route("HY2", x.hy2, x.hy2_target)}${route("AWG", x.awg, x.awg_target)}</div>
-    </div>`).join("") : emptyList("Узел не участвует в ретрансляторах.");
+    </div>`).join("") : emptyList("Узел не участвует в ретрансляторах");
 }
 
 function renderDanger(d) {

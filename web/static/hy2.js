@@ -145,7 +145,7 @@ function renderGroups(d, current) {
       </span>
       <span class="sub-line">${g.links.length} ${plural(g.links.length, ["ссылка", "ссылки", "ссылок"])} · логин <span class="mono">${esc(g.name)}</span></span>
     </a>`;
-  }).join("") : emptyList("Групп ссылок пока нет.", 'sudo iof hy2 add "Подпись"');
+  }).join("") : emptyList("Групп ссылок пока нет", 'sudo iof hy2 add "Подпись"');
 }
 
 function renderGroup(d, name) {
@@ -247,7 +247,7 @@ function renderNodes(d) {
   const empty = $("#nodes-empty");
   empty.hidden = nodes.length > 0;
   $("table.nodes").hidden = !nodes.length;
-  if (!nodes.length) empty.textContent = d.status_error ? `Не удалось опросить узлы: ${d.status_error}` : "Узлов нет.";
+  if (!nodes.length) empty.textContent = d.status_error ? `Не удалось опросить узлы: ${d.status_error}` : "Узлов нет";
 
   const mode = authMode(d);
   $("#auth-mode").textContent = mode === "password"
