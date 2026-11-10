@@ -6,7 +6,8 @@
 Ссылки Hysteria2 (в них пароль) отдаёт на странице hy2, ключи и конфиги AWG не отдаёт.
 Меняет что-то только через команды iof (добавление сервера: iof node add, iof hy2 install;
 группы ссылок: iof hy2 add | del | refresh; действия с узлом: iof hy2 restart | install, iof node del;
-обновление: iof update; перенос управляющего сервера: iof migrate), по одной задаче за раз,
+обновление: iof update; перенос управляющего сервера: iof migrate; проверка безопасности:
+iof audit run, она узлы только читает), по одной задаче за раз,
 с логом выполнения. Исключение — терминал на узел со страницы узла (ssh с ключом iof через
 WebSocket): он включается отдельно, IOF_WEB_TERMINAL=1.
 
@@ -63,6 +64,8 @@ STATIC_FILES = {
     "/node.js": ("node.js", "text/javascript; charset=utf-8"),
     "/service.html": ("service.html", "text/html; charset=utf-8"),
     "/service.js": ("service.js", "text/javascript; charset=utf-8"),
+    "/security.html": ("security.html", "text/html; charset=utf-8"),
+    "/security.js": ("security.js", "text/javascript; charset=utf-8"),
     "/term.js": ("term.js", "text/javascript; charset=utf-8"),
     "/xterm.js": ("xterm.js", "text/javascript; charset=utf-8"),
     "/xterm-fit.js": ("xterm-fit.js", "text/javascript; charset=utf-8"),
@@ -442,6 +445,27 @@ def iof_api(iof, args, timeout):
     return out, None
 
 
+def iof_json(iof, args, timeout):
+    """Вывод iof api ... в виде JSON (iof api audit) -> (объект, ошибка или None)."""
+    env = dict(os.environ, LC_ALL="C.UTF-8", LANG="C.UTF-8")
+    try:
+        p = subprocess.run([iof, *args], capture_output=True, timeout=timeout, env=env, stdin=subprocess.DEVNULL)
+    except FileNotFoundError:
+        return {}, f"не найден {iof}"
+    except subprocess.TimeoutExpired:
+        return {}, f"iof {' '.join(args)} не уложился в {timeout} секунд"
+    if p.returncode != 0:
+        err = p.stderr.decode("utf-8", "replace").strip().splitlines()
+        return {}, (err[-1] if err else f"iof завершился с кодом {p.returncode}").removeprefix("Ошибка: ")
+    try:
+        data = json.loads(p.stdout.decode("utf-8", "replace"))
+    except ValueError:
+        data = None
+    if not isinstance(data, dict):
+        return {}, f"iof {' '.join(args)} вернул не JSON"
+    return data, None
+
+
 # Задачи: команды iof, которые что-то меняют. Одна за раз, лог хранится в памяти
 
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
@@ -474,7 +498,7 @@ class Jobs:
 
     def start(self, title, steps, kind):
         """steps: [(подпись для лога, argv, stdin bytes или None)], kind: по нему страница находит
-        свои задачи (node, migrate, hy2, service, node:<имя>). None, если занято."""
+        свои задачи (node, migrate, hy2, service, audit, node:<имя>). None, если занято."""
         with self.lock:
             if self.running:
                 return None
@@ -705,6 +729,24 @@ def service_steps(iof, body):
     argv = ["systemd-run", "--unit=iof-update", "--collect", "--quiet", "--wait", "--pipe",
             "--setenv=LC_ALL=C.UTF-8", "/bin/bash", "-c", script]
     return "Обновление iof и панели", [("iof update", argv, None)]
+
+
+# Блоки страницы «Безопасность», которые умеет проверять iof audit run
+AUDIT_BLOCKS = {"server": "Аудит сервера", "dpi": "Защита от РКН"}
+
+
+def audit_steps(iof, body, nodes):
+    """Кнопка «Проверить» на странице «Безопасность» -> (заголовок задачи, шаги). nodes — имена
+    из nodes.conf. Узлы проверка не меняет, поэтому идёт и во время переноса управления."""
+    block, name = body.get("block"), text_field(body, "node", 40)
+    if block not in AUDIT_BLOCKS:
+        raise ValueError("неизвестный блок проверок")
+    if not name:
+        return f"{AUDIT_BLOCKS[block]}: все узлы", [step(iof, "audit", "run", block)]
+    # iof -n принимает шаблоны, а all значит «все»
+    if name not in nodes or name == "all":
+        raise ValueError(f"узла {name} нет в nodes.conf")
+    return f"{AUDIT_BLOCKS[block]}: {name}", [step(iof, "-n", name, "audit", "run", block)]
 
 
 # Терминал на узел со страницы узла: xterm.js в браузере, WebSocket к панели, на сервере ssh на узел
@@ -1051,6 +1093,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.node_info(query.get("n", ""), force)
         if url.path == "/api/service":
             return self.service_info(query.get("fetch") == "1")
+        if url.path == "/api/security":
+            return self.security_info()
         if url.path == "/api/jobs":
             return self.send_json({"jobs": self.server.jobs.list()})
         if url.path in STATIC_FILES:
@@ -1061,7 +1105,8 @@ class Handler(BaseHTTPRequestHandler):
         if not self.host_allowed() or not self.authorized() or not self.same_origin():
             return
         path = urlsplit(self.path).path
-        if path not in ("/api/nodes", "/api/migrate", "/api/hy2", "/api/node", "/api/service", "/api/term"):
+        if path not in ("/api/nodes", "/api/migrate", "/api/hy2", "/api/node", "/api/service", "/api/security",
+                        "/api/term"):
             return self.send_json({"error": "не найдено"}, HTTPStatus.NOT_FOUND)
         body = self.read_json()
         if body is None:
@@ -1095,6 +1140,8 @@ class Handler(BaseHTTPRequestHandler):
             name, title, steps = node_steps(srv.iof, body, read_conf(srv.base / "nodes.conf", 4),
                                             read_relays(srv.base), srv.hy2_template, migrate)
             return f"node:{name}", title, steps
+        if path == "/api/security":
+            return ("audit", *audit_steps(srv.iof, body, self.node_names()))
         return ("service", *service_steps(srv.iof, body))
 
     # Защита от DNS rebinding: чужой домен, указывающий на 127.0.0.1, не получит ответ панели
@@ -1296,6 +1343,17 @@ class Handler(BaseHTTPRequestHandler):
                 "branch": upd.get("branch", ""),
                 "commits": [dict(zip(("hash", "date", "subject"), c.split("\t", 2))) for c in upd.get("commit", [])],
             }
+        self.send_json(data)
+
+    # Страница «Безопасность»: последние проверки iof audit по блокам и узлам, справочник проверок,
+    # история запусков. Узлы не опрашиваются: проверку запускает POST /api/security
+    def security_info(self):
+        data, error = iof_json(self.server.iof, ["api", "audit"], 20)
+        data.update({
+            "error": error,
+            "busy": self.server.jobs.busy(),
+            "migrate": read_migrate(self.server.base),
+        })
         self.send_json(data)
 
     # QR одной ссылки (i = номер строки) или всей группы (i = all), как iof hy2 show

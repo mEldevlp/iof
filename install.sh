@@ -36,6 +36,10 @@ echo "iof-nightly: /usr/local/sbin/iof-nightly"
 if ! crontab -l -u root 2>/dev/null | grep -q '/usr/local/sbin/iof-nightly'; then
   echo "  в cron не запланирован. Каждую ночь в 4:00: sudo crontab -e, строка: 0 4 * * * /usr/local/sbin/iof-nightly"
 fi
+# Аудит безопасности раз в сутки, после ночного обслуживания. Тоже только подсказка
+if ! crontab -l -u root 2>/dev/null | grep -q 'iof audit cron'; then
+  echo "iof audit: в cron не запланирован. Раз в сутки: sudo crontab -e, строка: 30 5 * * * /usr/local/bin/iof audit cron >/dev/null 2>&1"
+fi
 
 if (( ! WEB )); then exit 0; fi
 

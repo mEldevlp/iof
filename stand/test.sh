@@ -2,9 +2,11 @@
 
 # Проверка iof на поднятом стенде, её же запускает CI на каждый push. Управляющий сервер видит
 # узлы и выполняет на них команды, ссылки Hysteria2 из iof работают с другого сервера, ретранслятор
-# пересылает трафик, панель отвечает, отбивает чужие запросы, выполняет задачи и открывает терминал
-# на каждый узел (stand.sh setup включает его в web.env). Созданные группы
-# ссылок и ретранслятор удаляются, стенд остаётся как был.
+# пересылает трафик, аудит безопасности видит изменения на узле (в том числе расхождение конфига
+# Hysteria2 с шаблоном в блоке dpi), панель отвечает, отбивает чужие
+# запросы, выполняет задачи и открывает терминал на каждый узел (stand.sh setup включает его
+# в web.env). Созданные группы ссылок и ретранслятор удаляются, изменения на узле для аудита
+# откатываются, стенд остаётся как был.
 #   bash stand/stand.sh test [сервер]   сервер — управляющий, по умолчанию old (после переноса: new)
 # Имена узлов в nodes.conf совпадают с именами контейнеров, как после stand.sh setup. Узлов нужно
 # хотя бы два, а стенду — интернет: трафик через туннель идёт на PROBE_URL.
@@ -22,6 +24,7 @@ PASSED=0
 FAILED=0
 GROUP_LEFT=0
 RELAY_LEFT=""
+AUDIT_LEFT=""
 NAMES=()
 declare -A ADDR=()
 
@@ -46,6 +49,10 @@ summary() {
 
 # Если проверка оборвалась посередине, убирает созданное ею
 cleanup() {
+  if [[ -n "$AUDIT_LEFT" ]]; then
+    echo "Возвращаю $AUDIT_LEFT как был"
+    audit_restore "$AUDIT_LEFT"
+  fi
   if [[ -n "$RELAY_LEFT" ]]; then
     echo "Убираю ретранслятор $RELAY_LEFT"
     # shellcheck disable=SC2086 # два слова: узел и через какой
@@ -283,6 +290,135 @@ check_restart() {
   if out="$(iofm hy2 restart all 2>&1)"; then ok "iof hy2 restart all"; else fail "iof hy2 restart all"; details "$out"; fi
 }
 
+# Оценка проверки $2 на узле $1 из iof api audit: "статус значение", down — узел не ответил.
+# $3 — блок, по умолчанию server
+audit_get() {
+  iofm api audit 2>/dev/null | on_in "$M" python3 -c '
+import json, sys
+node = json.load(sys.stdin)["blocks"][sys.argv[3]]["nodes"].get(sys.argv[1])
+check = next((c for c in node["checks"] if c["id"] == sys.argv[2]), None) if node else None
+print("нет" if not node else "down" if not node["reachable"] else "%s %s" % (check["status"], check["value"]) if check else "нет")
+' "$1" "$2" "${3:-server}"
+}
+
+# То, что check_audit и check_dpi меняют на узле $1: лишний слушатель, настройка sshd, остановленный
+# ssh, конфиг Hysteria2 (его копия лежит рядом, служба с правленым конфигом не перезапускалась)
+audit_restore() {
+  on "$1" bash -c 'systemctl stop iof-test-listen 2>/dev/null; systemctl reset-failed iof-test-listen 2>/dev/null
+    rm -f /etc/ssh/sshd_config.d/00-iof-test.conf; systemctl start ssh
+    if [[ -f /etc/hysteria/config.yaml.iof-test ]]; then mv -f /etc/hysteria/config.yaml.iof-test /etc/hysteria/config.yaml; fi' >/dev/null 2>&1 || true
+}
+
+# Аудит безопасности: все узлы проверены, вход root по паролю (на стенде он включён) оценён как
+# проблема. Меняется то, что меняется на узле: лишний слушающий порт попадает в «лишние», а
+# iof audit cron сообщает об ухудшении; PasswordAuthentication no снимает проблему; узел без ssh
+# остаётся без оценок. Узел для этого — первый, который не управляющий сервер
+check_audit() {
+  local out n node="" got
+  if out="$(iofm audit run 2>&1)"; then ok "iof audit run"; else fail "iof audit run"; details "$out"; return 1; fi
+  for n in "${NAMES[@]}"; do
+    if [[ "$n" != "$M" && -z "$node" ]]; then node="$n"; fi
+    got="$(audit_get "$n" ssh_password)"
+    if [[ "$got" == crit* ]]; then ok "аудит $n: вход по паролю — $got"; else fail "аудит $n: вход по паролю — «$got», ожидалась проблема"; fi
+  done
+  got="$(audit_get "$node" ports)"
+  if [[ "$got" == good* ]]; then ok "аудит $node: слушающие порты — $got"; else fail "аудит $node: слушающие порты — «$got»"; fi
+
+  AUDIT_LEFT="$node"
+  on "$node" systemd-run --quiet --collect --unit=iof-test-listen perl -MIO::Socket::INET \
+    -e '@keep = (IO::Socket::INET->new(Listen => 1, LocalPort => 18080, ReuseAddr => 1)); sleep 300' >/dev/null 2>&1
+  sleep 1
+  out="$(iofm audit cron 2>&1)" || true
+  got="$(audit_get "$node" ports)"
+  if [[ "$got" == crit*18080/tcp* ]]; then ok "аудит $node: лишний порт найден — $got"; else fail "аудит $node: лишний порт 18080 не найден — «$got»"; fi
+  if grep -q "^$node: Слушающие порты" <<<"$out"; then
+    ok "iof audit cron: сообщил, что на $node стало хуже"
+  else
+    fail "iof audit cron не сообщил об ухудшении на $node"
+    details "$out"
+  fi
+  on "$node" systemctl stop iof-test-listen >/dev/null 2>&1
+
+  on "$node" bash -c 'echo "PasswordAuthentication no" > /etc/ssh/sshd_config.d/00-iof-test.conf'
+  iofm -n "$node" audit run server >/dev/null 2>&1
+  got="$(audit_get "$node" ssh_password)"
+  if [[ "$got" == good* ]]; then ok "аудит $node: после PasswordAuthentication no — $got"; else fail "аудит $node: после PasswordAuthentication no — «$got»"; fi
+  got="$(audit_get "$node" ports)"
+  if [[ "$got" == good* ]]; then ok "аудит $node: лишний порт пропал — $got"; else fail "аудит $node: слушающие порты после остановки слушателя — «$got»"; fi
+  on "$node" rm -f /etc/ssh/sshd_config.d/00-iof-test.conf
+
+  on "$node" systemctl stop ssh >/dev/null 2>&1
+  out="$(iofm -n "$node" audit run server 2>&1)" || true
+  got="$(audit_get "$node" ssh_password)"
+  on "$node" systemctl start ssh >/dev/null 2>&1
+  if [[ "$got" == "down" ]] && grep -q '^Ошибки (1):' <<<"$out"; then
+    ok "аудит $node без ssh: узел без оценок, в выводе «Ошибки (1)»"
+  else
+    fail "аудит $node без ssh: «$got»"
+    details "$out"
+  fi
+  for _ in $(seq 1 20); do
+    if [[ "$(on "$node" systemctl is-active ssh 2>/dev/null || true)" == "active" ]]; then break; fi
+    sleep 0.5
+  done
+  if out="$(iofm -n "$node" audit run server 2>&1)" && [[ "$(audit_get "$node" ssh_password)" == crit* ]]; then
+    AUDIT_LEFT=""
+    ok "аудит $node: узел снова проверен, стенд как был"
+  else
+    fail "аудит $node после возврата ssh"
+    details "$out"
+  fi
+}
+
+# Блок «Защита от РКН» (dpi), его уже проверил iof audit run в check_audit: у каждого узла конфиг
+# Hysteria2 совпадает с шаблоном, порт отвечает на зонд QUIC, AmneziaWG «не установлен» (на стенде
+# его нет). На узле, который не управляющий сервер, в конфиг дописывается блок (служба не
+# перезапускается): проверка видит расхождение с шаблоном, iof audit cron сообщает об ухудшении,
+# после возврата конфига расхождения нет. Пароль Hysteria2 из шаблона в результаты не попадает
+check_dpi() {
+  local out n node="" got secret
+  for n in "${NAMES[@]}"; do
+    if [[ "$n" != "$M" && -z "$node" ]]; then node="$n"; fi
+    got="$(audit_get "$n" hy2_template dpi)"
+    if [[ "$got" == good* ]]; then ok "dpi $n: конфиг и шаблон — $got"; else fail "dpi $n: конфиг и шаблон — «$got», ожидалось совпадение"; fi
+    got="$(audit_get "$n" hy2_quic dpi)"
+    if [[ "$got" == good* ]]; then ok "dpi $n: зонд QUIC — $got"; else fail "dpi $n: зонд QUIC — «$got»"; fi
+    got="$(audit_get "$n" awg_params dpi)"
+    if [[ "$got" == none*"не установлен"* ]]; then ok "dpi $n: AmneziaWG — $got"; else fail "dpi $n: AmneziaWG — «$got», ожидалось «не установлен»"; fi
+  done
+
+  AUDIT_LEFT="$node"
+  on "$node" bash -c 'cp -p /etc/hysteria/config.yaml /etc/hysteria/config.yaml.iof-test
+    printf "\nmasquerade:\n  type: string\n  string:\n    content: iof-test\n" >> /etc/hysteria/config.yaml'
+  out="$(iofm audit cron 2>&1)" || true
+  got="$(audit_get "$node" hy2_template dpi)"
+  if [[ "$got" == warn*masquerade* ]]; then ok "dpi $node: правка конфига найдена — $got"; else fail "dpi $node: правка конфига не найдена — «$got»"; fi
+  if grep -q "^$node: Конфиг и шаблон" <<<"$out"; then
+    ok "iof audit cron: сообщил, что на $node конфиг разошёлся с шаблоном"
+  else
+    fail "iof audit cron не сообщил о расхождении с шаблоном на $node"
+    details "$out"
+  fi
+  on "$node" mv -f /etc/hysteria/config.yaml.iof-test /etc/hysteria/config.yaml
+  if out="$(iofm -n "$node" audit run dpi 2>&1)" && [[ "$(audit_get "$node" hy2_template dpi)" == good* ]]; then
+    AUDIT_LEFT=""
+    ok "dpi $node: конфиг возвращён, расхождения нет"
+  else
+    fail "dpi $node после возврата конфига: «$(audit_get "$node" hy2_template dpi)»"
+    details "$out"
+  fi
+
+  secret="$(on "$M" bash -c 'f="$(. /root/iof/iof.env 2>/dev/null; echo "${HY2_TEMPLATE:-/etc/hysteria/config.yaml}")"
+    sed -n "s/^[[:space:]]*password:[[:space:]]*//p" "$f" | head -n 1')"
+  if [[ -z "$secret" ]]; then
+    fail "dpi: в шаблоне Hysteria2 на $M не нашёлся пароль, проверить утечку нечем"
+  elif on "$M" bash -c 'grep -rqF -- "$0" /root/iof/audit || iof audit show 2>/dev/null | grep -qF -- "$0" || iof api audit 2>/dev/null | grep -qF -- "$0"' "$secret"; then
+    fail "dpi: пароль Hysteria2 попал в результаты аудита"
+  else
+    ok "dpi: пароля Hysteria2 нет в /root/iof/audit, iof audit show и iof api audit"
+  fi
+}
+
 # Панель на управляющем сервере: страницы и API, защита от DNS rebinding и CSRF, задача iof
 # из панели (создать и удалить группу ссылок), терминал на каждый узел через WebSocket.
 # Проверяет python3 на сервере, он там есть для панели
@@ -310,8 +446,8 @@ def report(good, text):
     print(("ok" if good else "fail") + "\t" + text, flush=True)
 
 
-def job(body, title):
-    code, resp = req("/api/hy2", "POST", body, POST)
+def job(body, title, path="/api/hy2"):
+    code, resp = req(path, "POST", body, POST)
     if code != 202:
         report(False, f"{title}: ответ {code} {resp.decode('utf-8', 'replace')[:200]}")
         return
@@ -454,6 +590,35 @@ if g:
     code, body = req("/api/hy2")
     report(code == 200 and group(json.loads(body)) is None, f"панель: группы «{label}» больше нет")
 
+# Страница «Безопасность»: результаты аудита по всем узлам, проверка одного узла задачей панели
+code, body = req("/api/security")
+sec = json.loads(body) if code == 200 else {}
+checked = set(sec.get("blocks", {}).get("server", {}).get("nodes", {}))
+report(code == 200 and not sec.get("error") and checked == nodes and len(sec.get("catalog", [])) >= 15,
+       f"панель: /api/security ({code}), проверены узлы: {' '.join(sorted(checked)) or 'нет'}"
+       + (f", ошибка: {sec['error']}" if sec.get("error") else ""))
+dpi = sec.get("blocks", {}).get("dpi", {}).get("nodes", {})
+ids = {c["id"] for c in sec.get("catalog", []) if c["block"] == "dpi"}
+done = {n for n, v in dpi.items() if v.get("reachable") and {c["id"] for c in v["checks"]} == ids}
+report(done == nodes and len(ids) >= 20,
+       f"панель: блок dpi в /api/security, проверок в справочнике: {len(ids)}, узлы со всеми оценками: {' '.join(sorted(done)) or 'нет'}")
+code, _ = req("/api/security", "POST", {"block": "нет-такого", "node": ""}, POST)
+report(code == 400, f"панель: проверка неизвестного блока отклонена ({code})")
+code, _ = req("/api/security", "POST", {"block": "server", "node": "нет-такого"}, POST)
+report(code == 400, f"панель: проверка неизвестного узла отклонена ({code})")
+one = sorted(nodes)[0]
+before = sec.get("blocks", {}).get("server", {}).get("nodes", {}).get(one, {}).get("at", 0)
+time.sleep(1)
+job({"block": "server", "node": one}, f"панель: аудит узла {one}", "/api/security")
+code, body = req("/api/security")
+after = json.loads(body)["blocks"]["server"]["nodes"].get(one, {}) if code == 200 else {}
+report(after.get("reachable") is True and after.get("at", 0) > before, f"панель: результат аудита {one} обновился")
+before = dpi.get(one, {}).get("at", 0)
+job({"block": "dpi", "node": one}, f"панель: проверка блока dpi на {one}", "/api/security")
+code, body = req("/api/security")
+after = json.loads(body)["blocks"]["dpi"]["nodes"].get(one, {}) if code == 200 else {}
+report(after.get("reachable") is True and after.get("at", 0) > before, f"панель: результат блока dpi на {one} обновился")
+
 # Терминал: stand.sh setup включает его в web.env (IOF_WEB_TERMINAL=1)
 for node in sorted(nodes):
     terminal(node)
@@ -500,6 +665,10 @@ step "Ретранслятор"
 check_relay
 check_hy2_del
 check_restart
+step "Аудит безопасности"
+check_audit
+step "Защита от РКН"
+check_dpi
 step "Веб-панель"
 check_panel
 step "Узлы после проверки"

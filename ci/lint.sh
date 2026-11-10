@@ -138,6 +138,23 @@ check_csp() {
   fi
 }
 
+# Боковое меню повторено в каждом html: пункты должны совпадать, отличается только отметка
+# текущего пункта aria-current (page, а на странице узла true у «Обзора»)
+check_menu() {
+  local f ref cur bad=""
+  ref="$(sed -n '/<nav class="nav"/,/<\/nav>/p' web/static/index.html | sed -E 's/ aria-current="[a-z]+"//')"
+  for f in web/static/*.html; do
+    cur="$(sed -n '/<nav class="nav"/,/<\/nav>/p' "$f")"
+    if [[ "$(sed -E 's/ aria-current="[a-z]+"//' <<<"$cur")" != "$ref" ]]; then bad+="$f "; fi
+    if [[ "$(grep -c 'aria-current=' <<<"$cur")" != "1" ]]; then bad+="$f(aria-current) "; fi
+  done
+  if [[ -z "$bad" ]]; then
+    ok "меню: одинаковое во всех html ($(grep -c '<a href' <<<"$ref") пунктов)"
+  else
+    fail "меню отличается от index.html или текущий пункт не отмечен: $bad"
+  fi
+}
+
 # Сторонний код на месте и с заголовком: какой пакет npm и какая версия
 check_vendor() {
   local f head bad=""
@@ -167,6 +184,7 @@ check_js
 check_node_funcs
 check_static
 check_csp
+check_menu
 check_vendor
 check_eol
 

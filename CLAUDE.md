@@ -33,10 +33,10 @@ Docker Desktop там не запускается: Kaspersky Standard не да�
 | `web/static/*` | страницы панели: html, js, css. Без подкаталогов: `install.sh` копирует `web/static/*` плоско | `/opt/iof-web/static/` |
 | `web/static/xterm.js`, `xterm-fit.js`, `xterm.css` | сторонний код для терминала: `@xterm/xterm` 6.0.0 и `@xterm/addon-fit` 0.11.0 из npm, см. «Терминал» | `/opt/iof-web/static/` |
 | `web/design.md` | цвета, шрифты, размеры, брейкпоинты и классы панели | не ставится |
-| `docs/panel-*.png` | скриншоты панели для README в тёмной теме: два на виду, три под спойлером; сняты в демо-режиме (см. «Проверка изменений») | не ставится |
+| `docs/panel-*.png` | скриншоты панели для README в тёмной теме: два на виду, четыре под спойлером; сняты в демо-режиме (см. «Проверка изменений») | не ставится |
 | `README.md` | инструкция для пользователя | — |
 | `stand/` | тестовый стенд на Docker: `Dockerfile` (Ubuntu 24.04 с systemd и SSH), `compose.yml` (old, node1, node2, new), `stand.sh`, `test.sh` (проверка iof на стенде), `hy2-template.yaml` | не ставится; попадает в `/opt/iof` как часть клона |
-| `ci/lint.sh` | статические проверки: `bash -n`, shellcheck, разбор и pyflakes для `iof-web.py`, `node --check`, правила проекта (NODE_FUNCS, STATIC_FILES, CSP, LF) | не ставится |
+| `ci/lint.sh` | статические проверки: `bash -n`, shellcheck, разбор и pyflakes для `iof-web.py`, `node --check`, правила проекта (NODE_FUNCS, STATIC_FILES, CSP, одинаковое меню во всех html, LF) | не ставится |
 | `.github/workflows/ci.yml` | CI в GitHub Actions, см. «Проверка изменений» | не ставится |
 | `.shellcheckrc` | настройки shellcheck: отключены SC2178 и SC2128, ложные срабатывания на local-переменные разных функций | не ставится |
 
@@ -60,7 +60,7 @@ Docker Desktop там не запускается: Kaspersky Standard не да�
 |---|---|
 | `nodes.conf` | `имя \| адрес для клиентов \| ssh (local или user@host[:port]) \| подпись`, `#` = комментарий |
 | `relays.conf` | `узел \| через узел \| hy2 порт ретранслятора \| hy2 порт узла \| awg порт ретранслятора \| awg порт узла`, `-` = протокол не ретранслируется |
-| `iof.env` | bash, читается через `source`: `TG_TOKEN`, `TG_CHAT`, `PARALLEL`, `IOF_SRC`, `HY2_TEMPLATE`, `HY2_CN` (CN сертификата для `hy2 install`, если сертификата из шаблона здесь нет) |
+| `iof.env` | bash, читается через `source`: `TG_TOKEN`, `TG_CHAT`, `PARALLEL`, `IOF_SRC`, `HY2_TEMPLATE`, `HY2_CN` (CN сертификата для `hy2 install`, если сертификата из шаблона здесь нет), `AUDIT_KEEP`, `BLOCKLIST_URL` и `REGISTRY_URL` (списки для блока dpi: текст, IP или CIDR в строке, `#` — комментарий; по умолчанию пусто) |
 | `web.env` | EnvironmentFile панели: `IOF_WEB_PASSWORD`, `IOF_WEB_HOSTS`, `IOF_WEB_TTL`, `IOF_WEB_TERMINAL` (`1` включает терминал), а также `HY2_TEMPLATE`, `IOF_BIN`, `IOF_BASE`, `IOF_SSH_KEY` |
 | `state/<узел>` | последнее состояние для `iof check`: `ok` или текст проблем |
 | `hy2/index.tsv` | `логин<TAB>подпись<TAB>создан` |
@@ -70,6 +70,9 @@ Docker Desktop там не запускается: Kaspersky Standard не да�
 | `awg/<логин>/<Подпись>.pub` | `публичный_ключ контейнер` |
 | `awg/<логин>/*_via_*.conf`, `keys.txt` | пересобираются при каждом `awg keys`/`refresh` |
 | `check.last` | итог последнего `iof check` для панели: `time`, `total`, `bad`, `problems` (имена через пробел), `changes` |
+| `audit/server.json`, `audit/dpi.json` | последняя проверка блока `iof audit` по узлам: `{"nodes": {имя: {addr, reachable, at, checked, error, checks: [{id, status, value, detail, hint, cmd}]}}}`. Проверка одного узла заменяет только его запись |
+| `audit/history.jsonl` | строка JSON на запуск `iof audit run`: `at`, `block` (`server`, `dpi` или `all`), `nodes`, `counts`, `down`, `worse`; хранится `AUDIT_KEEP` последних (по умолчанию 30, задаётся в `iof.env`) |
+| `audit/cache/` | для блока dpi: `blocklist.txt` и `registry.txt` (списки по `BLOCKLIST_URL` и `REGISTRY_URL`, рядом `.url` — откуда скачан, `.err` — последняя загрузка не удалась) и `whois-<адрес>.txt` (`состояние\|AS\|организация\|страна`). Всё обновляется не чаще раза в сутки |
 | `migrate.conf` | только во время переноса: `role` (source на старом, target на новом), `id`, `peer` (адрес SSH другого сервера), `self` (на старом: как новый заходит на него), `started` |
 | `migrate-cron` | на новом сервере до `migrate finish`: задания cron старого сервера |
 | `hy2-template.yaml` | на сервере, получившем управление переносом: шаблон Hysteria2 (в `iof.env` и `web.env` на него указывает `HY2_TEMPLATE`) |
@@ -130,8 +133,64 @@ sha1-хэш. Повторный запуск с той же подписью д�
   (список в `case "$cmd:${1:-}"`); `exec`, `check`, `status`, `update` и просмотр разрешены.
   При добавлении новой меняющей команды её нужно внести в этот список.
 
+- **Аудит безопасности** (`iof audit`, этапы 1 и 2 из плана `security-plan.md`). Блоков два:
+  `server` («Аудит сервера») и `dpi` («Защита от РКН (ТСПУ)»). `iof audit run [server|dpi|all]`,
+  по умолчанию `all`; `audit cron` проверяет оба. Общее устройство:
+  - Узел только собирает факты строками `ключ=значение`: `n_audit_server` (sshd -T, файрвол, fail2ban,
+    обновления, sudo, pwquality, SUID) и `n_audit_dpi`; `n_audit_listen` разбирает `ss`,
+    `n_audit_expect` печатает порты контейнеров Amnezia и правила ретранслятора. Python на узле не нужен.
+  - Оценку (`good`, `warn`, `crit`, `none`), значение, «как исправить» и команды ставят
+    `audit_eval_server` и `audit_eval_dpi` на управляющем сервере, тексты «почему это важно» —
+    в `audit_catalog` (строки `B` блок, `G` группа, `K` проверка). Что на узле ожидаемо, а что лишнее,
+    для обоих блоков решает `audit_ports`.
+  - `audit_job` для pmap печатает `@<блок>` и факты блока, `audit_results` отдаёт их в `AUDIT_PY`
+    (режимы `save`, `api`, `show`; строка `R` начинает блок). JSON ведёт встроенный python, поэтому
+    `iof audit` требует python3. Запуск `all` даёт одну строку истории.
+  - `audit run` принимает `-n`, узлы не меняет и во время переноса разрешён; `audit cron` шлёт
+    в Telegram только ухудшения относительно прошлой проверки (потеря связи ухудшением не считается).
+    Команды в советах не должны отрезать iof: root остаётся с `prohibit-password`, ufw сначала
+    открывает порты узла. `install.sh` подсказывает строку cron, сам расписание не трогает.
+- **Блок dpi** показывает, чем узел заметен для фильтров и зондов. Правила:
+  - Тексты не обещают защиту: «снижает заметность», «проверка показала». Где правильного ответа нет
+    (Salamander или masquerade, порт), ставится `warn` или `none` с объяснением компромисса, не `crit`.
+    `crit` только у трёх проверок: параметры AWG как у WireGuard, адрес в реестре, панель на внешнем адресе.
+  - Секреты в панель, JSON, лог задачи и вывод iof не попадают. Пароль Salamander узел не отдаёт:
+    он входит только в хэш блока `obfs`. Пакеты I1–I5 AWG входят только в `awg_hash`. Значения Jc,
+    Jmin, Jmax, S1–S4, H1–H4 приходят на управляющий сервер (они и так лежат в конфигах клиентов),
+    но в текст оценки идут только названия полей. Хэши короткие (12 знаков sha256) с солью запуска
+    `AUDIT_SALT`: соль нигде не сохраняется, сравнение возможно только внутри одной проверки.
+    Поэтому «одинаковые параметры AWG на узлах» при проверке одного узла получают `none`.
+  - Расхождение с шаблоном: `n_audit_hy2_blocks` хэширует блоки верхнего уровня конфига без
+    комментариев и пользователей `auth.userpass`; управляющий сервер считает той же функцией хэши
+    шаблона (`HY2_TEMPLATE` из `iof.env` или `/etc/hysteria/config.yaml`).
+  - Параметры AWG разбирает `n_audit_awg_params` (читает и закомментированные `# I1 = …`), границы
+    проверяет `audit_awg_check`: Jc 1–128, 0 ≤ Jmin < Jmax < 1280, S1 ≤ 1132, S2 ≤ 1188, S3 ≤ 1216,
+    S4 ≤ 32, S1 + 56 ≠ S2, H1–H4 — число или диапазон `начало-конец` в 5–2147483647 без пересечений.
+    Числа из документации GL.iNet, запрет пересечений из документации Amnezia. Порядок H1 < H2 < H3 < H4
+    не требуется. Обычный WireGuard: полей нет или Jc = 0, S1–S4 = 0, H1–H4 = 1, 2, 3, 4.
+  - Снаружи на узел смотрит управляющий сервер, `audit_outside` в том же задании pmap, строки `x_*`:
+    порты 80 и 443/tcp, сертификат (openssl), ping, PTR (`getent hosts`), зонд согласования версий
+    QUIC, приветствия лишних портов, whois, реестр. Сетевые помощники — встроенный python
+    `AUDIT_NET_PY` (режимы `quic`, `banner`, `whois`, `inlist`). Каждая внешняя команда под `timeout`.
+    Для узла `local` это взгляд не снаружи: в подробностях об этом сказано.
+  - Зонд QUIC: пакет с версией `0x1a2a3a4a`, 1200 байт. Сервер QUIC отвечает Version Negotiation
+    (`vn`), под Salamander не отвечает (`silent`). `vn` при Salamander в конфиге значит, что служба
+    не перезапущена. GET по HTTP/3 делается, только если curl собран с HTTP3 (в Ubuntu 24.04 нет).
+  - whois: свой запрос на порт 43, `whois.iana.org` → региональный реестр (для ARIN `n + адрес`,
+    ещё один переход по `ReferralServer`). Нет номера AS — значение «не определён», `none`.
+    Частный адрес не запрашивается.
+  - Списки `BLOCKLIST_URL` и `REGISTRY_URL` качает `audit_fetch` в `audit/cache`. Реестр — только IPv4.
+    Блок-лист iof не применяет, а проверяет то, что будет применять этап 4: набор ipset `iof-block`,
+    цепочка `IOF-BLOCK` с переходом из INPUT, время списка — `/etc/iof/block.list` на узле.
+    Port hopping: диапазон в `listen` или REDIRECT/DNAT диапазона на порт Hysteria2; цепочки `IOF-*`
+    ретранслятора при этом не учитываются.
+- Не сделано: проверка доступности с ПК (этап 3), действия вроде включения port hopping и применения
+  блок-листа (этап 4). Не проверено: разбор конфига AWG на живом контейнере (на стенде AmneziaWG нет,
+  проверен на подставном конфиге в формате `awg0.conf` контейнера `amnezia-awg2`), GET по HTTP/3,
+  whois для адреса узла целиком (помощник проверен на публичных адресах отдельно), CrowdSec.
+
 Команды: `status`, `check` (для cron, Telegram, пишет `check.last`), `exec`, `refresh`, `init`,
-`api status|service|updates`, `update`, `version` (версию подставляет `install.sh` в `IOF_VERSION`),
+`api status|service|updates|audit` (audit — JSON), `audit run [server|dpi|all]|show|cron`, `update`, `version` (версию подставляет `install.sh` в `IOF_VERSION`),
 `node add|import|del|list`, `hy2 install|add|del|list|show|refresh|status|restart`,
 `awg add|keys|del|show|export|list|clients|refresh|status`, `relay add|del|list|apply`,
 `migrate start|finish|cancel|status`, `vless` (заглушка, WIP). Полный список в `usage()`.
@@ -157,6 +216,11 @@ sha1-хэш. Повторный запуск с той же подписью д�
   `iof hy2 install`), `POST /api/migrate` (`action`: start, finish или cancel), `POST /api/hy2`
   (`add|del|refresh`), `POST /api/node` (`restart_hy2|install_hy2|delete`, удаление = `node del` + `refresh`),
   `POST /api/term` (`{name, cols, rows}` → одноразовый билет терминала),
+  `GET /api/security` (вывод `iof api audit` плюс `error`, `busy`, `migrate`; узлы не опрашивает) и
+  `POST /api/security` (`{block: "server" | "dpi", node}` → задача вида `audit`:
+  `iof [-n узел] audit run <блок>`; блоки перечислены в `AUDIT_BLOCKS`. Страница «Безопасность»,
+  `security.html` + `security.js`: у каждого блока из `BLOCKS` свои `#<блок>-node`, `-run`, `-stamp`,
+  `-health`, `-checks`, отрисовка общая (`renderBlock`); демо-данные обоих блоков в `security.js`),
   `POST /api/service` (`update`: `iof update` через `systemd-run --pipe --wait`, потому что install.sh
   перезапускает панель; вывод через `tee -p` ещё и в `/var/log/iof-update.log`, без этого `iof update`
   падал с кодом 1 на записи в оборванную трубу. Страница «Сервис» ждёт перезапуска, сравнивает
@@ -201,7 +265,7 @@ sha1-хэш. Повторный запуск с той же подписью д�
   с автообновлением. Там же общий код форм с задачей iof: `collectLogin`, `initLoginForm`,
   `showErrors`, `formError`, `postJson`, `pageJob`, `renderJobCard`, `jobResult`, `failReason`.
   У каждой страницы своя пара `*.html` + `*.js`. Страницы: Обзор (`index.html`, `dashboard.js`),
-  Hysteria2 (`hy2.*`), Добавить сервер (`add.*`), Перенос (`migrate.*`), Узел (`node.*`, `node.html#n=<имя>`,
+  Hysteria2 (`hy2.*`), Безопасность (`security.*`, загрузка как на «Сервисе», без `startPage`), Добавить сервер (`add.*`), Перенос (`migrate.*`), Узел (`node.*`, `node.html#n=<имя>`,
   открывается кликом по строке таблицы узлов; терминал на нём — `term.js`), Сервис (`service.*`). Опрос задачи страницы — `watchJob`
   в `common.js`, оценка узла и `meter` — тоже там. Ключи и конфиги AWG
   панель не показывает.
@@ -257,7 +321,15 @@ pipx). Задача `stand` поднимает на раннере стенд и
 `stand/test.sh` (`stand.sh test [управляющий сервер]`) проверяет: все узлы на связи и без проблем,
 `iof exec` и `iof check`, группу Hysteria2 (по ссылке на каждый узел клиент Hysteria2 с другого
 сервера открывает `PROBE_URL` через туннель, ссылка с неверным паролем получает отказ авторизации),
-ретранслятор (`relay add`, туннель через него, `relay del`), `hy2 restart`, панель (страницы,
+ретранслятор (`relay add`, туннель через него, `relay del`), `hy2 restart`, аудит (`audit run` по всем
+узлам, вход по паролю на стенде — проблема; на первом узле, который не управляющий сервер: лишний
+слушатель на 18080 попадает в «лишние» и `audit cron` сообщает об ухудшении, `PasswordAuthentication no`
+снимает проблему, узел с остановленным ssh остаётся без оценок), блок dpi (у каждого узла конфиг
+Hysteria2 совпадает с шаблоном, порт отвечает на зонд QUIC, AmneziaWG — `none` «не установлен»;
+после правки конфига на узле проверка видит расхождение с шаблоном и `audit cron` сообщает о нём,
+после возврата конфига расхождения нет; пароля Hysteria2 нет в `/root/iof/audit`, `audit show`
+и `api audit`), панель (страницы, `/api/security` с обоими блоками и проверка узла задачей панели
+по каждому блоку,
 `/api/dashboard`, отказ при чужом `Host`, без `X-IOF-Request` и с чужим `Origin`, создание и удаление
 группы задачей панели), терминал на каждый узел (WebSocket, размер окна при открытии и после resize,
 команда, код выхода; отказ при повторном билете, неверном билете и чужом `Origin`; терминал включает
@@ -268,7 +340,7 @@ pipx). Задача `stand` поднимает на раннере стенд и
 
 Скриншоты для README все в тёмной теме. На виду `docs/panel-overview.png` (`index.html?demo`) и
 `docs/panel-node.png` (`node.html?demo#n=node-4`), под спойлером `<details>` — `panel-hy2.png`
-(`hy2.html?demo`), `panel-terminal.png` и `panel-add.png` (`add.html?demo`). Снимаются Chrome без окна
+(`hy2.html?demo`), `panel-security.png` (`security.html?demo`), `panel-terminal.png` и `panel-add.png` (`add.html?demo`). Снимаются Chrome без окна
 с демо-страниц, раздаваемых статическим сервером. Окно 1360×860 (так таблица узлов ещё не превращается
 в карточки), масштаб 1.5, тёмную тему задаёт `--force-dark-mode`, а `--virtual-time-budget` даёт
 демо-данным загрузиться:
