@@ -160,12 +160,20 @@
     </div>
   </div>
 
-  <dialog id="qr-dialog" class="qr-dialog" aria-labelledby="qr-title">
-    <div class="qr-dialog-head">
+  <dialog id="qr-dialog" class="dialog qr-dialog" aria-labelledby="qr-title">
+    <div class="dialog-head">
       <h2 id="qr-title"></h2>
       <button id="qr-close" class="btn" type="button">Закрыть</button>
     </div>
     <div id="qr-body"></div>
+  </dialog>
+
+  <dialog id="hop-dialog" class="dialog" aria-labelledby="hop-title">
+    <div class="dialog-head">
+      <h2 id="hop-title">Список портов в ссылках</h2>
+      <button id="hop-close" class="btn" type="button">Закрыть</button>
+    </div>
+    <div id="hop-body" class="dialog-body"></div>
   </dialog>
 </body>
 </html>

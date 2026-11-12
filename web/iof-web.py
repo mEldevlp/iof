@@ -148,6 +148,7 @@ def shape_node(r):
             "state": r.get("hy2_state", ""),
             "udp": r.get("hy2_udp") == "yes",
             "port": r.get("hy2_port", ""),
+            "range": r.get("hy2_range", ""),
             "auth": r.get("hy2_auth", ""),
             "users": to_int(r.get("hy2_users")),
             "version": r.get("hy2_ver", ""),
@@ -270,17 +271,21 @@ def read_relays(base):
 SAFE_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
+HY2_PORTS = re.compile(r"^[0-9]+([,-][0-9]+)*$")
+
+
 def parse_hy2_link(url):
-    """hy2://пароль@хост:порт/?...#Подпись%20%7C%20Узел -> поля для страницы без пароля."""
+    """hy2://пароль@хост:порт/?...#Подпись%20%7C%20Узел -> поля для страницы без пароля. У группы
+    со сменой портов порт — список «443,10000-19999»: urlsplit его не разбирает, он берётся строкой."""
     u = urlsplit(url)
     title = unquote(u.fragment)
     node = title.split(" | ", 1)[1] if " | " in title else title
-    try:
-        port = u.port
-    except ValueError:
-        port = None
-    return {"url": url, "title": title, "node": node, "host": u.hostname or "",
-            "port": port, "relay": " via " in node}
+    hostport = u.netloc.rsplit("@", 1)[-1]
+    host, _, ports = hostport.rpartition(":")
+    if not host or not HY2_PORTS.match(ports):
+        host, ports = hostport, ""
+    return {"url": url, "title": title, "node": node, "host": host.strip("[]"),
+            "port": ports or None, "hop": "," in ports or "-" in ports, "relay": " via " in node}
 
 
 def hy2_group_file(base, name):
@@ -303,6 +308,8 @@ def read_hy2_groups(base):
             continue
         g["file"] = str(path)
         g["links"] = [parse_hy2_link(url) for url in read_hy2_links(path)]
+        # Метка iof hy2 add --hop: в ссылках группы список портов
+        g["hop"] = (base / "hy2" / f"{g['name']}.hop").exists()
         groups.append(g)
     return groups
 
@@ -677,9 +684,17 @@ def hy2_steps(iof, body, groups, migrate):
             raise ValueError("подпись: обязательна")
         if any(c in label for c in "|\t\r\n"):
             raise ValueError("подпись не может содержать |")
-        # Повтор с той же подписью пересобирает группу, как и в терминале
-        verb = "Пересборка" if any(g["label"] == label for g in groups) else "Создание"
-        return f"{verb} группы «{label}»", [step(iof, "hy2", "add", label)]
+        # Повтор с той же подписью пересобирает группу, как и в терминале. hop: true или false
+        # включает или выключает список портов в ссылках группы, без него остаётся как было
+        hop = body.get("hop")
+        if hop is not None and not isinstance(hop, bool):
+            raise ValueError("hop: true или false")
+        extra = [] if hop is None else ["--hop" if hop else "--no-hop"]
+        if hop is not None:
+            verb = "Список портов в ссылках: " + ("включение" if hop else "выключение") + ", группа"
+        else:
+            verb = "Пересборка группы" if any(g["label"] == label for g in groups) else "Создание группы"
+        return f"{verb} «{label}»", [step(iof, "hy2", "add", label, *extra)]
     if action == "del":
         name = text_field(body, "name", 100)
         group = next((g for g in groups if g["name"] == name), None)
@@ -735,10 +750,33 @@ def service_steps(iof, body):
 # Блоки страницы «Безопасность», которые умеет проверять iof audit run
 AUDIT_BLOCKS = {"server": "Аудит сервера", "dpi": "Защита от РКН"}
 
+# Действия из проверок блока «Защита от РКН»: iof сам меняет узел. Всегда на одном узле,
+# после действия узел проверяется заново, чтобы проверка показала новое состояние
+AUDIT_ACTIONS = {
+    "hop_on": ("Смена портов Hysteria2: включение", ("hy2", "hop", "on")),
+    "hop_off": ("Смена портов Hysteria2: выключение", ("hy2", "hop", "off")),
+    "hy2_upgrade": ("Обновление Hysteria2", ("hy2", "upgrade")),
+    "block_on": ("Блок-лист сканеров: применение", ("block", "on")),
+    "block_update": ("Блок-лист сканеров: обновление", ("block", "update")),
+    "block_off": ("Блок-лист сканеров: снятие", ("block", "off")),
+}
 
-def audit_steps(iof, body, nodes):
-    """Кнопка «Проверить» на странице «Безопасность» -> (заголовок задачи, шаги). nodes — имена
-    из nodes.conf. Узлы проверка не меняет, поэтому идёт и во время переноса управления."""
+
+def audit_steps(iof, body, nodes, migrate):
+    """Кнопки «Проверить» и действия в проверках на странице «Безопасность» -> (заголовок задачи,
+    шаги). nodes — имена из nodes.conf. Проверка узлы не меняет и идёт во время переноса управления,
+    действия меняют, поэтому при переносе запрещены и выполняются только на одном узле."""
+    action = body.get("action")
+    if action is not None:
+        if action not in AUDIT_ACTIONS:
+            raise ValueError("неизвестное действие")
+        not_migrating(migrate)
+        name = text_field(body, "node", 40)
+        # iof принимает шаблоны узлов, а all значит «все»: из панели — только один узел по имени
+        if not name or name not in nodes or name == "all":
+            raise ValueError("выбери узел из nodes.conf")
+        title, args = AUDIT_ACTIONS[action]
+        return f"{title}, {name}", [step(iof, *args, name), step(iof, "-n", name, "audit", "run", "dpi")]
     block, name = body.get("block"), text_field(body, "node", 40)
     if block not in AUDIT_BLOCKS:
         raise ValueError("неизвестный блок проверок")
@@ -1311,7 +1349,7 @@ class Handler(BaseHTTPRequestHandler):
                                             read_relays(srv.base), srv.hy2_template, migrate)
             return f"node:{name}", title, steps
         if path == "/api/security":
-            return ("audit", *audit_steps(srv.iof, body, self.node_names()))
+            return ("audit", *audit_steps(srv.iof, body, self.node_names(), migrate))
         return ("service", *service_steps(srv.iof, body))
 
     # Защита от DNS rebinding: чужой домен, указывающий на 127.0.0.1, не получит ответ панели

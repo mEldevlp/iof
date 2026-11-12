@@ -165,5 +165,21 @@
       <footer class="foot">iof-web · проверку выполняют <code>iof audit run</code> и <code>iof audit probe</code>, результат хранится в <code>/root/iof/audit</code>. Набор проверок по мотивам vps-audit и rkn-block-checker</footer>
     </div>
   </div>
+
+  <dialog id="act-dialog" class="dialog" aria-labelledby="act-title">
+    <div class="dialog-head">
+      <h2 id="act-title"></h2>
+      <button id="act-close" class="btn" type="button">Закрыть</button>
+    </div>
+    <div class="dialog-body">
+      <label class="dialog-field">
+        <span>Узел</span>
+        <select id="act-node"></select>
+      </label>
+      <div id="act-state" class="act-state"></div>
+      <div id="act-list" class="act-list"></div>
+      <p id="act-note" class="form-error" hidden></p>
+    </div>
+  </dialog>
 </body>
 </html>

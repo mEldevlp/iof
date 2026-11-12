@@ -122,7 +122,9 @@ EOS
 set -euo pipefail
 echo "== old: пакеты и iof"
 apt-get update -qq >/dev/null
-apt-get install -y -qq git python3 qrencode sshpass >/dev/null
+# nftables: с ним Hysteria2 ставит правила смены портов через nft (в ядре WSL нет fib для IPv6,
+# и iof переходит на iptables), на остальных узлах — через iptables. Так test проверяет оба пути
+apt-get install -y -qq git python3 qrencode sshpass nftables >/dev/null
 bash /opt/iof/install.sh
 
 echo "== old: шаблон Hysteria2 и nodes.conf"

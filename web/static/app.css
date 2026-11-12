@@ -414,13 +414,25 @@ img.qr { display: block; width: 100%; max-width: 240px; height: auto; margin: 0 
 .cmds dt { margin: 0; }
 .cmds dd { margin: 0; color: var(--ink-2); }
 
-.qr-dialog {
+/* Диалог: QR-код на Hysteria2, подтверждение действий на «Безопасности» и Hysteria2 */
+.dialog {
   border: 1px solid var(--ring); border-radius: 12px; padding: 16px;
-  background: var(--surface); color: var(--ink); width: min(340px, calc(100vw - 32px));
+  background: var(--surface); color: var(--ink); width: min(520px, calc(100vw - 32px));
 }
-.qr-dialog::backdrop { background: rgba(0, 0, 0, 0.45); }
-.qr-dialog-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 12px; }
-.qr-dialog h2 { font-size: 14px; font-weight: 600; overflow-wrap: anywhere; }
+.dialog::backdrop { background: rgba(0, 0, 0, 0.45); }
+.dialog-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 12px; }
+.dialog h2 { margin: 0; font-size: 14px; font-weight: 600; overflow-wrap: anywhere; }
+.dialog-body { display: grid; gap: 12px; font-size: 13px; }
+.dialog-body p { margin: 0; }
+.dialog-field { display: grid; gap: 4px; font-weight: 500; }
+.dialog-field select { width: 100%; }
+.act-state { display: grid; gap: 0; padding: 8px 12px; border: 1px solid var(--grid); border-radius: 8px; overflow-wrap: anywhere; }
+.act-list { display: grid; gap: 12px; }
+.act-item { display: grid; gap: 8px; justify-items: start; padding-top: 12px; border-top: 1px solid var(--grid); }
+.act-item p { color: var(--ink-2); }
+.dialog-body .note { margin: 0; }
+.dialog-body .btn-row { padding: 0; }
+.qr-dialog { width: min(340px, calc(100vw - 32px)); }
 .qr-dialog img.qr { max-width: 280px; }
 .qr-dialog .hint { padding: 12px 0 0; text-align: center; }
 
@@ -579,6 +591,7 @@ pre.log {
 .cmd { display: flex; gap: 8px; align-items: flex-start; min-width: 0; }
 .cmd pre.code { flex: 1; min-width: 0; margin: 0; }
 .cmd .btn { flex: none; }
+.check-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
 .check-note { display: flex; gap: 6px; align-items: flex-start; margin-top: 4px; }
 .check-note .ico { margin-top: 3px; }
 

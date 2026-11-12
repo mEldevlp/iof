@@ -61,11 +61,12 @@ Docker Desktop там не запускается: Kaspersky Standard не да�
 |---|---|
 | `nodes.conf` | `имя \| адрес для клиентов \| ssh (local или user@host[:port]) \| подпись`, `#` = комментарий |
 | `relays.conf` | `узел \| через узел \| hy2 порт ретранслятора \| hy2 порт узла \| awg порт ретранслятора \| awg порт узла`, `-` = протокол не ретранслируется |
-| `iof.env` | bash, читается через `source`: `TG_TOKEN`, `TG_CHAT`, `PARALLEL`, `IOF_SRC`, `HY2_TEMPLATE`, `HY2_CN` (CN сертификата для `hy2 install`, если сертификата из шаблона здесь нет), `AUDIT_KEEP`, `BLOCKLIST_URL` и `REGISTRY_URL` (списки для блока dpi: текст, IP или CIDR в строке, `#` — комментарий; по умолчанию пусто), `PROBE_TTL` (сколько секунд живут мишени проверки с ПК, 900, допустимо 20–3600) и `PROBE_PORTS` (порт мишеней: пусто — случайный свободный 20000–60000, `a-b` — из диапазона, `N` — этот порт; одинаково для всех узлов) |
+| `iof.env` | bash, читается через `source`: `TG_TOKEN`, `TG_CHAT`, `PARALLEL`, `IOF_SRC`, `HY2_TEMPLATE`, `HY2_CN` (CN сертификата для `hy2 install`, если сертификата из шаблона здесь нет), `AUDIT_KEEP`, `BLOCKLIST_URL` и `REGISTRY_URL` (списки для блока dpi и `iof block`: текст, IP или CIDR в строке, `#` — комментарий; по умолчанию пусто), `BLOCK_ALLOW` (адреса и сети через пробел, которые блок-лист не блокирует никогда), `HY2_HOP` (диапазон смены портов для `hy2 hop on`, по умолчанию `10000-19999`: ниже портов, которые iof сам выбирает для ретрансляторов и мишеней), `PROBE_TTL` (сколько секунд живут мишени проверки с ПК, 900, допустимо 20–3600) и `PROBE_PORTS` (порт мишеней: пусто — случайный свободный 20000–60000, `a-b` — из диапазона, `N` — этот порт; одинаково для всех узлов) |
 | `web.env` | EnvironmentFile панели: `IOF_WEB_PASSWORD`, `IOF_WEB_HOSTS`, `IOF_WEB_TTL`, `IOF_WEB_TERMINAL` (`1` включает терминал), а также `HY2_TEMPLATE`, `IOF_BIN`, `IOF_BASE`, `IOF_SSH_KEY` |
 | `state/<узел>` | последнее состояние для `iof check`: `ok` или текст проблем |
 | `hy2/index.tsv` | `логин<TAB>подпись<TAB>создан` |
-| `hy2/<логин>.txt` | ссылки группы по строке: узлы, затем ретрансляторы; внутри пароли |
+| `hy2/<логин>.txt` | ссылки группы по строке: узлы, затем ретрансляторы; внутри пароли. У группы со списком портов порт узла со сменой портов — `443,10000-19999` |
+| `hy2/<логин>.hop` | пустая метка `iof hy2 add --hop`: в ссылках группы список портов. Без неё ссылки как раньше, с одним портом |
 | `awg/index.tsv` | как у hy2 |
 | `awg/<логин>/<Подпись>.conf` | конфиг клиента для узла, с **приватным ключом клиента** (больше нигде его нет) |
 | `awg/<логин>/<Подпись>.pub` | `публичный_ключ контейнер` |
@@ -92,6 +93,17 @@ sha1-хэш. Повторный запуск с той же подписью д�
 - Hysteria2: `/etc/hysteria/config.yaml` (бэкапы `config.yaml.bak.<ts>`), сервис `hysteria-server`,
   `/etc/sysctl.d/99-hysteria.conf`, лог установки `/var/log/iof-hy2-install.log`.
   Режимы auth: `userpass` (на группу свой пользователь) или `password` (общий пароль).
+- Смена портов (`hy2 hop on`): диапазон в `listen` (`listen: :443,10000-19999`), drop-in
+  `/etc/systemd/system/hysteria-server.service.d/iof-hop.conf` и скрипт `/usr/local/sbin/iof-hy2-hop-clean`
+  (перед стартом службы убирает правила, оставшиеся после её падения; если с nftables служба не поднялась,
+  в drop-in ещё `HYSTERIA_FIREWALL_BACKEND=iptables`). Сами правила ставит и снимает Hysteria2: таблицы
+  nftables `hysteria_<хэш>` или цепочки iptables `HYSTERIA-PR-<хэш>` в nat. `hop off` убирает всё.
+- Обновление Hysteria2 (`hy2 upgrade`): копии бинарника и юнита в `/var/backups/iof-hy2` (три последние),
+  лог установщика `/var/log/iof-hy2-upgrade.log`.
+- Блок-лист (`iof block`): пакет `ipset` (ставится, если его нет), `/etc/iof/block.list` (время файла —
+  когда список скачал управляющий сервер), `/etc/iof/block.allow`, `/usr/local/sbin/iof-block`,
+  `iof-block.service`, наборы `iof-block` и `iof-allow`, цепочка `IOF-BLOCK` в таблице raw с переходом
+  из PREROUTING. `block off` убирает всё, кроме пакета `ipset`.
 - AmneziaWG: docker-контейнер `amnezia-awg2` или `amnezia-awg` (ставит приложение Amnezia VPN),
   конфиг `/opt/amnezia/awg/{awg0|wg0}.conf` внутри контейнера, `clientsTable` ведётся как
   в приложении. Бэкапы перед изменением: `/var/backups/iof-awg` на хосте.
@@ -115,6 +127,8 @@ sha1-хэш. Повторный запуск с той же подписью д�
   через stdin bash-скрипт: `declare -f` всех функций из массива `NODE_FUNCS` плюс вызов.
   Поэтому `n_*` не должны зависеть от остального кода. Новую `n_*` нужно **добавить в `NODE_FUNCS`**.
   Пароли не попадают в аргументы процессов узла. Если пользователь не root, команда идёт через `sudo -n`.
+  Для `local` скрипт читается из канала (`bash <(…)`), а не из аргумента `bash -c`: так у аргумента нет
+  предела 128 КБ (блок-лист больше) и скрипт не виден в списке процессов.
   Что все `n_*` есть в `NODE_FUNCS`, проверяет `ci/lint.sh`.
 - `ssh_cmd`: ключ iof, `BatchMode`, `ConnectTimeout=8`, `StrictHostKeyChecking=accept-new`.
 - `read_nodes` заполняет массивы `N_NAME N_ADDR N_SSH N_TITLE`, `read_relays` — массивы `R_*`.
@@ -139,11 +153,12 @@ sha1-хэш. Повторный запуск с той же подписью д�
   данные уходят в `.moved-`), cron ставится здесь. `cancel` на старом: `n_migrate_abort` на новом,
   блокировка снимается. Номер `id` в `migrate.conf` обоих серверов защищает от снятия не того сервера.
   Пока здесь role=source, `migrate_guard` в точке входа запрещает команды, которые что-то меняют
-  (список в `case "$cmd:${1:-}"`, для трёхсловных — в `case "$cmd:${1:-}:${2:-}"`, там `audit probe
-  start|stop|import`); `exec`, `check`, `status`, `update`, `audit run` и просмотр разрешены.
+  (список в `case "$cmd:${1:-}"`, в том числе `hy2 hop`, `hy2 upgrade`, `block on|update|off`; для
+  трёхсловных — в `case "$cmd:${1:-}:${2:-}"`, там `audit probe start|stop|import`); `exec`, `check`,
+  `status`, `update`, `audit run`, `audit probe list` и просмотр разрешены.
   При добавлении новой меняющей команды её нужно внести в этот список.
 
-- **Аудит безопасности** (`iof audit`, этапы 1–3 из плана `security-plan.md`). Блоков два:
+- **Аудит безопасности** (`iof audit`, этапы 1–4 из плана `security-plan.md`). Блоков два:
   `server` («Аудит сервера») и `dpi` («Защита от РКН (ТСПУ)»). `iof audit run [server|dpi|all]`,
   по умолчанию `all`; `audit cron` проверяет оба. Общее устройство:
   - Узел только собирает факты строками `ключ=значение`: `n_audit_server` (sshd -T, файрвол, fail2ban,
@@ -190,10 +205,43 @@ sha1-хэш. Повторный запуск с той же подписью д�
     ещё один переход по `ReferralServer`). Нет номера AS — значение «не определён», `none`.
     Частный адрес не запрашивается.
   - Списки `BLOCKLIST_URL` и `REGISTRY_URL` качает `audit_fetch` в `audit/cache`. Реестр — только IPv4.
-    Блок-лист iof не применяет, а проверяет то, что будет применять этап 4: набор ipset `iof-block`,
-    цепочка `IOF-BLOCK` с переходом из INPUT, время списка — `/etc/iof/block.list` на узле.
-    Port hopping: диапазон в `listen` или REDIRECT/DNAT диапазона на порт Hysteria2; цепочки `IOF-*`
-    ретранслятора при этом не учитываются.
+    Блок-лист: набор ipset `iof-block`, цепочка `IOF-BLOCK` в таблице raw с переходом из PREROUTING,
+    служба `iof-block`, время списка — `/etc/iof/block.list` на узле (`block_*`). Нет iptables — `none`.
+    Port hopping (`n_hy2_hop_rules`): диапазоны, перенаправленные на порт Hysteria2, из nftables и iptables,
+    в том числе через цепочку `HYSTERIA-PR-*`; цепочки `IOF-*` ретранслятора не учитываются. `good` —
+    диапазон в `listen` и правила на него есть, диапазон без правил — `warn`, правила без `listen` — «вне iof».
+  - Действия: у проверок `hy2_hop` и `blocklist` строка `C` несёт седьмое поле — действия панели на этом
+    узле через пробел (`hop_on`, `hop_off`, `hy2_upgrade`, `block_on`, `block_update`, `block_off`), в JSON
+    это `act`. Ставит их `audit_eval_dpi` по фактам узла.
+- **Действия по результатам проверки** (этап 4): iof сам меняет узлы. Всё под `migrate_guard`.
+  - `hy2 hop on|off <узлы|all> [--ports a-b]`: `n_hy2_hop` дописывает диапазон в `listen` после основного
+    порта (`listen: :443,10000-19999`). Hysteria2 (от `HY2_HOP_MIN` = 2.12.3: раньше её правила заворачивали
+    и исходящий UDP узла) слушает основной порт, остальные перенаправляет сама: nftables, если есть `nft`,
+    иначе iptables, и снимает правила при остановке. Основной порт не меняется, поэтому выданные ссылки,
+    ретрансляторы (DNAT на основной порт) и шаблон работают как раньше. Файрвол узла открывать не нужно:
+    REDIRECT в nat PREROUTING раньше filter INPUT. Проверки перед включением: версия, порты диапазона не
+    заняты (слушатели UDP, `relay.rules`, опубликованные порты Docker, nat-перенаправления, порты
+    ретрансляторов из `relays.conf`), `PROBE_PORTS` не внутри диапазона. После перезапуска `n_hy2_hop_ready`
+    ждёт слушатель и правила; с nftables не вышло — второй заход с `HYSTERIA_FIREWALL_BACKEND=iptables` в
+    drop-in; не вышло и так — конфиг и drop-in возвращаются (`n_hy2_last_error` даёт причину из журнала).
+    Затем пересобираются группы с меткой `.hop`. `n_free_ports` (новые ретрансляторы) и мишени обходят
+    диапазон, `hy2 install` диапазон из шаблона не переносит, `n_audit_hy2_blocks` сравнивает у `listen`
+    только основной порт.
+  - Ссылки: список портов `host:443,10000-19999` (формат URI Hysteria2) только у групп `hy2 add --hop`.
+    Его понимают официальный клиент и Hiddify с 5.5.5 (ray2sing разбирает его с 3.10.2026), а v2rayN
+    (System.Uri) и Hiddify старше такую ссылку не импортируют, поэтому по умолчанию ссылки прежние.
+    Параметр `mport` (v2rayN, 3x-ui) iof не пишет: Hiddify его не читает. Ссылка через ретранслятор
+    всегда с одним портом.
+  - `hy2 upgrade <узлы|all>`: `n_hy2_upgrade` запускает официальный установщик (конфиг он не трогает,
+    юнит перезаписывает и сам перезапускает службу); бинарник и юнит до этого копируются, служба
+    не поднялась — возвращаются.
+  - `block on|off <узлы|all>`, `block update [узлы]` (для cron, только там, где список включён):
+    `block_prepare` чистит список встроенным python (`AUDIT_NET_PY blocklist`): только IPv4, без частных
+    и служебных сетей (Docker, внутренние сети), без записей шире `/BLOCK_MIN_PREFIX` (16). Список уходит
+    на узел gzip+base64, вместе с адресами, которые не блокируются (`block_allow`: адреса узлов и их SSH,
+    `hostname -I` этого сервера, `BLOCK_ALLOW`); узел добавляет свои адреса, loopback и собеседников
+    текущих сессий SSH. `n_block_apply` подменяет наборы через `ipset swap`. Не скачался — на узлы идёт
+    прошлая копия. Нет iptables — отказ (только nftables iof не поддерживает).
 - **Проверка с ПК** (`iof audit probe`, этап 3): доходит ли трафик до узлов через провайдера ПК.
   - `probe start [--ttl с]` (с `-n`): токен (16 байт hex) пишется в `audit/probe/token`, на узлах
     `n_probe_start <номер> <ttl> <PROBE_PORTS> <токен>` поднимает мишень, затем в том же задании pmap
@@ -226,17 +274,20 @@ sha1-хэш. Повторный запуск с той же подписью д�
     результат по слоям и прошлые. Узел `local` в контроле — взгляд не снаружи, об этом пишется в `detail`.
   - `remap` в отчёте ставит `probe.ps1`, когда задан `IOF_PROBE_MAP` (стенд): частный IP источника тогда
     не считается VPN, а в причинах сказано, что путь не через провайдера.
-- Не сделано: действия вроде включения port hopping и применения блок-листа (этап 4). Не проверено:
-  разбор конфига AWG на живом контейнере (на стенде AmneziaWG нет, проверен на подставном конфиге в
-  формате `awg0.conf` контейнера `amnezia-awg2`), GET по HTTP/3, whois для адреса узла целиком (помощник
-  проверен на публичных адресах отдельно), CrowdSec. Проверка с ПК из России с настоящим провайдером
-  (на стенде ПК ходит к контейнерам через WSL), мишень за `ufw` (на стенде проверена политика DROP
-  iptables), узел с одной таблицей nftables.
+- Не проверено: разбор конфига AWG на живом контейнере (на стенде AmneziaWG нет, проверен на подставном
+  конфиге в формате `awg0.conf` контейнера `amnezia-awg2`), GET по HTTP/3, whois для адреса узла целиком
+  (помощник проверен на публичных адресах отдельно), CrowdSec. Проверка с ПК из России с настоящим
+  провайдером (на стенде ПК ходит к контейнерам через WSL), мишень за `ufw` (на стенде проверена политика
+  DROP iptables), узел с одной таблицей nftables. Этап 4: `hy2 upgrade` со старой версии (на стенде
+  Hysteria2 уже последняя), смена портов с правилами nftables целиком (в ядре WSL нет fib для IPv6, там
+  проверен переход на iptables), ссылки со списком портов в настоящем Hiddify и v2rayN (формат взят из
+  их исходников), блок-лист с Docker и `ufw` на узле.
 
 Команды: `status`, `check` (для cron, Telegram, пишет `check.last`), `exec`, `refresh`, `init`,
 `api status|service|updates|audit` (audit — JSON), `audit run [server|dpi|all]|show|cron`,
 `audit probe start [--ttl с]|stop|import|list`, `update`, `version` (версию подставляет `install.sh` в `IOF_VERSION`),
-`node add|import|del|list`, `hy2 install|add|del|list|show|refresh|status|restart`,
+`node add|import|del|list`, `hy2 install|add [--hop|--no-hop]|del|list|show|refresh|status|restart|hop on|off|upgrade`,
+`block on|update|off`,
 `awg add|keys|del|show|export|list|clients|refresh|status`, `relay add|del|list|apply`,
 `migrate start|finish|cancel|status`, `vless` (заглушка, WIP). Полный список в `usage()`.
 
@@ -259,13 +310,20 @@ sha1-хэш. Повторный запуск с той же подписью д�
   `/var/log/iof-nightly*.log`), `/api/jobs`, `/api/term/ws?t=<билет>` (WebSocket терминала);
   `POST /api/nodes` (добавление сервера, при необходимости
   `iof hy2 install`), `POST /api/migrate` (`action`: start, finish или cancel), `POST /api/hy2`
-  (`add|del|refresh`), `POST /api/node` (`restart_hy2|install_hy2|delete`, удаление = `node del` + `refresh`),
+  (`add|del|refresh`; у `add` необязательный `hop: true|false` → `hy2 add --hop|--no-hop`, кнопка
+  «Список портов» группы с диалогом `#hop-dialog`; в группах `hop`, у ссылок `hop` и `port` строкой),
+  `POST /api/node` (`restart_hy2|install_hy2|delete`, удаление = `node del` + `refresh`),
   `POST /api/term` (`{name, cols, rows}` → одноразовый билет терминала),
-  `GET /api/security` (вывод `iof api audit` плюс `error`, `busy`, `migrate`, `probe_state`; узлы не опрашивает) и
+  `GET /api/security` (вывод `iof api audit` плюс `error`, `busy`, `migrate`, `probe_state`; узлы не опрашивает;
+  в `settings` ещё `hop` — диапазон `HY2_HOP`, `block_cron`, `blocklist`) и
   `POST /api/security` (`{block: "server" | "dpi", node}` → задача вида `audit`:
-  `iof [-n узел] audit run <блок>`; блоки перечислены в `AUDIT_BLOCKS`. Страница «Безопасность»,
+  `iof [-n узел] audit run <блок>`; блоки перечислены в `AUDIT_BLOCKS`; `{action, node}` → действие из
+  `AUDIT_ACTIONS` только на одном узле по имени и при переносе отказ: `iof hy2 hop on|off`, `hy2 upgrade`,
+  `block on|update|off` с этим узлом, затем `iof -n <узел> audit run dpi`. Страница «Безопасность»,
   `security.html` + `security.js`: у каждого блока из `BLOCKS` свои `#<блок>-node`, `-run`, `-stamp`,
-  `-health`, `-checks`, отрисовка общая (`renderBlock`); демо-данные обоих блоков в `security.js`),
+  `-health`, `-checks`, отрисовка общая (`renderBlock`); в раскрытой проверке из `ACT_CHECKS` кнопка
+  открывает диалог `#act-dialog`: список узлов, состояние проверки на выбранном и его действия из `act`
+  с описанием `ACTS`; демо-данные обоих блоков в `security.js`, действия в демо меняют `demoAct`),
   проверка с ПК (класс `Probes`, задачи вида `probe`): `POST /api/probe` (`{action: "start", nodes, origin}` →
   задача `iof [-n узлы] audit probe start` и билет `secrets.token_urlsafe`; `origin` — адрес панели в браузере,
   сверяется с `IOF_WEB_HOSTS`; `{action: "cancel"}` → `audit probe stop`), `GET /api/probe` (сессия из
@@ -384,14 +442,27 @@ pipx). Задача `stand` поднимает на раннере стенд и
 `stand/test.sh` (`stand.sh test [управляющий сервер]`) проверяет: все узлы на связи и без проблем,
 `iof exec` и `iof check`, группу Hysteria2 (по ссылке на каждый узел клиент Hysteria2 с другого
 сервера открывает `PROBE_URL` через туннель, ссылка с неверным паролем получает отказ авторизации),
-ретранслятор (`relay add`, туннель через него, `relay del`), `hy2 restart`, аудит (`audit run` по всем
+ретранслятор (`relay add`, туннель через него, `relay del`), `hy2 restart`, смену портов (`hy2 hop on all`,
+повтор ничего не меняет; на первом узле, который не управляющий сервер, входящие запрещены политикой DROP;
+по ссылке группы `--hop` клиент на другом сервере с `hopInterval 5s` открывает `PROBE_URL`, где правила в
+iptables, счётчик перехода показывает несколько потоков; заход на порт из диапазона; `hy2_hop` — `good`,
+`listen` не считается расхождением с шаблоном, `refresh` не теряет диапазон; `hop off all` — один порт,
+ссылки рабочие, на узлах нет правил и drop-in; включение и выключение задачей панели, `all` панель не
+принимает), аудит (`audit run` по всем
 узлам, вход по паролю на стенде — проблема; на первом узле, который не управляющий сервер: лишний
 слушатель на 18080 попадает в «лишние» и `audit cron` сообщает об ухудшении, `PasswordAuthentication no`
 снимает проблему, узел с остановленным ssh остаётся без оценок), блок dpi (у каждого узла конфиг
 Hysteria2 совпадает с шаблоном, порт отвечает на зонд QUIC, AmneziaWG — `none` «не установлен»;
 после правки конфига на узле проверка видит расхождение с шаблоном и `audit cron` сообщает о нём,
 после возврата конфига расхождения нет; пароля Hysteria2 нет в `/root/iof/audit`, `audit show`
-и `api audit`), проверку с ПК (мишени на узлах с python3 и «не проверяется» на узле без него; на первом
+и `api audit`), блок-лист (на первом узле, который не управляющий сервер; список раздаёт управляющий сервер
+`python3 -m http.server` на 127.0.0.1; у другого сервера адреса 1.2.3.4 из списка и 1.2.3.5 из `BLOCK_ALLOW`,
+узел ходит к ним через него: с 1.2.3.4 пакеты отбрасываются, с 1.2.3.5, с адреса из `nodes.conf` и
+с управляющего сервера — нет; IPv6, частные и слишком широкие записи и мусор пропущены; после
+перезапуска `iof-block` список на месте; `block update` с тем же списком ничего не меняет; `blocklist` —
+`good`; обновление и снятие задачей панели, после снятия нет наборов, правил и файлов), запрет действий
+при переносе (поддельный `migrate.conf`: `hy2 hop`, `block`, `hy2 upgrade` и действие в панели отказаны,
+`audit run` разрешён), проверку с ПК (мишени на узлах с python3 и «не проверяется» на узле без него; на первом
 узле с python3, который не управляющий сервер, входящие запрещены политикой DROP — мишень открывает
 порт двумя правилами; контроль проходит все слои; мишень отвечает по TLS и UDP только с токеном; готовый
 JSON: TCP не проходит — `crit` с высокой уверенностью, IP источника — адрес узла — всё `none` и низкая,
@@ -440,7 +511,7 @@ wsl -d Ubuntu-24.04 -u root --cd /mnt/c/dev/repos/iof -- bash stand/stand.sh up
 
 ```bash
 bash stand/stand.sh up        # собрать и поднять; up old node1 — только эти серверы, как в CI
-bash stand/stand.sh setup     # iof из рабочей копии на old, поднятые узлы, Hysteria2, группа ссылок, cron, терминал, python3 на node1
+bash stand/stand.sh setup     # iof из рабочей копии на old, поднятые узлы, Hysteria2, группа ссылок, cron, терминал, python3 на node1, nftables на old
 bash stand/stand.sh test      # проверка iof на стенде (stand/test.sh); после переноса: test new
 bash stand/stand.sh sync      # после правок: залить рабочую копию на серверы, где стоит iof
 bash stand/stand.sh tunnel    # панели: old http://localhost:8081/, new http://localhost:8082/
@@ -473,6 +544,12 @@ bash stand/stand.sh down
 - python3 для мишеней проверки с ПК `setup` ставит только на node1: node2 остаётся без него, и `test`
   проверяет оба случая. В CI (old и node1) случая «нет python3» нет, `test` об этом пишет.
   `setup` же пишет в `iof.env` управляющего сервера `PROBE_PORTS=47000`.
+- `setup` ставит на old `nftables`: Hysteria2 тогда пробует правила смены портов через nft. В ядре WSL
+  нет `CONFIG_NFT_FIB_IPV6`, правило для ip6 не встаёт, служба падает, и iof переходит на iptables — так
+  стенд проверяет этот откат. В CI (ядро Azure) на old должны встать правила nftables. Счётчика
+  потоков у них нет, поэтому `test` проверяет на таком узле только туннели.
+- Все адреса стенда частные, а частные сети блок-лист не применяет. Поэтому `test` даёт серверу адреса
+  1.2.3.4 и 1.2.3.5 и маршрут к ним с проверяемого узла, а потом убирает их.
 - Проверка с ПК с Windows: WSL в режиме NAT пересылает на 127.0.0.1 только TCP, UDP доходит лишь до
   адреса WSL, а сеть 172.30.0.0/24 из Windows не видна. `stand.sh pc on [управляющий]` ставит в WSL DNAT
   (комментарий `iof-stand-pc`): порт `470NN` на мишень `172.30.0.NN:47000` по TCP и UDP, `471NN` на 443/udp
@@ -482,6 +559,17 @@ bash stand/stand.sh down
   тогда `lint.sh` и скрипты стенда запускаются из WSL (`wsl -d Ubuntu-24.04 -u root -- bash ci/lint.sh`).
 
 ## Неочевидные места
+
+- Смена портов Hysteria2 пишется в `listen` как `:443,10000-19999`, а не `:10000-19999`: Hysteria2
+  слушает первый порт списка, и с одним диапазоном основной порт стал бы 10000, а выданные ссылки и
+  DNAT ретрансляторов на 443 перестали бы работать. `n_hy2_port` и так берёт первый порт.
+- Правила смены портов ставит не iof, а сама Hysteria2 при запуске, и снимает при остановке. После
+  падения на iptables осталась бы цепочка `HYSTERIA-PR-*`, и служба не запустилась бы (`-N` с ошибкой):
+  поэтому drop-in `iof-hop.conf` перед стартом чистит остатки. Он же удаляет таблицы `hysteria_*` других
+  экземпляров `hysteria-server@*`, если они есть.
+- Блок-лист стоит в raw PREROUTING, а не в INPUT: в INPUT не попадает трафик к портам контейнеров Docker
+  (AmneziaWG) и ретранслятора, он идёт через FORWARD после DNAT. Частные сети список не блокирует:
+  через raw PREROUTING идут и пакеты контейнеров Docker с их внутренних адресов.
 
 - `iof-nightly` считает сервер управляющим по наличию `/usr/local/bin/iof`: там задание ждёт
   5 минут, пока оно разойдётся по остальным узлам. Поэтому `migrate finish` удаляет `iof`

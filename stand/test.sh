@@ -2,12 +2,14 @@
 
 # Проверка iof на поднятом стенде, её же запускает CI на каждый push. Управляющий сервер видит
 # узлы и выполняет на них команды, ссылки Hysteria2 из iof работают с другого сервера, ретранслятор
-# пересылает трафик, аудит безопасности видит изменения на узле (в том числе расхождение конфига
-# Hysteria2 с шаблоном в блоке dpi), мишени проверки с ПК отвечают только с токеном, готовый отчёт
+# пересылает трафик, смена портов Hysteria2 включается и выключается (клиент ходит по ссылке со списком
+# портов), аудит безопасности видит изменения на узле (в том числе расхождение конфига Hysteria2
+# с шаблоном в блоке dpi), блок-лист отбрасывает пакеты с адресов из списка и не трогает защищённые,
+# действия запрещены во время переноса, мишени проверки с ПК отвечают только с токеном, готовый отчёт
 # даёт ожидаемые оценки, мишени исчезают по сроку; панель отвечает, отбивает чужие
 # запросы, выполняет задачи, выдаёт скрипт для ПК по билету и открывает терминал на каждый узел
 # (stand.sh setup включает его в web.env). Созданные группы ссылок и ретранслятор удаляются,
-# изменения на узле для аудита и проверки с ПК откатываются, стенд остаётся как был.
+# изменения на узле для аудита, смены портов, блок-листа и проверки с ПК откатываются, стенд остаётся как был.
 #   bash stand/stand.sh test [сервер]   сервер — управляющий, по умолчанию old (после переноса: new)
 # Имена узлов в nodes.conf совпадают с именами контейнеров, как после stand.sh setup. Узлов нужно
 # хотя бы два, а стенду — интернет: трафик через туннель идёт на PROBE_URL.
@@ -19,6 +21,7 @@ PROBE_URL="${PROBE_URL:-http://connectivitycheck.gstatic.com/generate_204}"
 # Группы ссылок, которые проверка создаёт и удаляет: из консоли и из панели
 GROUP="CI проверка"
 PANEL_GROUP="CI панель"
+HOP_GROUP="CI смена портов"
 export MSYS_NO_PATHCONV=1
 
 PASSED=0
@@ -29,6 +32,9 @@ AUDIT_LEFT=""
 PROBE_LEFT=0        # 1 — могли остаться мишени проверки с ПК
 PROBE_FW_LEFT=""    # узел, где для проверки с ПК запрещены входящие
 PROBE_PY=()         # узлы с python3: на них поднимаются мишени
+HOP_LEFT=0          # 1 — могла остаться смена портов на узлах и группа со списком портов
+BLOCK_LEFT=""       # «узел|сервер с тестовыми адресами»: там мог остаться блок-лист
+GUARD_LEFT=0        # 1 — на управляющем сервере остался поддельный migrate.conf
 NAMES=()
 declare -A ADDR=()
 
@@ -53,6 +59,19 @@ summary() {
 
 # Если проверка оборвалась посередине, убирает созданное ею
 cleanup() {
+  if (( GUARD_LEFT )); then
+    echo "Убираю поддельный migrate.conf"
+    on "$M" rm -f /root/iof/migrate.conf || true
+  fi
+  if (( HOP_LEFT )); then
+    echo "Выключаю смену портов и убираю группу «$HOP_GROUP»"
+    iofm hy2 hop off all >/dev/null 2>&1 || true
+    iofm hy2 del "$HOP_GROUP" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$BLOCK_LEFT" ]]; then
+    echo "Снимаю блок-лист с ${BLOCK_LEFT%%|*}"
+    block_restore "${BLOCK_LEFT%%|*}" "${BLOCK_LEFT#*|}"
+  fi
   if [[ -n "$AUDIT_LEFT" ]]; then
     echo "Возвращаю $AUDIT_LEFT как был"
     audit_restore "$AUDIT_LEFT"
@@ -120,6 +139,70 @@ tunnel() {
     if [[ "$code" != 2* ]]; then echo "ответ $code, лог клиента:"; tail -n 5 "$log"; fi
     rm -f "$cfg" "$log"
     [[ "$code" == 2* ]]' _ "$PROBE_URL"
+}
+
+# То же со сменой портов: клиент меняет порт каждые 5 с и 14 секунд подряд открывает PROBE_URL.
+# Код 0, если удачных запросов хотя бы 12, печатает их число
+tunnel_hop() {
+  printf '%s\n' "$2" | on_in "$1" bash -c '
+    command -v hysteria >/dev/null || { echo "на сервере нет hysteria"; exit 1; }
+    link="$(cat)"
+    cfg="$(mktemp --suffix=.yaml)"
+    log="$(mktemp)"
+    printf "server: \"%s\"\ntransport:\n  udp:\n    hopInterval: 5s\nsocks5:\n  listen: 127.0.0.1:10804\n" "$link" > "$cfg"
+    timeout 90 hysteria client -c "$cfg" > "$log" 2>&1 &
+    good=0
+    for _ in $(seq 1 14); do
+      code="$(curl -s -o /dev/null -w "%{http_code}" -m 5 --socks5-hostname 127.0.0.1:10804 "$1")" || true
+      if [[ "$code" == 2* ]]; then good=$((good + 1)); fi
+      sleep 1
+    done
+    kill %1 2>/dev/null
+    wait 2>/dev/null
+    echo "удачных запросов: $good из 14"
+    if (( good < 12 )); then tail -n 5 "$log"; fi
+    rm -f "$cfg" "$log"
+    (( good >= 12 ))' _ "$PROBE_URL"
+}
+
+# Сколько новых потоков ушло в перенаправление Hysteria2 на узле $1 (счётчик перехода в HYSTERIA-PR-*).
+# Пусто, если правила стоят в nftables: там счётчиков нет
+hop_flows() {
+  on "$1" bash -c 'iptables -w -t nat -L PREROUTING -v -n -x 2>/dev/null | awk "/HYSTERIA-PR-/ { s += \$1; f = 1 } END { if (f) print s }"'
+}
+
+# Доходит ли TCP с сервера $1 до порта 22 сервера $2, $3 — ключи curl (например, --interface адрес)
+reach() {
+  on "$1" bash -c "curl -sv -m 3 $3 telnet://$2:22 </dev/null 2>&1 | grep -q 'Connected to'"
+}
+
+# Задача панели: POST /api/security с телом $1 (JSON) на управляющем сервере, ждёт её конца.
+# Печатает «состояние заголовок» и хвост лога, при отказе — «refused код текст»
+panel_act() {
+  on_in "$M" python3 - "$1" <<'PY'
+import json, sys, time, urllib.error, urllib.request
+
+BASE = "http://127.0.0.1:8088"
+POST = {"X-IOF-Request": "1", "Content-Type": "application/json", "Origin": BASE}
+r = urllib.request.Request(BASE + "/api/security", data=sys.argv[1].encode(), method="POST", headers=POST)
+try:
+    with urllib.request.urlopen(r, timeout=30) as resp:
+        code, data = resp.status, json.loads(resp.read())
+except urllib.error.HTTPError as e:
+    code, data = e.code, json.loads(e.read() or b"{}")
+if code != 202:
+    print(f"refused {code} {data.get('error', '')}")
+    sys.exit(0)
+for _ in range(600):
+    with urllib.request.urlopen(BASE + "/api/jobs", timeout=30) as resp:
+        job = next((j for j in json.loads(resp.read())["jobs"] if j["id"] == data["job"]), None)
+    if job and job["state"] != "running":
+        print(job["state"], job["title"])
+        print("\n".join(job["log"][-15:]))
+        sys.exit(0)
+    time.sleep(1)
+print("timeout")
+PY
 }
 
 # Все узлы на связи, без проблем, Hysteria2 работает. Заполняет NAMES и ADDR
@@ -301,6 +384,235 @@ check_hy2_del() {
 check_restart() {
   local out
   if out="$(iofm hy2 restart all 2>&1)"; then ok "iof hy2 restart all"; else fail "iof hy2 restart all"; details "$out"; fi
+}
+
+# Ссылка группы $1 на сервер с адресом $2
+group_link_to() {
+  local l
+  while IFS= read -r l; do
+    if [[ "$(link_host "$l")" == "$2" ]]; then echo "$l"; return 0; fi
+  done < <(group_links "$1")
+  return 1
+}
+
+# Смена портов Hysteria2: iof hy2 hop on на всех узлах; по ссылке группы с --hop клиент с другого сервера
+# меняет порт каждые 5 с (где правила в iptables, видно по счётчику, что потоков было несколько), прямой заход
+# на порт из диапазона, оценка аудита, refresh не теряет диапазон; затем hop off — снова один порт, ссылки
+# рабочие, на узлах нет правил и drop-in. Включение и выключение из панели задачей. На первом узле, который
+# не управляющий сервер, входящие запрещены политикой DROP, открыты только 22/tcp и 443/udp
+check_hop() {
+  local out n link one client got range lo before after fwnode="" count
+  for n in "${NAMES[@]}"; do
+    if [[ "$n" != "$M" && -z "$fwnode" ]]; then fwnode="$n"; fi
+  done
+  HOP_LEFT=1
+  if [[ -n "$fwnode" ]]; then
+    PROBE_FW_LEFT="$fwnode"
+    probe_fw "$fwnode" on
+  fi
+  if out="$(iofm hy2 hop on all 2>&1)" && (( $(grep -c '^Включено ' <<<"$out" || true) == ${#NAMES[@]} )); then
+    ok "iof hy2 hop on all: включено на узлах: ${#NAMES[@]}"
+  else
+    fail "iof hy2 hop on all"
+    details "$out"
+    return 1
+  fi
+  if grep -q 'через iptables' <<<"$out"; then
+    echo "      $(grep 'через iptables' <<<"$out" | head -n 3 | sed 's/^Включено *//' | paste -sd';' -)"
+  fi
+  range="$(grep -m1 -oE 'порты [0-9]+-[0-9]+' <<<"$out" | cut -d' ' -f2)"
+  lo="${range%-*}"
+  out="$(iofm hy2 hop on all 2>&1)" || true
+  if grep -q "^Уже было так (${#NAMES[@]})" <<<"$out"; then ok "повтор hop on: ничего не меняет"; else fail "повтор hop on"; details "$out"; fi
+  if out="$(iofm hy2 add "$HOP_GROUP" --hop 2>&1)"; then ok "iof hy2 add «$HOP_GROUP» --hop"; else fail "iof hy2 add «$HOP_GROUP» --hop"; details "$out"; return 1; fi
+
+  for n in "${NAMES[@]}"; do
+    link="$(group_link_to "$HOP_GROUP" "${ADDR[$n]}")" || { fail "в группе «$HOP_GROUP» нет ссылки на $n"; continue; }
+    if [[ "$(link_hostport "$link")" != *",$range" ]]; then fail "ссылка на $n без диапазона: $(link_hostport "$link")"; continue; fi
+    client="$(other_server "${ADDR[$n]}")" || { fail "не с какого сервера проверить $n"; continue; }
+    before="$(hop_flows "$n")"
+    if out="$(tunnel_hop "$client" "$link" 2>&1)"; then
+      ok "туннель со сменой портов $client -> $n ($(link_hostport "$link")): $(head -n 1 <<<"$out")"
+    else
+      fail "туннель со сменой портов $client -> $n ($(link_hostport "$link"))"
+      details "$out"
+    fi
+    after="$(hop_flows "$n")"
+    if [[ -n "$before" && -n "$after" ]]; then
+      if (( after - before >= 2 )); then ok "$n: клиент менял порт, новых потоков на диапазон: $((after - before))"
+      else fail "$n: новых потоков на диапазон $((after - before)), ожидалось хотя бы 2"; fi
+    fi
+    one="$(sed -E "s#@([^/?@]*):[0-9,-]+/#@\\1:$((lo + 123))/#" <<<"$link")"
+    if out="$(tunnel "$client" "$one" 2>&1)"; then ok "туннель $client -> $n на порт $((lo + 123)) из диапазона"
+    else fail "туннель $client -> $n на порт $((lo + 123)) из диапазона"; details "$out"; fi
+  done
+
+  iofm audit run dpi >/dev/null 2>&1 || true
+  for n in "${NAMES[@]}"; do
+    got="$(audit_get "$n" hy2_hop dpi)"
+    if [[ "$got" == good*"$range"* ]]; then ok "dpi $n: смена портов — $got"; else fail "dpi $n: смена портов — «$got»"; fi
+    got="$(audit_get "$n" hy2_template dpi)"
+    if [[ "$got" == good* ]]; then ok "dpi $n: диапазон в listen не считается расхождением с шаблоном"; else fail "dpi $n: конфиг и шаблон — «$got»"; fi
+  done
+  iofm hy2 refresh >/dev/null 2>&1 || true
+  count="$(group_links "$HOP_GROUP" | grep -c ":[0-9]*,$range/" || true)"
+  if (( count == ${#NAMES[@]} )); then ok "iof hy2 refresh: диапазон в ссылках остался ($count)"; else fail "после refresh ссылок с диапазоном: $count из ${#NAMES[@]}"; fi
+
+  # Выключение: снова один порт
+  if out="$(iofm hy2 hop off all 2>&1)" && (( $(grep -c '^Выключено ' <<<"$out" || true) == ${#NAMES[@]} )); then
+    ok "iof hy2 hop off all: выключено на узлах: ${#NAMES[@]}"
+  else
+    fail "iof hy2 hop off all"
+    details "$out"
+  fi
+  count="$(group_links "$HOP_GROUP" | grep -c ':[0-9]*,' || true)"
+  if (( count == 0 )); then ok "после hop off в ссылках группы один порт"; else fail "после hop off ссылок со списком портов: $count"; fi
+  for n in "${NAMES[@]}"; do
+    out="$(on "$n" bash -c 'grep "^listen" /etc/hysteria/config.yaml; ls /etc/systemd/system/hysteria-server.service.d/iof-hop.conf 2>/dev/null
+      iptables -w -t nat -S 2>/dev/null | grep -c HYSTERIA-PR || true; nft list tables 2>/dev/null | grep -c hysteria_ || true')"
+    if [[ "$(head -n 1 <<<"$out")" == "listen: :443" && "$(tail -n 2 <<<"$out" | paste -sd' ' -)" == "0 0" && "$out" != *iof-hop.conf* ]]; then
+      ok "$n: в listen один порт, правил и drop-in нет"
+    else
+      fail "$n после hop off: $(paste -sd' ' - <<<"$out")"
+    fi
+    link="$(group_link_to "$HOP_GROUP" "${ADDR[$n]}")" || continue
+    client="$(other_server "${ADDR[$n]}")" || continue
+    if out="$(tunnel "$client" "$link" 2>&1)"; then ok "туннель $client -> $n ($(link_hostport "$link")) после hop off"
+    else fail "туннель $client -> $n после hop off"; details "$out"; fi
+  done
+
+  # Из панели: задача включает и выключает на одном узле, после неё узел проверен заново
+  n="${fwnode:-${NAMES[0]}}"
+  out="$(panel_act "{\"action\": \"hop_on\", \"node\": \"$n\"}")"
+  if [[ "$out" == ok* ]] && [[ "$(audit_get "$n" hy2_hop dpi)" == good* ]]; then ok "панель: смена портов на $n включена задачей, проверка — good"
+  else fail "панель: включение смены портов на $n"; details "$out"; fi
+  out="$(panel_act "{\"action\": \"hop_off\", \"node\": \"$n\"}")"
+  if [[ "$out" == ok* ]] && [[ "$(audit_get "$n" hy2_hop dpi)" == warn* ]]; then ok "панель: смена портов на $n выключена задачей"
+  else fail "панель: выключение смены портов на $n"; details "$out"; fi
+  out="$(panel_act '{"action": "hop_on", "node": "all"}')"
+  if [[ "$out" == refused* ]]; then ok "панель: действие на «all» не принято (${out#refused })"; else fail "панель приняла действие на all"; details "$out"; fi
+
+  if [[ -n "$fwnode" ]]; then
+    probe_fw "$fwnode" off
+    PROBE_FW_LEFT=""
+  fi
+  if iofm hy2 del "$HOP_GROUP" >/dev/null 2>&1; then HOP_LEFT=0; ok "группа «$HOP_GROUP» удалена"; else fail "не удалилась группа «$HOP_GROUP»"; fi
+}
+
+# Возвращает как было после проверки блок-листа на узле $1 с тестовыми адресами на сервере $2
+block_restore() {
+  iofm block off "$1" >/dev/null 2>&1 || true
+  on "$2" bash -c 'ip addr del 1.2.3.4/32 dev eth0; ip addr del 1.2.3.5/32 dev eth0' >/dev/null 2>&1 || true
+  on "$1" ip route del 1.2.3.0/24 >/dev/null 2>&1 || true
+  on "$M" bash -c 'systemctl stop iof-test-www 2>/dev/null; systemctl reset-failed iof-test-www 2>/dev/null; rm -rf /root/iof-test-www
+    if [[ -f /root/iof-test-env.bak ]]; then cat /root/iof-test-env.bak > /root/iof/iof.env; rm -f /root/iof-test-env.bak; fi
+    rm -f /root/iof/audit/cache/blocklist.txt*' >/dev/null 2>&1 || true
+}
+
+# Блок-лист сканеров на первом узле, который не управляющий сервер. У другого сервера стенда два внешних
+# адреса: 1.2.3.4 из списка и 1.2.3.5 из BLOCK_ALLOW, узел ходит к ним через этот сервер. Список
+# (с частными сетями, IPv6, слишком широкими записями и мусором, их iof пропускает) раздаёт управляющий
+# сервер python3 -m http.server на 127.0.0.1. Пакеты с 1.2.3.4 узел отбрасывает, с остальных — нет,
+# после перезапуска службы список на месте, update без изменений ничего не меняет, снятие убирает всё
+check_block() {
+  local out node="" src="" n got me
+  for n in "${NAMES[@]}"; do
+    if [[ "$n" != "$M" && -z "$node" ]]; then node="$n"; fi
+  done
+  if [[ -z "$node" ]]; then echo "      блок-лист: нет узла, кроме управляющего сервера, пропускаю"; return 0; fi
+  src="$(other_server "${ADDR[$node]}")" || { fail "блок-лист: не с какого сервера проверить $node"; return 1; }
+  BLOCK_LEFT="$node|$src"
+  on_in "$M" bash -s <<'EOF'
+mkdir -p /root/iof-test-www
+printf '# тестовый список iof\n1.2.3.0/24\n172.30.0.0/24\n10.0.0.0/8\n1.0.0.0/4\n2001:db8::/32\nне адрес\n' > /root/iof-test-www/list.txt
+systemctl stop iof-test-www 2>/dev/null; systemctl reset-failed iof-test-www 2>/dev/null
+systemd-run --quiet --unit iof-test-www python3 -m http.server 8765 --bind 127.0.0.1 --directory /root/iof-test-www
+[[ -f /root/iof-test-env.bak ]] || cp -p /root/iof/iof.env /root/iof-test-env.bak
+grep -vE '^(BLOCKLIST_URL|BLOCK_ALLOW)=' /root/iof-test-env.bak > /root/iof/iof.env
+printf 'BLOCKLIST_URL="http://127.0.0.1:8765/list.txt"\nBLOCK_ALLOW="1.2.3.5"\n' >> /root/iof/iof.env
+rm -f /root/iof/audit/cache/blocklist.txt*
+sleep 1
+EOF
+  on "$src" bash -c 'ip addr add 1.2.3.4/32 dev eth0; ip addr add 1.2.3.5/32 dev eth0' >/dev/null 2>&1 || true
+  on "$node" ip route replace 1.2.3.0/24 via "${ADDR[$src]}"
+
+  if out="$(iofm block on "$node" 2>&1)" && grep -q "^  $node: записей 1," <<<"$out"; then
+    ok "iof block on $node: $(grep "^  $node:" <<<"$out" | sed 's/^ *//')"
+  else
+    fail "iof block on $node"
+    details "$out"
+    return 1
+  fi
+  if grep -q 'пропущено: IPv6 1, шире /16 2, частных и служебных 1, нечитаемых 1' <<<"$out"; then
+    ok "из списка пропущены IPv6, слишком широкие записи, частные сети и мусор"
+  else
+    fail "пропущено не то: $(grep 'пропущено' <<<"$out")"
+  fi
+  me="$(on "$M" hostname -I | awk '{ print $1 }')"
+  out="$(on "$node" cat /etc/iof/block.allow)"
+  got="ok"
+  for n in "${NAMES[@]}"; do grep -qx "${ADDR[$n]}" <<<"$out" || got="нет ${ADDR[$n]}"; done
+  grep -qx "$me" <<<"$out" || got="нет $me"
+  grep -qx "1.2.3.5" <<<"$out" || got="нет 1.2.3.5"
+  if [[ "$got" == ok ]]; then ok "$node: не блокируются узлы из nodes.conf, управляющий сервер ($me) и BLOCK_ALLOW"
+  else fail "$node: в block.allow $got"; fi
+
+  if ! reach "$src" "${ADDR[$node]}" "--interface 1.2.3.4"; then ok "$node отбрасывает пакеты с 1.2.3.4 (в списке)"; else fail "$node принимает пакеты с 1.2.3.4"; fi
+  if reach "$src" "${ADDR[$node]}" "--interface 1.2.3.5"; then ok "$node принимает 1.2.3.5 (BLOCK_ALLOW)"; else fail "$node отбрасывает 1.2.3.5 из BLOCK_ALLOW"; fi
+  if reach "$src" "${ADDR[$node]}" ""; then ok "$node принимает $src с его адреса из nodes.conf"; else fail "$node отбрасывает $src"; fi
+  if reach "$M" "${ADDR[$node]}" ""; then ok "$node принимает управляющий сервер $M"; else fail "$node отбрасывает управляющий сервер"; fi
+
+  out="$(on "$node" bash -c 'systemctl restart iof-block && ipset list -t iof-block | sed -n "s/^Number of entries: //p"; iptables -w -t raw -C PREROUTING -j IOF-BLOCK && echo hook')"
+  if [[ "$out" == $'1\nhook' ]] && ! reach "$src" "${ADDR[$node]}" "--interface 1.2.3.4"; then
+    ok "$node: после перезапуска iof-block список на месте"
+  else
+    fail "$node после перезапуска iof-block: $(paste -sd' ' - <<<"$out")"
+  fi
+  out="$(iofm block update 2>&1)" || true
+  if grep -q "^Список тот же, не менялся (1): $node" <<<"$out"; then ok "iof block update: тот же список не трогает"; else fail "iof block update"; details "$out"; fi
+  iofm -n "$node" audit run dpi >/dev/null 2>&1 || true
+  got="$(audit_get "$node" blocklist dpi)"
+  if [[ "$got" == good*"применён"* ]]; then ok "dpi $node: блок-лист — $got"; else fail "dpi $node: блок-лист — «$got»"; fi
+
+  out="$(panel_act "{\"action\": \"block_update\", \"node\": \"$node\"}")"
+  if [[ "$out" == ok* ]]; then ok "панель: обновление блок-листа на $node задачей"; else fail "панель: обновление блок-листа на $node"; details "$out"; fi
+  out="$(panel_act "{\"action\": \"block_off\", \"node\": \"$node\"}")"
+  got="$(on "$node" bash -c 'ipset list -n 2>/dev/null | grep -c "^iof-" || true; iptables -w -t raw -S 2>/dev/null | grep -c IOF-BLOCK || true
+    ls /etc/iof/block.list /etc/systemd/system/iof-block.service /usr/local/sbin/iof-block 2>/dev/null | wc -l')"
+  if [[ "$out" == ok* && "$(paste -sd' ' - <<<"$got")" == "0 0 0" ]]; then
+    ok "панель: блок-лист снят с $node целиком (наборов, правил и файлов нет)"
+  else
+    fail "панель: снятие блок-листа с $node: $(paste -sd' ' - <<<"$got")"
+    details "$out"
+  fi
+  if reach "$src" "${ADDR[$node]}" "--interface 1.2.3.4"; then ok "$node после снятия принимает 1.2.3.4"; else fail "$node после снятия отбрасывает 1.2.3.4"; fi
+  got="$(audit_get "$node" blocklist dpi)"
+  if [[ "$got" == warn*"не применён"* ]]; then ok "dpi $node после снятия: $got"; else fail "dpi $node после снятия: «$got»"; fi
+  block_restore "$node" "$src"
+  BLOCK_LEFT=""
+}
+
+# Во время переноса управления (migrate.conf с role=source) действия запрещены и в консоли, и в панели,
+# а проверка разрешена. migrate.conf подделывается, если переноса нет
+check_guard() {
+  local out n="${NAMES[0]}"
+  if on "$M" test -f /root/iof/migrate.conf; then echo "      идёт настоящий перенос, проверку запрета пропускаю"; return 0; fi
+  GUARD_LEFT=1
+  on "$M" bash -c 'printf "role=source\nid=iof-test\npeer=root@192.0.2.1\nstarted=%s\n" "$(date +%s)" > /root/iof/migrate.conf'
+  if out="$(iofm hy2 hop on "$n" 2>&1)"; then fail "hy2 hop on во время переноса выполнилась"
+  elif grep -q 'идёт перенос' <<<"$out"; then ok "во время переноса: iof hy2 hop on запрещена"
+  else fail "hy2 hop on во время переноса: не та ошибка"; details "$out"; fi
+  if out="$(iofm block on "$n" 2>&1)"; then fail "block on во время переноса выполнилась"
+  elif grep -q 'идёт перенос' <<<"$out"; then ok "во время переноса: iof block on запрещена"
+  else fail "block on во время переноса: не та ошибка"; details "$out"; fi
+  if out="$(iofm hy2 upgrade "$n" 2>&1)"; then fail "hy2 upgrade во время переноса выполнилась"
+  elif grep -q 'идёт перенос' <<<"$out"; then ok "во время переноса: iof hy2 upgrade запрещена"
+  else fail "hy2 upgrade во время переноса: не та ошибка"; details "$out"; fi
+  out="$(panel_act "{\"action\": \"hop_on\", \"node\": \"$n\"}")"
+  if [[ "$out" == refused*перенос* ]]; then ok "панель: действие во время переноса не принято (${out#refused })"; else fail "панель приняла действие во время переноса"; details "$out"; fi
+  if out="$(iofm -n "$n" audit run dpi 2>&1)"; then ok "во время переноса: iof audit run разрешена"; else fail "audit run во время переноса"; details "$out"; fi
+  on "$M" rm -f /root/iof/migrate.conf
+  GUARD_LEFT=0
 }
 
 # Оценка проверки $2 на узле $1 из iof api audit: "статус значение", down — узел не ответил.
@@ -987,10 +1299,16 @@ step "Ретранслятор"
 check_relay
 check_hy2_del
 check_restart
+step "Смена портов Hysteria2"
+check_hop
 step "Аудит безопасности"
 check_audit
 step "Защита от РКН"
 check_dpi
+step "Блок-лист сканеров"
+check_block
+step "Действия во время переноса"
+check_guard
 step "Проверка с ПК"
 check_probe
 step "Веб-панель"

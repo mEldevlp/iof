@@ -111,6 +111,7 @@ function renderHy2(d) {
   if (!up) rows = [["Состояние", '<span class="muted">нет данных</span>']];
   else if (!h.installed) rows = [["Состояние", '<span class="muted">не установлена</span>']];
   else rows = [["Состояние", hy2Cell(n, false)], ["Порт", `UDP ${esc(h.port)}`],
+    ["Смена портов", h.range ? `UDP ${esc(h.range)} → ${esc(h.port)}` : '<span class="muted">нет</span>'],
     ["Доступ", esc(hy2Access(h)) || "—"], ["Версия", esc(h.version) || "—"]];
   $("#hy2").innerHTML = kv(rows);
 

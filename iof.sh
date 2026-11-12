@@ -23,6 +23,10 @@ PROBE_DIR="$AUDIT_DIR/probe"         # проверка с ПК: session.json, t
 PROBE_WHITE="$BASE/probe-white.txt"  # контрольные сайты для проверки с ПК: открываются из России всегда
 PROBE_BLACK="$BASE/probe-black.txt"  # и давно заблокированные РКН
 SSH_KEY="/root/.ssh/iof_ed25519"
+# Смене портов Hysteria2 нужна эта версия: раньше её правила заворачивали и исходящий UDP самого узла
+HY2_HOP_MIN="2.12.3"
+# Записи блок-листа шире этой маски не применяются: ошибка в списке не должна отрезать клиентов
+BLOCK_MIN_PREFIX=16
 
 # Коммит и дата этой версии, install.sh подставляет их при установке
 IOF_VERSION="dev"
@@ -33,10 +37,13 @@ TG_CHAT=""
 PARALLEL=20
 IOF_SRC="/opt/iof"   # клон репозитория для iof update
 AUDIT_KEEP=30        # сколько последних запусков iof audit хранить в истории
-BLOCKLIST_URL=""     # список адресов сканеров для iof audit: текст, по IP или CIDR в строке, # — комментарий
+BLOCKLIST_URL=""     # список адресов сканеров для iof audit и iof block: текст, по IP или CIDR в строке, # — комментарий
+BLOCK_ALLOW=""       # адреса и сети через пробел, которые блок-лист не блокирует никогда (например, свой домашний)
 REGISTRY_URL=""      # выгрузка реестра блокировок в том же формате: есть ли в ней адреса узлов
 PROBE_TTL=900        # сколько секунд живут мишени проверки с ПК (iof audit probe)
 PROBE_PORTS=""       # порт мишеней: пусто — случайный свободный 20000–60000, a-b — из диапазона, N — этот
+HY2_HOP="10000-19999" # диапазон смены портов Hysteria2 для iof hy2 hop on: ниже портов, которые iof сам
+                     # выбирает для ретрансляторов и мишеней (20000–60000)
 IOF_ONLY=""
 if [[ -f "$ENV_FILE" ]]; then
   # shellcheck source=/dev/null # файл на сервере, в репозитории его нет
@@ -61,6 +68,9 @@ n_defaults() {
   AWG_DNS="1.1.1.1, 1.0.0.1"
   AWG_BACKUP="/var/backups/iof-awg"
   IOF_HOME="/root/iof"   # то же, что BASE на управляющем сервере, для переноса управления
+  # Смена портов Hysteria2: drop-in службы и скрипт, который он запускает перед её стартом
+  HOP_DROPIN="/etc/systemd/system/hysteria-server.service.d/iof-hop.conf"
+  HOP_CLEAN="/usr/local/sbin/iof-hy2-hop-clean"
 }
 
 n_err() { echo "Ошибка [$(hostname)]: $*" >&2; exit 1; }
@@ -100,6 +110,38 @@ n_hy2_port() {
   local p
   p="$(grep -oE '^[[:space:]]*listen:[[:space:]]*:?[0-9]+' "$CONFIG" | grep -oE '[0-9]+$' | head -1 || true)"
   printf '%s' "${p:-443}"
+}
+
+# Строка listen из $CONFIG тремя полями «адрес|основной порт|остальные порты». Адрес бывает пустым
+# (listen: :443), остальные порты — диапазон смены портов: listen: :443,10000-19999 даёт |443|10000-19999.
+# Hysteria2 слушает основной порт, а остальные перенаправляет на него сама. Если listen начинается
+# с диапазона (:20000-50000), основной порт — его начало, а в остальных весь диапазон
+n_hy2_listen() {
+  local s host ports base rest=""
+  s="$(sed -n 's/^listen:[[:space:]]*//p' "$CONFIG" 2>/dev/null | sed -E "s/[[:space:]]+#.*\$//; s/[\"']//g; s/[[:space:]]+\$//" | head -n 1 || true)"
+  if [[ -z "$s" ]]; then s=":443"; fi
+  host=""
+  ports="$s"
+  if [[ "$s" == *:* ]]; then host="${s%:*}"; ports="${s##*:}"; fi
+  base="${ports%%[,-]*}"
+  if [[ "$ports" == "$base,"* ]]; then rest="${ports#*,}"
+  elif [[ "$ports" == "$base-"* ]]; then rest="$ports"; fi
+  printf '%s|%s|%s\n' "$host" "$base" "$rest"
+}
+
+# Заменяет первую строку listen в $CONFIG на «listen: $1» (или дописывает её). Файл остаётся тем же:
+# права и владелец не меняются
+n_hy2_listen_set() {
+  local tmp
+  tmp="$(mktemp)"
+  awk -v v="$1" '!done && /^listen:/ { print "listen: " v; done = 1; next } { print } END { if (!done) print "listen: " v }' "$CONFIG" > "$tmp"
+  cat "$tmp" > "$CONFIG"
+  rm -f "$tmp"
+}
+
+# Версия hysteria без v в начале: 2.13.0
+n_hy2_version() {
+  hysteria version 2>/dev/null | awk -F':[[:space:]]*' '/^Version/ { sub(/^v/, "", $2); print $2; exit }' || true
 }
 
 # Пользователи из блока auth.userpass, по строке "имя<TAB>пароль"
@@ -192,15 +234,20 @@ n_hy2_service_restart() {
 # Готовит доступ и печатает ссылку hy2:// в stdout.
 # userpass: создаёт пользователя, если его нет (повторный вызов вернёт ту же ссылку).
 # password: пользователей нет, в ссылку идёт общий пароль из конфига.
+# hop=1 (группа со сменой портов): если в listen есть диапазон, порт в ссылке — список «443,10000-19999»
 n_hy2_add() {
-  local name="$1" pass="$2" label="$3" host="$4"
-  local port acme auth_type auth_str existing sni
+  local name="$1" pass="$2" label="$3" host="$4" hop="${5:-0}"
+  local port acme auth_type auth_str existing sni base range
   local obfs="" pin="" obfs_type obfs_pass cert fp
   n_defaults
   [[ $EUID -eq 0 ]] || n_err "нужны права root"
   [[ -f "$CONFIG" ]] || n_err "не найден $CONFIG"
 
   port="$(n_hy2_port)"
+  if [[ "$hop" == "1" ]]; then
+    IFS='|' read -r _ base range <<<"$(n_hy2_listen)"
+    if [[ -n "$range" ]]; then port="$base,$range"; fi
+  fi
   acme="$(awk '/^[[:space:]]*acme:/{f=1} f&&/^[[:space:]]*-[[:space:]]/{sub(/^[[:space:]]*-[[:space:]]*/,""); sub(/[[:space:]]+#.*$/,""); print; exit}' "$CONFIG" || true)"
 
   # С ACME сертификат настоящий и проверка не нужна, иначе insecure=1 и пин сертификата
@@ -277,7 +324,7 @@ n_hy2_del() {
 # Сертификат создаётся на каждом узле свой (CN = $2), существующий не перезаписывается.
 # Печатает "skip", если Hysteria2 уже работает и не передан force=1, иначе "installed <версия>".
 n_hy2_install() {
-  local tpl="$1" cn="$2" force="$3" cert key port p ver
+  local tpl="$1" cn="$2" force="$3" cert key port p ver lh lb lr
   n_defaults
   [[ $EUID -eq 0 ]] || n_err "нужны права root"
 
@@ -310,6 +357,12 @@ n_hy2_install() {
   cert="$(n_yaml_value tls cert || true)"
   key="$(n_yaml_value tls key || true)"
   port="$(n_hy2_port)"
+  # Смена портов включается на каждом узле отдельно (iof hy2 hop on), диапазон из шаблона не переносится
+  IFS='|' read -r lh lb lr <<<"$(n_hy2_listen)"
+  if [[ -n "$lr" ]]; then
+    n_hy2_listen_set "$lh:$lb"
+    echo "[$(hostname)] диапазон портов $lr из шаблона не перенесён, смену портов включает iof hy2 hop on" >&2
+  fi
   CONFIG="/etc/hysteria/config.yaml"
   [[ -n "$cert" && -n "$key" ]] || { rm -f "$CONFIG.new"; n_err "в шаблоне нет tls.cert или tls.key"; }
 
@@ -348,6 +401,283 @@ n_hy2_install() {
   fi
   ver="$(hysteria version 2>/dev/null | awk -F':[[:space:]]*' '/^Version/{print $2; exit}' || true)"
   echo "installed ${ver:-?}"
+}
+
+# Диапазоны UDP, перенаправленные на порт $1, по строке a-b. Правила nftables (так их ставит сама
+# Hysteria2, если nft есть) и iptables: прямые REDIRECT и DNAT и переходы в цепочку, которая
+# перенаправляет на этот порт (HYSTERIA-PR-*, если nft нет). Цепочки ретранслятора IOF-* не в счёт:
+# там DNAT одного порта на другой узел
+n_hy2_hop_rules() {
+  local port="$1"
+  {
+    if command -v iptables >/dev/null 2>&1; then
+      timeout 10 iptables -w 5 -t nat -S 2>/dev/null | grep -v -- '^-[AN] IOF-' | awk -v p="$port" '
+        { line[NR] = $0 }
+        $1 == "-A" && $2 != "PREROUTING" && $2 != "OUTPUT" && / -j REDIRECT --to-ports / && $NF == p { to[$2] = 1 }
+        END {
+          for (i = 1; i <= NR; i++) {
+            if (line[i] !~ / -p udp /) continue
+            n = split(line[i], f, " ")
+            t = ""
+            for (j = 1; j < n; j++) if (f[j] == "-j") t = f[j + 1]
+            if ((t in to) || (t == "REDIRECT" && f[n] == p) || (t == "DNAT" && f[n] ~ ":" p "$"))
+              for (j = 1; j < n; j++) if (f[j] == "--dport" || f[j] == "--dports") print f[j + 1]
+          }
+        }' || true
+    fi
+    if command -v nft >/dev/null 2>&1; then
+      timeout 10 nft list ruleset 2>/dev/null | awk -v p="$port" '
+        /udp dport/ && ($0 ~ "redirect to :" p "([^0-9]|$)" || $0 ~ "dnat (ip )?to [0-9.]*:" p "([^0-9]|$)") {
+          for (i = 1; i < NF; i++) if ($i == "dport") print $(i + 1)
+        }' || true
+    fi
+  } | tr ':' '-' | grep -xE '[0-9]+-[0-9]+' | sort -u || true
+}
+
+# Drop-in службы Hysteria2 и скрипт, который он запускает перед её стартом: убирает правила смены
+# портов, оставшиеся после аварийного завершения. Hysteria2 снимает свои правила сама при остановке,
+# но после падения на iptables осталась бы цепочка, и следующий запуск не прошёл бы.
+# n_hy2_hop_files on [iptables] пишет оба файла (с iptables drop-in ещё и велит Hysteria2 ставить
+# правила через iptables, а не nftables), off удаляет. systemctl daemon-reload — за вызывающим
+n_hy2_hop_files() {
+  if [[ "$1" != "on" ]]; then
+    rm -f "$HOP_DROPIN" "$HOP_CLEAN"
+    rmdir "$(dirname "$HOP_DROPIN")" 2>/dev/null || true
+    return 0
+  fi
+  mkdir -p "$(dirname "$HOP_DROPIN")"
+  cat > "$HOP_CLEAN" <<'EOS'
+#!/bin/bash
+# iof: убирает правила смены портов Hysteria2, оставшиеся после аварийного завершения службы:
+# таблицы nftables hysteria_* и цепочки iptables HYSTERIA-PR-*. Запускается перед стартом
+# hysteria-server (drop-in iof-hop.conf), когда своих правил у службы ещё нет
+set -u
+if command -v nft >/dev/null 2>&1; then
+  nft list tables 2>/dev/null | while read -r _ fam name; do
+    case "$name" in hysteria_*) nft delete table "$fam" "$name" 2>/dev/null ;; esac
+  done
+fi
+for ipt in iptables ip6tables; do
+  command -v "$ipt" >/dev/null 2>&1 || continue
+  "$ipt" -w 5 -t nat -S 2>/dev/null | grep -E -- ' -j HYSTERIA-PR-[0-9a-f]+$' | while read -r -a rule; do
+    rule[0]=-D
+    "$ipt" -w 5 -t nat "${rule[@]}" 2>/dev/null
+  done
+  for chain in $("$ipt" -w 5 -t nat -S 2>/dev/null | awk '$1 == "-N" && $2 ~ /^HYSTERIA-PR-/ { print $2 }'); do
+    "$ipt" -w 5 -t nat -F "$chain" 2>/dev/null
+    "$ipt" -w 5 -t nat -X "$chain" 2>/dev/null
+  done
+done
+exit 0
+EOS
+  chmod 755 "$HOP_CLEAN"
+  {
+    printf '%s\n' "# iof hy2 hop: перед запуском убрать правила смены портов, оставшиеся после аварийного завершения" \
+      "[Service]" "ExecStartPre=+$HOP_CLEAN"
+    if [[ "${2:-}" == "iptables" ]]; then
+      printf '%s\n' "# Правила через nftables здесь не встали (ядро без нужных модулей), поэтому через iptables" \
+        "Environment=HYSTERIA_FIREWALL_BACKEND=iptables"
+    fi
+  } > "$HOP_DROPIN"
+}
+
+# Ждёт, пока служба Hysteria2 слушает основной порт $1 и, если задан диапазон $2, перенаправляет его.
+# Код 1, если служба упала или правил нет. Без вывода
+n_hy2_hop_ready() {
+  local i
+  sleep 2
+  for (( i = 0; i < 16; i++ )); do
+    if ! systemctl is-active --quiet "$SERVICE"; then return 1; fi
+    if [[ -n "$(ss -Huln "sport = :$1" 2>/dev/null)" ]] \
+       && { [[ -z "$2" ]] || grep -qxF "$2" <<<"$(n_hy2_hop_rules "$1")"; }; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  return 1
+}
+
+# Последняя ошибка Hysteria2 из журнала одной строкой, без цветов
+n_hy2_last_error() {
+  journalctl -u "$SERVICE" -n 30 --no-pager -o cat 2>/dev/null | sed -E 's/\x1b\[[0-9;]*m//g' \
+    | grep -E 'FATAL|ERROR' | tail -n 1 | sed -E 's/^.*"error": "//; s/\\n.*$//; s/"\}$//' | cut -c1-300 || true
+}
+
+# Смена портов (port hopping): n_hy2_hop <on|off> <диапазон a-b> <занятые порты через запятую> <версия от>.
+# on дописывает диапазон в listen (listen: :443,10000-19999): Hysteria2 слушает основной порт, а пакеты
+# на порты диапазона перенаправляет на него сама правилами nftables или iptables и снимает их при
+# остановке. Основной порт не меняется, поэтому выданные ссылки и ретрансляторы работают как раньше.
+# Файрвол узла диапазон открывать не должен: перенаправление случается раньше, чем пакет до него дойдёт.
+# Если служба не поднялась или правил нет, конфиг и drop-in возвращаются как были, узел остаётся
+# на прежних портах. off оставляет в listen основной порт и снимает drop-in.
+# Печатает hop (on или off), port (основной), range, was (что было: диапазон, none или same)
+n_hy2_hop() {
+  local act="$1" range="$2" busy="$3" min="$4" host base cur lo hi ver p s bak had=0 want ok=0 olddrop backend="auto"
+  local bad=()
+  n_defaults
+  [[ $EUID -eq 0 ]] || n_err "нужны права root"
+  if [[ ! -f "$CONFIG" ]] || ! systemctl cat "$SERVICE" >/dev/null 2>&1; then n_err "Hysteria2 не установлена"; fi
+  IFS='|' read -r host base cur <<<"$(n_hy2_listen)"
+  [[ "$base" =~ ^[0-9]+$ ]] || n_err "не разобрал listen в $CONFIG"
+  if [[ -f "$HOP_DROPIN" ]]; then had=1; fi
+
+  if [[ "$act" == "off" ]]; then
+    if [[ -z "$cur" ]]; then
+      # Уже один порт: остатки правил и drop-in убираются без перезапуска службы
+      if (( had )); then
+        "$HOP_CLEAN" || true
+        n_hy2_hop_files off
+        systemctl daemon-reload
+      fi
+      printf 'hop=off\nport=%s\nrange=\nwas=same\n' "$base"
+      return 0
+    fi
+    want="$host:$base"
+  else
+    [[ "$range" =~ ^([0-9]{1,5})-([0-9]{1,5})$ ]] || n_err "диапазон: нужен вид 10000-19999"
+    lo=$((10#${BASH_REMATCH[1]}))
+    hi=$((10#${BASH_REMATCH[2]}))
+    (( lo >= 1024 && lo < hi && hi <= 65535 )) || n_err "диапазон: порты от 1024 до 65535, начало меньше конца"
+    (( base < lo || base > hi )) || n_err "основной порт $base попадает в диапазон $range"
+    ver="$(n_hy2_version)"
+    [[ -n "$ver" ]] || n_err "не узнал версию hysteria"
+    if [[ "$(printf '%s\n%s\n' "$min" "$ver" | sort -V | head -n 1)" != "$min" ]]; then
+      n_err "Hysteria2 $ver, а смене портов нужна версия от $min: сначала обнови её (iof hy2 upgrade)"
+    fi
+    if ! command -v nft >/dev/null 2>&1 && ! command -v iptables >/dev/null 2>&1; then
+      n_err "нет ни nft, ни iptables: Hysteria2 нечем перенаправить диапазон"
+    fi
+    if [[ "$cur" == "$range" ]] && systemctl is-active --quiet "$SERVICE" \
+       && grep -qxF "$range" <<<"$(n_hy2_hop_rules "$base")"; then
+      if (( ! had )); then n_hy2_hop_files on; systemctl daemon-reload; fi
+      printf 'hop=on\nport=%s\nrange=%s\nwas=same\n' "$base" "$range"
+      return 0
+    fi
+
+    # Порты диапазона, которые уже чьи-то: слушатели UDP, порты ретранслятора, опубликованные порты
+    # контейнеров, перенаправления nat (кроме своих правил Hysteria2) и то, что передал управляющий сервер
+    s="$( {
+      ss -Huln 2>/dev/null | awk '{ p = $4; sub(/^.*:/, "", p); print p }'
+      if [[ -f /etc/iof/relay.rules ]]; then awk '$1 !~ /^#/ && NF >= 4 { print $2 }' /etc/iof/relay.rules; fi
+      if command -v docker >/dev/null 2>&1; then
+        timeout 10 docker ps --format '{{.Ports}}' 2>/dev/null | tr ',' '\n' \
+          | sed -nE 's/^.*:([0-9]+(-[0-9]+)?)->[0-9-]+\/udp.*$/\1/p' || true
+      fi
+      if command -v iptables >/dev/null 2>&1; then
+        timeout 10 iptables -w 5 -t nat -S 2>/dev/null | grep -v -- '-j HYSTERIA-PR-' | grep -- ' -p udp ' \
+          | grep -oE -- '--dports? [0-9:,]+' | cut -d' ' -f2 | tr ',' '\n' || true
+      fi
+      tr ',' '\n' <<<"$busy"
+    } | tr ':' '-' | grep -xE '[0-9]+(-[0-9]+)?' | sort -u || true)"
+    while IFS= read -r p; do
+      [[ -n "$p" ]] || continue
+      if awk -F- -v lo="$lo" -v hi="$hi" '{ b = (NF > 1 ? $2 : $1); exit !($1 <= hi && b >= lo) }' <<<"$p"; then bad+=("$p"); fi
+    done <<<"$s"
+    if (( ${#bad[@]} > 0 )); then
+      n_err "в диапазоне $range уже заняты порты UDP: $(printf '%s\n' "${bad[@]}" | sort -n | head -n 10 | paste -sd, -). Выбери другой диапазон"
+    fi
+    want="$host:$base,$range"
+  fi
+
+  bak="$CONFIG.bak.$(date +%s)"
+  cp -p "$CONFIG" "$bak"
+  olddrop="$(cat "$HOP_DROPIN" 2>/dev/null || true)"
+  if [[ "$act" == "on" ]]; then
+    # Hysteria2 выбирает nftables, если есть nft. Если с ними служба не поднялась (бывает на ядрах
+    # без нужных модулей), второй заход — через iptables. Если так было и раньше, сразу через iptables
+    if grep -q 'HYSTERIA_FIREWALL_BACKEND=iptables' <<<"$olddrop"; then backend="iptables"; fi
+    n_hy2_hop_files on "$backend"
+    systemctl daemon-reload
+    n_hy2_listen_set "$want"
+    systemctl restart "$SERVICE" >/dev/null 2>&1 || true
+    if n_hy2_hop_ready "$base" "$range"; then ok=1
+    elif [[ "$backend" == "auto" ]] && command -v nft >/dev/null 2>&1 && command -v iptables >/dev/null 2>&1; then
+      s="$(n_hy2_last_error)"
+      echo "[$(hostname)] через nftables не вышло${s:+ ($s)}, пробую через iptables" >&2
+      n_hy2_hop_files on iptables
+      systemctl daemon-reload
+      systemctl restart "$SERVICE" >/dev/null 2>&1 || true
+      if n_hy2_hop_ready "$base" "$range"; then ok=1; backend="iptables"; fi
+    fi
+  else
+    # Свои правила Hysteria2 снимает при остановке, остальное добирает скрипт
+    n_hy2_listen_set "$want"
+    systemctl stop "$SERVICE" >/dev/null 2>&1 || true
+    "$HOP_CLEAN" 2>/dev/null || true
+    n_hy2_hop_files off
+    systemctl daemon-reload
+    systemctl start "$SERVICE" >/dev/null 2>&1 || true
+    if n_hy2_hop_ready "$base" ""; then ok=1; fi
+  fi
+
+  # Не вышло: конфиг и drop-in как были, служба перезапускается с ними
+  if (( ! ok )); then
+    s="$(n_hy2_last_error)"
+    cat "$bak" > "$CONFIG"
+    if [[ -x "$HOP_CLEAN" ]]; then "$HOP_CLEAN" || true; fi
+    if (( had )); then
+      n_hy2_hop_files on
+      printf '%s\n' "$olddrop" > "$HOP_DROPIN"
+    else
+      n_hy2_hop_files off
+    fi
+    systemctl daemon-reload
+    systemctl restart "$SERVICE" >/dev/null 2>&1 || true
+    if [[ "$act" == "on" ]]; then s="служба не поднялась с диапазоном или не поставила правила${s:+: $s}"
+    else s="служба не поднялась без диапазона${s:+: $s}"; fi
+    n_err "$s. Конфиг возвращён как был (копия: $bak)"
+  fi
+  if [[ "$act" == "on" ]]; then
+    printf 'hop=on\nport=%s\nrange=%s\nwas=%s\nbackend=%s\n' "$base" "$range" "${cur:-none}" "$backend"
+  else
+    printf 'hop=off\nport=%s\nrange=\nwas=%s\n' "$base" "$cur"
+  fi
+}
+
+# Обновление Hysteria2 официальным установщиком: n_hy2_upgrade. Конфиг он не трогает, юнит службы
+# перезаписывает (drop-in iof-hop.conf остаётся) и сам перезапускает работающую службу. Перед этим
+# бинарник и юнит копируются в /var/backups/iof-hy2, хранятся три последние копии. Если служба после
+# обновления не работает, а до него работала, бинарник и юнит возвращаются и служба перезапускается.
+# Печатает "same <версия>" (уже последняя) или "upgraded <была> <стала>"
+n_hy2_upgrade() {
+  local bin="/usr/local/bin/hysteria" unit="/etc/systemd/system/hysteria-server.service"
+  local dir="/var/backups/iof-hy2" log="/var/log/iof-hy2-upgrade.log" old new ts active=0 s rc=0
+  n_defaults
+  [[ $EUID -eq 0 ]] || n_err "нужны права root"
+  [[ -x "$bin" ]] || n_err "нет $bin: Hysteria2 не установлена или поставлена не официальным установщиком"
+  command -v curl >/dev/null 2>&1 || n_err "нет curl: apt install curl"
+  old="$(n_hy2_version)"
+  if systemctl is-active --quiet "$SERVICE"; then active=1; fi
+  ts="$(date +%s)"
+  mkdir -p "$dir"
+  chmod 700 "$dir"
+  cp -p "$bin" "$dir/hysteria-${old:-unknown}-$ts"
+  if [[ -f "$unit" ]]; then cp -p "$unit" "$dir/hysteria-server.service-$ts"; fi
+
+  bash <(curl -fsSL https://get.hy2.sh/) > "$log" 2>&1 || rc=$?
+  new="$(n_hy2_version)"
+  if (( rc == 0 )) && [[ -n "$new" && "$new" == "$old" ]]; then
+    rm -f "$dir/hysteria-${old:-unknown}-$ts" "$dir/hysteria-server.service-$ts"
+    echo "same $new"
+    return 0
+  fi
+  sleep 2
+  if (( rc != 0 )) || { (( active )) && ! systemctl is-active --quiet "$SERVICE"; }; then
+    s="$(journalctl -u "$SERVICE" -n 5 --no-pager -o cat 2>/dev/null | grep -v '^[[:space:]]*$' | tail -n 1 || true)"
+    install -m 755 "$dir/hysteria-${old:-unknown}-$ts" "$bin"
+    if [[ -f "$dir/hysteria-server.service-$ts" ]]; then cp -p "$dir/hysteria-server.service-$ts" "$unit"; fi
+    systemctl daemon-reload
+    if (( active )); then systemctl restart "$SERVICE" >/dev/null 2>&1 || true; fi
+    if (( rc != 0 )); then s="установщик завершился с ошибкой (лог: $log)"
+    else s="после обновления до ${new:-?} служба не работает${s:+: $s}"; fi
+    n_err "$s. Возвращена версия ${old:-прежняя}"
+  fi
+  # Три последние копии, остальные удаляются
+  # shellcheck disable=SC2012 # имена копий без пробелов
+  ls -1t "$dir"/hysteria-[0-9u]* 2>/dev/null | tail -n +4 | xargs -r rm -f
+  # shellcheck disable=SC2012
+  ls -1t "$dir"/hysteria-server.service-* 2>/dev/null | tail -n +4 | xargs -r rm -f
+  echo "upgraded ${old:-?} ${new:-?}"
 }
 
 
@@ -674,13 +1004,14 @@ n_awg_del() {
 #  awg_state running/stopped/none, awg_port, awg_peers, awg_online (рукопожатие за 3 минуты),
 #  cpus, load1, mem_used_mb, mem_total_mb, disk_used_kb, disk_total_kb, uptime_s
 n_status() {
-  local installed="no" state="" udp="no" port="" auth="" users=0 ver=""
+  local installed="no" state="" udp="no" port="" auth="" users=0 ver="" range=""
   local awg_state="none" awg_port="" awg_peers="" awg_online="" aconf
   n_defaults
 
   if command -v hysteria >/dev/null 2>&1 || [[ -f "$CONFIG" ]]; then installed="yes"; fi
   if [[ -f "$CONFIG" ]]; then
     port="$(n_hy2_port)"
+    range="$(n_hy2_listen | cut -d'|' -f3)"
     auth="$(n_yaml_value auth type || true)"
     users="$(n_hy2_userpass | wc -l)"
   fi
@@ -706,6 +1037,7 @@ n_status() {
     "hy2_state=${state:-unknown}" \
     "hy2_udp=$udp" \
     "hy2_port=$port" \
+    "hy2_range=$range" \
     "hy2_auth=$auth" \
     "hy2_users=$users" \
     "hy2_ver=$ver" \
@@ -724,14 +1056,18 @@ n_status() {
 # (DNAT + MASQUERADE). Пакеты не расшифровываются, работает ядро, без отдельного процесса.
 # Правила хранятся в /etc/iof/relay.rules, применяются сервисом iof-relay при загрузке.
 
-# $1 свободных портов из диапазона 20000-60000, по одному в строке
+# $1 свободных портов из диапазона 20000-60000, по одному в строке. Мимо слушателей, правил
+# ретранслятора и диапазона смены портов Hysteria2: пакеты на его порты ушли бы в Hysteria2
 n_free_ports() {
-  local need="$1" got=() p tries=0
+  local need="$1" got=() p tries=0 hop=""
+  n_defaults
+  if [[ -f "$CONFIG" ]]; then hop="$(n_hy2_listen | cut -d'|' -f3 | tr ',' '\n')"; fi
   while (( ${#got[@]} < need && tries < 200 )); do
     tries=$((tries + 1))
     p="$(shuf -i 20000-60000 -n 1)"
     if [[ -n "$(ss -Htuln "sport = :$p" 2>/dev/null)" ]]; then continue; fi
     if [[ -f /etc/iof/relay.rules ]] && awk -v p="$p" '$2 == p { f = 1 } END { exit !f }' /etc/iof/relay.rules; then continue; fi
+    if [[ -n "$hop" ]] && awk -F- -v p="$p" 'NF { b = (NF > 1 ? $2 : $1); if (p >= $1 && p <= b) f = 1 } END { exit !f }' <<<"$hop"; then continue; fi
     if [[ " ${got[*]} " == *" $p "* ]]; then continue; fi
     got+=("$p")
   done
@@ -837,6 +1173,155 @@ n_relay_status() {
   active="$(systemctl is-active iof-relay.service 2>/dev/null || true)"
   rules="$(iptables -w -t nat -S IOF-PRE 2>/dev/null | grep -c DNAT || true)"
   printf '%s %s\n' "${active:-inactive}" "${rules:-0}"
+}
+
+
+# Блок-лист сканеров на узле (iof block). Пакеты с адресов из списка отбрасываются в таблице raw,
+# в цепочке IOF-BLOCK с переходом из PREROUTING: раньше NAT, поэтому под список попадают и порты
+# контейнеров Docker, и порты ретранслятора, которые через INPUT не идут. Адреса из block.allow
+# не блокируются никогда. Список возвращает после перезагрузки служба iof-block, как iof-relay
+
+# n_block_apply <on|update|off> <список: gzip и base64> <защищённые адреса через пробел> <время списка>.
+# on и update пишут /etc/iof/block.list (время файла — когда управляющий сервер скачал список) и
+# /etc/iof/block.allow: к адресам с управляющего сервера добавляются свои адреса узла, loopback
+# и собеседники текущих сессий SSH. Наборы ipset подменяются целиком (ipset swap), старый список
+# действует, пока не готов новый. update меняет список только там, где он уже включён.
+# off снимает всё: переход, цепочку, наборы, службу и файлы.
+# Печатает block (on, same, skip, off), entries, allow
+n_block_apply() {
+  local act="$1" b64="$2" allow="$3" at="$4" tmp n m
+  [[ $EUID -eq 0 ]] || n_err "нужны права root"
+  if [[ "$act" == "off" ]]; then
+    systemctl disable --now iof-block.service >/dev/null 2>&1 || true
+    if [[ -x /usr/local/sbin/iof-block ]]; then /usr/local/sbin/iof-block stop || true; fi
+    rm -f /etc/systemd/system/iof-block.service /usr/local/sbin/iof-block /etc/iof/block.list /etc/iof/block.allow
+    systemctl daemon-reload
+    echo "block=off"
+    return 0
+  fi
+  if [[ "$act" == "update" && ! -f /etc/iof/block.list ]]; then echo "block=skip"; return 0; fi
+  command -v iptables >/dev/null 2>&1 || n_err "нет iptables: блок-лист iof ставит правилом iptables с набором ipset, узел только с nftables так не защитить"
+  if ! command -v ipset >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    if ! apt-get install -y -qq ipset >/dev/null 2>&1; then
+      apt-get update -qq >/dev/null 2>&1 || true
+      apt-get install -y -qq ipset >/dev/null 2>&1 || n_err "не удалось установить ipset: apt install ipset"
+    fi
+  fi
+  [[ "$at" =~ ^[0-9]+$ ]] || at="$(date +%s)"
+
+  mkdir -p /etc/iof
+  tmp="$(mktemp)"
+  if ! printf '%s' "$b64" | base64 -d 2>/dev/null | gzip -dc > "$tmp" 2>/dev/null; then
+    rm -f "$tmp"
+    n_err "список повреждён при передаче"
+  fi
+  if [[ ! -s "$tmp" ]] || grep -qvE '^[0-9]{1,3}(\.[0-9]{1,3}){3}(/[0-9]{1,2})?$' "$tmp"; then
+    rm -f "$tmp"
+    n_err "список пуст или в нём есть строки не IPv4"
+  fi
+  {
+    tr ' ,' '\n\n' <<<"$allow"
+    echo "127.0.0.0/8"
+    ip -4 -o addr show 2>/dev/null | awk '{ sub(/\/.*/, "", $4); print $4 }'
+    ss -Htnp state established 2>/dev/null | awk '/"sshd/ { p = $4; sub(/:[0-9]+$/, "", p); gsub(/[][]/, "", p); sub(/^::ffff:/, "", p); print p }'
+  } | grep -xE '[0-9]{1,3}(\.[0-9]{1,3}){3}(/[0-9]{1,2})?' | sort -u > "$tmp.allow" || true
+
+  # Тот же список уже применён: только время списка
+  if cmp -s "$tmp" /etc/iof/block.list && cmp -s "$tmp.allow" /etc/iof/block.allow \
+     && systemctl is-active --quiet iof-block.service && iptables -w 5 -t raw -C PREROUTING -j IOF-BLOCK 2>/dev/null; then
+    rm -f "$tmp" "$tmp.allow"
+    touch -d "@$at" /etc/iof/block.list
+    printf 'block=same\nentries=%s\nallow=%s\n' "$(grep -c . /etc/iof/block.list)" "$(grep -c . /etc/iof/block.allow || true)"
+    return 0
+  fi
+  install -m 600 "$tmp" /etc/iof/block.list
+  install -m 600 "$tmp.allow" /etc/iof/block.allow
+  rm -f "$tmp" "$tmp.allow"
+  touch -d "@$at" /etc/iof/block.list
+
+  cat > /usr/local/sbin/iof-block <<'EOS'
+#!/bin/bash
+# iof: блок-лист сканеров. Пакеты с адресов из /etc/iof/block.list отбрасываются в таблице raw,
+# раньше NAT, ufw и Docker. Адреса из /etc/iof/block.allow не блокируются никогда.
+# start и reload загружают списки заново (ipset swap, старый действует до готовности нового), stop снимает всё
+set -u
+LIST=/etc/iof/block.list
+ALLOW=/etc/iof/block.allow
+ipt() { iptables -w 5 "$@"; }
+
+# Набор $1 из файла $2: собирается под именем $1-new и подменяет прежний целиком
+load() {
+  local set="$1" file="$2" max=65536 n
+  n="$(grep -c . "$file" 2>/dev/null || true)"
+  if (( ${n:-0} + 1024 > max )); then max=$(( n + 1024 )); fi
+  ipset destroy "$set-new" 2>/dev/null
+  { echo "create $set-new hash:net family inet maxelem $max"
+    grep -E '^[0-9]' "$file" | sed "s/^/add $set-new /"
+  } | ipset restore -exist || return 1
+  if ipset -q list -n "$set" >/dev/null; then
+    ipset swap "$set-new" "$set" && ipset destroy "$set-new"
+  else
+    ipset rename "$set-new" "$set"
+  fi
+}
+
+stop() {
+  local s
+  while ipt -t raw -D PREROUTING -j IOF-BLOCK 2>/dev/null; do :; done
+  ipt -t raw -F IOF-BLOCK 2>/dev/null
+  ipt -t raw -X IOF-BLOCK 2>/dev/null
+  for s in iof-block iof-allow iof-block-new iof-allow-new; do ipset destroy "$s" 2>/dev/null; done
+  return 0
+}
+
+start() {
+  [[ -s "$LIST" ]] || { stop; return 0; }
+  touch "$ALLOW"
+  load iof-allow "$ALLOW" || return 1
+  load iof-block "$LIST" || return 1
+  ipt -t raw -N IOF-BLOCK 2>/dev/null
+  ipt -t raw -C IOF-BLOCK -m set --match-set iof-allow src -j RETURN 2>/dev/null \
+    || ipt -t raw -I IOF-BLOCK 1 -m set --match-set iof-allow src -j RETURN || return 1
+  ipt -t raw -C IOF-BLOCK -m set --match-set iof-block src -j DROP 2>/dev/null \
+    || ipt -t raw -A IOF-BLOCK -m set --match-set iof-block src -j DROP || return 1
+  ipt -t raw -C PREROUTING -j IOF-BLOCK 2>/dev/null || ipt -t raw -I PREROUTING 1 -j IOF-BLOCK
+}
+
+case "${1:-start}" in
+  start|reload) start ;;
+  stop)         stop ;;
+  *)            echo "usage: iof-block start|reload|stop" >&2; exit 2 ;;
+esac
+EOS
+  chmod 755 /usr/local/sbin/iof-block
+
+  cat > /etc/systemd/system/iof-block.service <<'EOS'
+[Unit]
+Description=iof block list (drops packets from scanner addresses)
+After=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/iof-block start
+ExecReload=/usr/local/sbin/iof-block reload
+ExecStop=/usr/local/sbin/iof-block stop
+
+[Install]
+WantedBy=multi-user.target
+EOS
+  systemctl daemon-reload
+  systemctl enable iof-block.service >/dev/null 2>&1
+  if systemctl is-active --quiet iof-block.service; then
+    systemctl reload iof-block.service || n_err "список не применился: journalctl -u iof-block -n 20"
+  else
+    systemctl restart iof-block.service || n_err "список не применился: journalctl -u iof-block -n 20"
+  fi
+  iptables -w 5 -t raw -C PREROUTING -j IOF-BLOCK 2>/dev/null || n_err "нет перехода в IOF-BLOCK после применения: journalctl -u iof-block -n 20"
+  n="$(ipset list -t iof-block 2>/dev/null | sed -n 's/^Number of entries:[[:space:]]*//p')"
+  m="$(ipset list -t iof-allow 2>/dev/null | sed -n 's/^Number of entries:[[:space:]]*//p')"
+  printf 'block=on\nentries=%s\nallow=%s\n' "${n:-0}" "${m:-0}"
 }
 
 
@@ -1013,6 +1498,8 @@ n_audit_hy2_blocks() {
     /^[ \t]*(#.*)?$/ { next }
     { sub(/[ \t]+#.*$/, ""); sub(/[ \t]+$/, "") }
     /^[^ \t]/ { name = $0; sub(/:.*$/, "", name); skip = -1 }
+    # У listen только основной порт: диапазон смены портов у каждого узла свой (iof hy2 hop)
+    /^listen:/ { gsub(/["\047]/, ""); sub(/[,-][0-9,-]*$/, "") }
     skip >= 0 { if (ind($0) > skip) next; skip = -1 }
     name == "auth" && /^[ \t]+userpass:$/ { skip = ind($0) }
     name ~ /^[A-Za-z][A-Za-z0-9_]*$/ { print name "\t" $0 }
@@ -1051,15 +1538,16 @@ n_audit_awg_params() {
 # Факты для блока «Защита от РКН»: n_audit_dpi <соль запуска>. Секретов в выводе нет: пароль
 # Salamander попадает только в хэш блока obfs, пакеты I1–I5 AmneziaWG — только в awg_hash.
 #  now, hostname,
-#  hy2 yes/no, hy2_state, hy2_port, hy2_range (диапазон портов в listen), hy2_obfs none/salamander,
+#  hy2 yes/no, hy2_state, hy2_port, hy2_ver, hy2_range (диапазон портов в listen), hy2_obfs none/salamander,
 #  hy2_obfs_pass set/empty, hy2_masq none/proxy/file/string, hy2_masq_url, hy2_masq_code (ответ цели
 #  proxy с узла), hy2_masq_dir yes/no, hy2_http и hy2_https (порты listenHTTP и listenHTTPS),
 #  hy2_acme yes/no, hy2_cert_cn, hy2_cert_self yes/no, hy2_log (уровень журнала), hy2_hop (диапазоны
 #  портов, перенаправленные на порт Hysteria2, через запятую),
 #  awg none/stopped/noconf/running, awg_c, awg_if, awg_hash, awg_log_driver, awg_log_max, awg_log_size,
 #  web none/loopback/any/unknown, web_addr (на чём слушает iof-web),
-#  block_set yes/no, block_entries, block_chain yes/no, block_hook yes/no, block_at (блок-лист
-#  сканеров: ipset iof-block, цепочка IOF-BLOCK, время /etc/iof/block.list),
+#  block_set yes/no, block_entries, block_ipt yes/no, block_chain yes/no, block_hook yes/no, block_svc,
+#  block_at (блок-лист сканеров: ipset iof-block, цепочка IOF-BLOCK в raw, служба iof-block,
+#  время /etc/iof/block.list),
 #  jd_retention, jd_maxuse, jd_usage, jd_oldest, time_sync yes/no, time_ntp, now_end,
 #  и повторяющиеся: hy2_block (см. n_audit_hy2_blocks), awg_p и awg_i (см. n_audit_awg_params),
 #  listen (см. n_audit_listen), expect и relay (см. n_audit_expect)
@@ -1074,9 +1562,9 @@ n_audit_dpi() {
     echo "hy2_state=$(systemctl is-active "$SERVICE" 2>/dev/null || true)"
     port="$(n_hy2_port)"
     echo "hy2_port=$port"
-    # Hysteria2 слушает первый порт диапазона, остальные перенаправляет на него сама
-    s="$(sed -n 's/^listen:[[:space:]]*//p' "$CONFIG" | sed -E "s/[[:space:]]+#.*\$//; s/[\"']//g" | head -n 1 || true)"
-    if [[ "$s" =~ :([0-9]+-[0-9]+)$ ]]; then echo "hy2_range=${BASH_REMATCH[1]}"; fi
+    echo "hy2_ver=$(n_hy2_version)"
+    # Hysteria2 слушает основной порт, остальные порты из listen перенаправляет на него сама
+    echo "hy2_range=$(n_hy2_listen | cut -d'|' -f3)"
     v="$(n_yaml_value obfs type || true)"
     echo "hy2_obfs=${v:-none}"
     if [[ -n "$(n_yaml_value salamander password || true)" ]]; then echo "hy2_obfs_pass=set"; else echo "hy2_obfs_pass=empty"; fi
@@ -1118,22 +1606,9 @@ n_audit_dpi() {
     fi
     echo "hy2_log=${v:-info}"
 
-    # Port hopping своими правилами: диапазон UDP, перенаправленный на порт Hysteria2. Цепочки
-    # ретранслятора IOF-* сюда не относятся: там DNAT одного порта на другой узел
-    s=""
-    if command -v iptables >/dev/null 2>&1; then
-      s+="$(timeout 10 iptables -w 5 -t nat -S 2>/dev/null | grep -v -- '^-[AN] IOF-' | awk -v p="$port" '
-        / -p udp / && ($0 ~ " -j REDIRECT --to-ports " p "$" || $0 ~ " -j DNAT --to-destination [0-9.]*:" p "$") {
-          for (i = 1; i < NF; i++) if ($i == "--dport" || $i == "--dports") print $(i + 1)
-        }' || true)"$'\n'
-    fi
-    if command -v nft >/dev/null 2>&1; then
-      s+="$(timeout 10 nft list ruleset 2>/dev/null | awk -v p="$port" '
-        /udp dport/ && ($0 ~ "redirect to :" p "([^0-9]|$)" || $0 ~ "dnat to [0-9.]*:" p "([^0-9]|$)") {
-          for (i = 1; i < NF; i++) if ($i == "dport") print $(i + 1)
-        }' || true)"
-    fi
-    echo "hy2_hop=$(tr ':' '-' <<<"$s" | grep -xE '[0-9]+-[0-9]+' | sort -u | paste -sd, || true)"
+    # Диапазоны UDP, которые сейчас перенаправлены на порт Hysteria2: её собственные правила
+    # (диапазон в listen) или поставленные вручную
+    echo "hy2_hop=$(n_hy2_hop_rules "$port" | paste -sd, || true)"
 
     n_audit_hy2_blocks "$CONFIG" "$salt"
   else
@@ -1173,7 +1648,8 @@ n_audit_dpi() {
     else echo "web=loopback"; fi
   fi
 
-  # Блок-лист сканеров: только смотрим, применён ли он. Набор iof-block и цепочка IOF-BLOCK
+  # Блок-лист сканеров (iof block): набор iof-block, цепочка IOF-BLOCK в таблице raw с переходом
+  # из PREROUTING, служба iof-block, время списка — когда его скачал управляющий сервер
   s=""
   if command -v ipset >/dev/null 2>&1; then s="$(timeout 10 ipset list -t iof-block 2>/dev/null || true)"; fi
   if [[ -n "$s" ]]; then
@@ -1184,11 +1660,15 @@ n_audit_dpi() {
   fi
   s=""; v=""
   if command -v iptables >/dev/null 2>&1; then
-    s="$(timeout 10 iptables -w 5 -S IOF-BLOCK 2>/dev/null || true)"
-    v="$(timeout 10 iptables -w 5 -S INPUT 2>/dev/null || true)"
+    echo "block_ipt=yes"
+    s="$(timeout 10 iptables -w 5 -t raw -S IOF-BLOCK 2>/dev/null || true)"
+    v="$(timeout 10 iptables -w 5 -t raw -S PREROUTING 2>/dev/null || true)"
+  else
+    echo "block_ipt=no"
   fi
-  if [[ -n "$s" ]]; then echo "block_chain=yes"; else echo "block_chain=no"; fi
+  if grep -q -- '--match-set iof-block src -j DROP' <<<"$s"; then echo "block_chain=yes"; else echo "block_chain=no"; fi
   if grep -q -- '-j IOF-BLOCK' <<<"$v"; then echo "block_hook=yes"; else echo "block_hook=no"; fi
+  echo "block_svc=$(systemctl is-enabled iof-block.service 2>/dev/null || true)"
   if [[ -f /etc/iof/block.list ]]; then echo "block_at=$(stat -c %Y /etc/iof/block.list)"; fi
 
   # Журнал systemd: действующие настройки, сколько занимает и с какого времени хранит записи
@@ -1565,12 +2045,14 @@ n_migrate_abort() {
 # Всё, что run_on передаёт на узел
 NODE_FUNCS=(
   n_defaults n_err n_yaml_value n_urlencode
-  n_hy2_port n_hy2_userpass n_hy2_user_add n_hy2_user_del n_hy2_restart n_hy2_service_restart
-  n_hy2_add n_hy2_del n_hy2_install
+  n_hy2_port n_hy2_listen n_hy2_listen_set n_hy2_version
+  n_hy2_userpass n_hy2_user_add n_hy2_user_del n_hy2_restart n_hy2_service_restart
+  n_hy2_add n_hy2_del n_hy2_install n_hy2_hop_rules n_hy2_hop_files n_hy2_hop_ready n_hy2_last_error
+  n_hy2_hop n_hy2_upgrade
   n_awg_find n_awg_running n_awg_iface n_awg_table_pubs n_awg_table_add n_awg_table_del n_awg_pubkey
   n_awg_clients n_awg_backup n_awg_add n_awg_del
   n_status
-  n_free_ports n_relay_apply n_relay_status
+  n_free_ports n_relay_apply n_relay_status n_block_apply
   n_audit_listen n_audit_expect n_audit_server n_audit_hy2_blocks n_audit_awg_params n_audit_dpi
   n_probe_start n_probe_stop
   n_migrate_check n_migrate_receive n_migrate_uninstall n_migrate_demote n_migrate_abort
@@ -1607,12 +2089,14 @@ remote_sudo() {
 
 # Выполняет функцию n_* на узле: run_on <local|user@host[:port]> <функция> [аргументы].
 # Скрипт с функциями и аргументами уходит через stdin, поэтому пароли не видны в списке процессов узла.
+# На самом управляющем сервере скрипт читается из канала, а не из аргумента: так его тоже не видно
+# в списке процессов, stdin остаётся свободным, и нет предела в 128 КБ на аргумент (блок-лист больше)
 run_on() {
   local target="$1" script
   shift
   script="set -euo pipefail; $(declare -f "${NODE_FUNCS[@]}"); $(printf '%q ' "$@")"
   if [[ "$target" == "local" ]]; then
-    bash -c "$script"
+    bash <(printf '%s' "$script")
   else
     ssh_cmd "$target" "$(remote_sudo "$target")bash -s" <<<"$script"
   fi
@@ -2026,6 +2510,13 @@ TG_CHAT=""
 
 # Сколько узлов обрабатывать одновременно
 PARALLEL=20
+
+# Диапазон смены портов Hysteria2 для iof hy2 hop on
+HY2_HOP="10000-19999"
+
+# Блок-лист сканеров (iof block): адрес списка и адреса, которые не блокируются никогда
+BLOCKLIST_URL=""
+BLOCK_ALLOW=""
 EOF
     chmod 600 "$ENV_FILE"
     echo "Создан $ENV_FILE"
@@ -2518,14 +3009,39 @@ cmd_node() {
 hy2_add_job() {
   local i="$1" remark="$HY2_ADD_LABEL"
   if [[ -n "${N_TITLE[$i]}" ]]; then remark="$HY2_ADD_LABEL | ${N_TITLE[$i]}"; fi
-  run_on "${N_SSH[$i]}" n_hy2_add "$HY2_ADD_NAME" "$HY2_ADD_PASS" "$remark" "${N_ADDR[$i]}"
+  run_on "${N_SSH[$i]}" n_hy2_add "$HY2_ADD_NAME" "$HY2_ADD_PASS" "$remark" "${N_ADDR[$i]}" "$HY2_ADD_HOP"
 }
 
 hy2_del_job() { run_on "${N_SSH[$1]}" n_hy2_del "$HY2_DEL_NAME"; }
 
-# Создаёт или пересобирает группу ссылок. Повторный запуск с той же подписью безопасен
+# Метка группы со сменой портов в ссылках: $HY2_DIR/<логин>.hop. У такой группы порт узла со сменой
+# портов в ссылке — список «443,10000-19999». Его понимают Hiddify с 5.5.5 и официальный клиент,
+# а v2rayN и Hiddify старше такую ссылку не импортируют, поэтому у новых групп метки нет
+hy2_hop_mark() { printf '%s/%s.hop' "$HY2_DIR" "$1"; }
+
+# Сколько групп со сменой портов в ссылках, строкой для аудита
+hop_groups_line() {
+  local n=0 t=0 name _l _c
+  if [[ -f "$HY2_INDEX" ]]; then
+    while IFS=$'\t' read -r name _l _c; do
+      t=$((t + 1))
+      if [[ -f "$(hy2_hop_mark "$name")" ]]; then n=$((n + 1)); fi
+    done < "$HY2_INDEX"
+  fi
+  printf 'Групп ссылок со списком портов: %s из %s (sudo iof hy2 add "Подпись" --hop)' "$n" "$t"
+}
+
+# Создаёт или пересобирает группу ссылок. Повторный запуск с той же подписью безопасен.
+# --hop включает смену портов в ссылках группы, --no-hop выключает, без них остаётся как было
 hy2_add() {
-  local label="${1:-}"
+  local label="" a hop=""
+  for a in "$@"; do
+    case "$a" in
+      --hop)    hop=1 ;;
+      --no-hop) hop=0 ;;
+      *)        if [[ -z "$label" ]]; then label="$a"; else die "лишний аргумент: $a"; fi ;;
+    esac
+  done
   [[ -n "$label" ]] || die "укажи подпись: iof hy2 add \"Подпись\""
   # | разделяет подпись и узел в названии ссылки, табуляция — поля index.tsv
   title_ok "$label" && [[ "$label" != *$'\t'* ]] || die "подпись не может содержать |, табуляцию и перевод строки"
@@ -2533,12 +3049,17 @@ hy2_add() {
   mkdir -p "$HY2_DIR"
   chmod 700 "$HY2_DIR"
 
-  local name out tmp i link ok=0 r ni vi rl
+  local name out tmp i link ok=0 r ni vi rl multi
   local node_link=() failed=()
   name="$(name_for "$label")"
+  if [[ -z "$hop" ]]; then
+    hop=0
+    if [[ -f "$(hy2_hop_mark "$name")" ]]; then hop=1; fi
+  fi
   HY2_ADD_NAME="$name"
   HY2_ADD_PASS="$(gen_pass)"
   HY2_ADD_LABEL="$label"
+  HY2_ADD_HOP="$hop"
   out="$HY2_DIR/$name.txt"
   tmp="$(mktemp)"
 
@@ -2574,6 +3095,12 @@ hy2_add() {
   mv "$tmp" "$out"
   chmod 600 "$out"
   index_set "$HY2_INDEX" "$name" "$label"
+  if (( hop )); then
+    : > "$(hy2_hop_mark "$name")"
+    chmod 600 "$(hy2_hop_mark "$name")"
+  else
+    rm -f "$(hy2_hop_mark "$name")"
+  fi
 
   echo
   echo "Подпись: $label"
@@ -2582,6 +3109,14 @@ hy2_add() {
   cat "$out"
   echo
   echo "Скопируй строки выше и добавь в Hiddify из буфера обмена."
+  if (( hop )); then
+    multi="$(grep -cE '^hy2://[^@]*@[^/?#]*:[0-9]+,' "$out" || true)"
+    echo
+    echo "Смена портов в ссылках группы включена, со списком портов ссылок: $multi."
+    echo "Такие ссылки импортируют Hiddify с версии 5.5.5 и официальный клиент Hysteria2, а v2rayN"
+    echo "и Hiddify старше — нет. Вернуть обычные ссылки: sudo iof hy2 add \"$label\" --no-hop"
+    if (( multi == 0 )); then echo "На узлах смена портов не включена: sudo iof hy2 hop on <узел>"; fi
+  fi
   if (( ${#failed[@]} > 0 )); then
     echo
     echo "Не выдали ссылку (${#failed[@]}):"
@@ -2606,7 +3141,7 @@ hy2_del() {
     echo "Ошибки (${#failed[@]}):"
     report_failures "${failed[@]}"
   fi
-  rm -f "$HY2_DIR/$name.txt"
+  rm -f "$HY2_DIR/$name.txt" "$(hy2_hop_mark "$name")"
   if [[ -f "$HY2_INDEX" ]]; then index_set "$HY2_INDEX" "$name"; fi
 }
 
@@ -2616,10 +3151,12 @@ hy2_list() {
     return 0
   fi
   {
-    row "ЛОГИН" "ПОДПИСЬ" "СОЗДАН" "ФАЙЛ"
-    local name label created
+    row "ЛОГИН" "ПОДПИСЬ" "СОЗДАН" "СМЕНА ПОРТОВ" "ФАЙЛ"
+    local name label created hop
     while IFS=$'\t' read -r name label created; do
-      row "$name" "$label" "$created" "$HY2_DIR/$name.txt"
+      hop="нет"
+      if [[ -f "$(hy2_hop_mark "$name")" ]]; then hop="в ссылках"; fi
+      row "$name" "$label" "$created" "$hop" "$HY2_DIR/$name.txt"
     done < "$HY2_INDEX"
   } | table
 }
@@ -2673,18 +3210,171 @@ hy2_restart() {
   fi
 }
 
+# Версия $1 не ниже $2 (2.13.0 и 2.12.3)
+ver_ge() { [[ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -n 1)" == "$2" ]]; }
+
+# Диапазон a-b для смены портов: порты от 1024 до 65535, не меньше 10 портов
+hop_range_ok() {
+  [[ "$1" =~ ^([0-9]{1,5})-([0-9]{1,5})$ ]] || return 1
+  local lo=$((10#${BASH_REMATCH[1]})) hi=$((10#${BASH_REMATCH[2]}))
+  (( lo >= 1024 && hi <= 65535 && hi - lo >= 9 ))
+}
+
+# Пересекаются ли «порт или a-b» $1 и $2
+ports_overlap() {
+  local a="$1" b="$2"
+  [[ "$a" == *-* ]] || a="$a-$a"
+  [[ "$b" == *-* ]] || b="$b-$b"
+  (( 10#${a%-*} <= 10#${b#*-} && 10#${b%-*} <= 10#${a#*-} ))
+}
+
+# Порты ретрансляторов на узле $1 через запятую: у них нет сокета, а пакеты на них уходят через DNAT
+hop_busy() {
+  local r out=()
+  for r in "${!R_NODE[@]}"; do
+    [[ "${R_VIA[$r]}" == "$1" ]] || continue
+    if [[ "${R_HYL[$r]}" != "-" ]]; then out+=("${R_HYL[$r]}"); fi
+    if [[ "${R_AWL[$r]}" != "-" ]]; then out+=("${R_AWL[$r]}"); fi
+  done
+  local IFS=,
+  printf '%s' "${out[*]}"
+}
+
+hy2_hop_job() { run_on "${N_SSH[$1]}" n_hy2_hop "$HOP_ACT" "$HOP_RANGE" "$(hop_busy "${N_NAME[$1]}")" "$HY2_HOP_MIN"; }
+
+# Смена портов Hysteria2 (port hopping) на узлах: iof hy2 hop on|off <узлы|all> [--ports a-b].
+# on дописывает диапазон (HY2_HOP или --ports) в listen: основной порт остаётся, выданные ссылки работают
+# как раньше. Диапазон в ссылках получают только группы с меткой --hop, они пересобираются здесь же.
+# off оставляет основной порт. Код 1, если на каком-то узле не получилось (там всё осталось как было)
+hy2_hop() {
+  local act="${1:-}" range="$HY2_HOP" i out port rng was groups=() done_on=() done_off=() same=() failed=() args=()
+  local name label created l
+  if [[ $# -gt 0 ]]; then shift; fi
+  [[ "$act" == "on" || "$act" == "off" ]] || die "используй: iof hy2 hop on <узлы|all> [--ports 10000-19999]   или   iof hy2 hop off <узлы|all>"
+  while (( $# > 0 )); do
+    if [[ "$1" == "--ports" ]]; then
+      range="${2:-}"
+      shift
+      if [[ $# -gt 0 ]]; then shift; fi
+    else
+      args+=("$1")
+      shift
+    fi
+  done
+  (( ${#args[@]} > 0 )) || die "укажи узлы: iof hy2 hop $act node-1   или   iof hy2 hop $act all"
+  if [[ "$act" == "on" ]]; then
+    hop_range_ok "$range" || die "диапазон '$range': нужен вид 10000-19999, порты от 1024 до 65535, не меньше 10 портов (HY2_HOP в $ENV_FILE или --ports)"
+    if [[ -n "$PROBE_PORTS" ]] && ports_overlap "$PROBE_PORTS" "$range"; then
+      die "PROBE_PORTS ($PROBE_PORTS) пересекается с диапазоном $range: мишени проверки с ПК не поднимутся. Выбери другой диапазон: --ports a-b"
+    fi
+  fi
+  read_nodes
+  read_relays
+  select_nodes "${args[@]}"
+  HOP_ACT="$act"
+  HOP_RANGE="$range"
+  if [[ "$act" == "on" ]]; then
+    echo "Включаю смену портов $range на узлах: ${#SEL[@]}"
+  else
+    echo "Выключаю смену портов на узлах: ${#SEL[@]}"
+  fi
+  pmap hy2_hop_job "${SEL[@]}"
+  for i in "${SEL[@]}"; do
+    out="$(pm_out "$i")"
+    if ! pm_ok "$i" || ! grep -q '^hop=' <<<"$out"; then failed+=("$i"); continue; fi
+    port="$(kv_get "$out" port)"
+    rng="$(kv_get "$out" range)"
+    was="$(kv_get "$out" was)"
+    if [[ "$was" == "same" ]]; then same+=("${N_NAME[$i]}")
+    elif [[ "$act" == "on" && "$(kv_get "$out" backend)" == "iptables" ]]; then
+      done_on+=("${N_NAME[$i]}: порты $rng -> $port (правила через iptables: с nftables служба не поднялась)")
+    elif [[ "$act" == "on" ]]; then done_on+=("${N_NAME[$i]}: порты $rng -> $port")
+    else done_off+=("${N_NAME[$i]}: остался порт $port"); fi
+  done
+
+  echo
+  for l in "${done_on[@]}"; do echo "Включено  $l"; done
+  for l in "${done_off[@]}"; do echo "Выключено $l"; done
+  if (( ${#same[@]} > 0 )); then echo "Уже было так (${#same[@]}): ${same[*]}"; fi
+  if (( ${#failed[@]} > 0 )); then
+    echo "Ошибки (${#failed[@]}):"
+    report_failures "${failed[@]}"
+  fi
+
+  # Ссылки меняются только у групп со сменой портов в ссылках
+  if (( ${#done_on[@]} + ${#done_off[@]} > 0 )) && [[ -s "$HY2_INDEX" ]]; then
+    while IFS=$'\t' read -r name label created; do
+      if [[ -f "$(hy2_hop_mark "$name")" ]]; then groups+=("$label"); fi
+    done < "$HY2_INDEX"
+    echo
+    if (( ${#groups[@]} > 0 )); then
+      for l in "${groups[@]}"; do
+        echo "Пересобираю группу со сменой портов в ссылках: $l"
+        ( trap pm_cleanup EXIT; hy2_add "$l" >/dev/null ) || echo "Не удалось обновить: $l"
+      done
+      if (( ${#done_off[@]} > 0 )); then
+        echo "Клиентам этих групп нужны новые ссылки: в старых диапазон, а его порты на этих узлах закрыты."
+      fi
+    else
+      echo "Ссылки групп не менялись: в них по-прежнему основной порт. Смену портов в ссылках группы включает"
+      echo "  sudo iof hy2 add \"Подпись\" --hop   (её импортируют Hiddify с 5.5.5 и официальный клиент, v2rayN — нет)"
+    fi
+  fi
+  if (( ${#done_on[@]} > 0 )); then
+    echo
+    echo "Если у хостера свой файрвол в панели, открой там UDP $range. Файрвол самого узла трогать не нужно:"
+    echo "Hysteria2 перенаправляет диапазон на основной порт раньше, чем пакет до него дойдёт."
+  fi
+  if (( ${#failed[@]} > 0 )); then return 1; fi
+}
+
+hy2_upgrade_job() { run_on "${N_SSH[$1]}" n_hy2_upgrade; }
+
+# Обновление Hysteria2 на узлах официальным установщиком: iof hy2 upgrade <узлы|all>. Бинарник и юнит
+# сохраняются на узле в /var/backups/iof-hy2, если служба после обновления не работает, возвращаются.
+# Код 1, если где-то не получилось
+hy2_upgrade() {
+  local i out a b up=() same=() failed=()
+  (( $# > 0 )) || die "укажи узлы: iof hy2 upgrade node-1   или   iof hy2 upgrade all"
+  read_nodes
+  select_nodes "$@"
+  echo "Обновляю Hysteria2 на узлах: ${#SEL[@]}, одновременно до $PARALLEL"
+  pmap hy2_upgrade_job "${SEL[@]}"
+  for i in "${SEL[@]}"; do
+    out="$(pm_out "$i" | tail -n 1)"
+    if pm_ok "$i" && [[ "$out" == upgraded* ]]; then
+      read -r _ a b <<<"$out"
+      up+=("${N_NAME[$i]}: $a -> $b")
+    elif pm_ok "$i" && [[ "$out" == same* ]]; then
+      same+=("${N_NAME[$i]} (${out#same })")
+    else
+      failed+=("$i")
+    fi
+  done
+  echo
+  echo "Обновлено: ${#up[@]}"
+  for out in "${up[@]}"; do echo "  $out"; done
+  if (( ${#same[@]} > 0 )); then echo "Уже последняя версия (${#same[@]}): ${same[*]}"; fi
+  if (( ${#failed[@]} > 0 )); then
+    echo "Ошибки (${#failed[@]}):"
+    report_failures "${failed[@]}"
+    return 1
+  fi
+}
+
 # Только Hysteria2
 hy2_status() {
   read_nodes
   select_nodes
   local i rows=()
   probe_all "${SEL[@]}"
-  rows+=("$(row "УЗЕЛ" "АДРЕС" "СОСТОЯНИЕ" "ДОСТУП" "ВЕРСИЯ")")
+  rows+=("$(row "УЗЕЛ" "АДРЕС" "СОСТОЯНИЕ" "ДОСТУП" "ПОРТЫ" "ВЕРСИЯ")")
   for i in "${SEL[@]}"; do
     if probe_load "$i"; then
-      rows+=("$(row "${N_NAME[$i]}" "${N_ADDR[$i]}" "$(cell_hy2)" "$(cell_hy2_access)" "${P[hy2_ver]:--}")")
+      rows+=("$(row "${N_NAME[$i]}" "${N_ADDR[$i]}" "$(cell_hy2)" "$(cell_hy2_access)" \
+        "${P[hy2_port]:--}${P[hy2_range]:+,${P[hy2_range]}}" "${P[hy2_ver]:--}")")
     else
-      rows+=("$(row "${N_NAME[$i]}" "${N_ADDR[$i]}" "$(c_red "НЕТ СВЯЗИ")" "-" "-")")
+      rows+=("$(row "${N_NAME[$i]}" "${N_ADDR[$i]}" "$(c_red "НЕТ СВЯЗИ")" "-" "-" "-")")
     fi
   done
   printf '%s\n' "${rows[@]}" | table
@@ -2770,7 +3460,9 @@ cmd_hy2() {
     status)  hy2_status ;;
     install) hy2_install "$@" ;;
     restart) hy2_restart "$@" ;;
-    *)       die "используй: iof hy2 add | del | list | show | refresh | status | install | restart" ;;
+    hop)     hy2_hop "$@" ;;
+    upgrade) hy2_upgrade "$@" ;;
+    *)       die "используй: iof hy2 add | del | list | show | refresh | status | install | restart | hop | upgrade" ;;
   esac
 }
 
@@ -3297,6 +3989,132 @@ cmd_relay() {
 }
 
 
+# Блок-лист сканеров: iof block on <узлы|all> | update [узлы] | off <узлы|all>.
+# Список — BLOCKLIST_URL, его же смотрит iof audit (кэш $AUDIT_DIR/cache, скачивается не чаще раза
+# в сутки). Здесь он чистится: только IPv4, без частных и служебных сетей и без записей шире
+# /$BLOCK_MIN_PREFIX, чтобы ошибка в списке не отрезала клиентов. Узлы из nodes.conf, адреса
+# управляющего сервера и BLOCK_ALLOW уходят на узлы списком, который не блокируется никогда.
+# Применяет список на узле n_block_apply
+
+# IPv4-адреса имени или адреса $1, по строке
+block_resolve() {
+  if [[ "$1" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then echo "$1"; return 0; fi
+  getent ahostsv4 "$1" 2>/dev/null | awk '{ print $1 }' | sort -u || true
+}
+
+# Адреса, которые блок-лист не блокирует, через пробел: адреса узлов для клиентов и для SSH,
+# адреса этого сервера и BLOCK_ALLOW. Узел добавит к ним свои адреса и собеседников сессий SSH
+block_allow() {
+  local i h out=()
+  for i in "${!N_NAME[@]}"; do
+    out+=("${N_ADDR[$i]}")
+    if [[ "${N_SSH[$i]}" != "local" ]]; then
+      split_target "${N_SSH[$i]}"
+      out+=("${T_HOST#*@}")
+    fi
+  done
+  {
+    for h in "${out[@]}"; do block_resolve "$h"; done
+    hostname -I 2>/dev/null | tr ' ' '\n'
+    tr ' ,' '\n\n' <<<"$BLOCK_ALLOW"
+  } | grep -xE '[0-9]{1,3}(\.[0-9]{1,3}){3}(/[0-9]{1,2})?' | sort -u | paste -sd' ' - || true
+}
+
+BLOCK_ACT=""; BLOCK_B64=""; BLOCK_ALLOWED=""; BLOCK_AT=""
+block_job() { run_on "${N_SSH[$1]}" n_block_apply "$BLOCK_ACT" "$BLOCK_B64" "$BLOCK_ALLOWED" "$BLOCK_AT"; }
+
+# Готовит список для узлов: BLOCK_B64 (gzip и base64), BLOCK_AT (когда скачан), BLOCK_ALLOWED.
+# Печатает, сколько записей пропущено и почему
+block_prepare() {
+  local f="$AUDIT_DIR/cache/blocklist.txt" out stats n v6 wide special junk hit
+  have python3 || die "для блок-листа нужен python3: apt install python3"
+  [[ -n "$BLOCKLIST_URL" ]] || die "не задан BLOCKLIST_URL в $ENV_FILE: адрес списка, по IP или CIDR в строке, # — комментарий"
+  mkdir -p "$AUDIT_DIR/cache"
+  chmod 700 "$AUDIT_DIR" "$AUDIT_DIR/cache"
+  audit_fetch blocklist "$BLOCKLIST_URL"
+  [[ -s "$f" ]] || die "список не скачался ($(cat "$f.err" 2>/dev/null || echo 'нет копии')): проверь BLOCKLIST_URL, curl -fsSL \"\$BLOCKLIST_URL\" | head"
+  if [[ -f "$f.err" ]]; then
+    echo "Внимание: список не скачался ($(cat "$f.err")), на узлы идёт прошлая копия от $(audit_when "$(stat -c %Y "$f")")"
+  fi
+  BLOCK_AT="$(stat -c %Y "$f")"
+  BLOCK_ALLOWED="$(block_allow)"
+  # shellcheck disable=SC2086 # адреса через пробел — отдельные аргументы
+  out="$(python3 -c "$AUDIT_NET_PY" blocklist "$f" "$BLOCK_MIN_PREFIX" $BLOCK_ALLOWED)" || die "не удалось разобрать список $f"
+  stats="$(head -n 1 <<<"$out")"
+  read -r _ n v6 wide special junk hit <<<"$stats"
+  [[ "$stats" =~ ^S( [0-9]+){6}$ ]] || die "не удалось разобрать список $f"
+  (( n > 0 )) || die "в списке нет ни одной записи, которую можно применить (пропущено: IPv6 $v6, шире /$BLOCK_MIN_PREFIX $wide, частных и служебных $special, нечитаемых $junk)"
+  (( n <= 262144 )) || die "в списке $n записей, это слишком много для узлов (до 262144)"
+  BLOCK_B64="$(tail -n +2 <<<"$out" | gzip -9c | base64 -w0)"
+  echo "Список: записей $n, скачан $(audit_when "$BLOCK_AT")"
+  if (( v6 + wide + special + junk > 0 )); then
+    echo "  пропущено: IPv6 $v6, шире /$BLOCK_MIN_PREFIX $wide, частных и служебных $special, нечитаемых $junk"
+  fi
+  if (( hit > 0 )); then
+    echo "  записей, в которые попадают узлы, этот сервер или BLOCK_ALLOW: $hit (эти адреса блокироваться не будут)"
+  fi
+}
+
+# Применить (on), обновить там, где включён (update), или снять (off) на выбранных узлах
+block_apply() {
+  local act="$1" i out st items=() same=() skip=() failed=()
+  shift
+  read_nodes
+  select_nodes "$@"
+  BLOCK_ACT="$act"
+  BLOCK_B64=""; BLOCK_ALLOWED=""; BLOCK_AT=""
+  if [[ "$act" != "off" ]]; then
+    if [[ "$act" == "update" && -z "$BLOCKLIST_URL" ]]; then
+      echo "BLOCKLIST_URL не задан, обновлять нечего"
+      return 0
+    fi
+    block_prepare
+  fi
+  case "$act" in
+    on)     echo "Применяю на узлах: ${#SEL[@]}" ;;
+    update) echo "Обновляю там, где список включён, проверяю узлов: ${#SEL[@]}" ;;
+    off)    echo "Снимаю на узлах: ${#SEL[@]}" ;;
+  esac
+  pmap block_job "${SEL[@]}"
+  for i in "${SEL[@]}"; do
+    out="$(pm_out "$i")"
+    st="$(kv_get "$out" block)"
+    if ! pm_ok "$i" || [[ -z "$st" ]]; then failed+=("$i"); continue; fi
+    case "$st" in
+      on)   items+=("${N_NAME[$i]}: записей $(kv_get "$out" entries), не блокируются $(kv_get "$out" allow)") ;;
+      same) same+=("${N_NAME[$i]}") ;;
+      skip) skip+=("${N_NAME[$i]}") ;;
+      off)  items+=("${N_NAME[$i]}: снят") ;;
+    esac
+  done
+  echo
+  for out in "${items[@]}"; do echo "  $out"; done
+  if (( ${#same[@]} > 0 )); then echo "Список тот же, не менялся (${#same[@]}): ${same[*]}"; fi
+  if (( ${#skip[@]} > 0 )); then echo "Блок-лист не включён, не трогал (${#skip[@]}): ${skip[*]}"; fi
+  if (( ${#failed[@]} > 0 )); then
+    echo "Ошибки (${#failed[@]}):"
+    report_failures "${failed[@]}"
+  fi
+  if [[ "$act" == "on" ]] && ! crontab -l -u root 2>/dev/null | grep -q 'iof block update'; then
+    echo
+    echo "Обновлять раз в сутки: sudo crontab -e, строка: 15 5 * * * /usr/local/bin/iof block update >/dev/null 2>&1"
+  fi
+  if (( ${#failed[@]} > 0 )); then return 1; fi
+}
+
+cmd_block() {
+  local action="${1:-}"
+  if [[ $# -gt 0 ]]; then shift; fi
+  case "$action" in
+    on|off)
+      (( $# > 0 )) || die "укажи узлы: iof block $action node-1   или   iof block $action all"
+      block_apply "$action" "$@" ;;
+    update) block_apply update "$@" ;;
+    *)      die "используй: iof block on <узлы|all> | update [узлы] | off <узлы|all>" ;;
+  esac
+}
+
+
 # Аудит безопасности: iof audit run | show | cron, для панели iof api audit.
 # Блоки: server («Аудит сервера») и dpi («Защита от РКН»: насколько узел заметен для фильтров
 # и зондов). Узлы отдают факты (n_audit_server, n_audit_dpi), оценку каждой проверки ставят
@@ -3365,7 +4183,7 @@ audit_catalog() {
   k hy2_port hy2 "Порт" \
     "HTTP/3 работает на 443/udp, QUIC на другом порту встречается редко и заметнее. Под Salamander трафик не похож на QUIC на любом порту."
   k hy2_hop hy2 "Смена портов (port hopping)" \
-    "Клиент раз в полминуты меняет порт, поэтому блокировка одного порта или долгого потока UDP не обрывает связь. Для этого нужен диапазон портов на сервере и он же в ссылке клиента."
+    "Клиент раз в полминуты меняет порт, поэтому блокировка одного порта или долгого потока UDP не обрывает связь. Для этого нужен диапазон портов на сервере и он же в ссылке клиента. iof включает диапазон на узле (iof hy2 hop), а список портов попадает только в ссылки групп с --hop: старые клиенты такую ссылку не импортируют."
   k hy2_template hy2 "Конфиг и шаблон" \
     "iof hy2 install ставит на узлы конфиг по шаблону с управляющего сервера. Если конфиг узла потом правили вручную, маскировка на нём отличается от остальных, а повторная установка затрёт правки."
   k awg_params awg "Параметры обфускации" \
@@ -3385,7 +4203,7 @@ audit_catalog() {
   k panel probe "Панель iof-web" \
     "Панель управляет всеми узлами от root. Она должна слушать только 127.0.0.1 и открываться через SSH-туннель: на внешнем адресе её найдёт любой сканер."
   k blocklist scan "Блок-лист сканеров" \
-    "Список адресов, с которых узлы сканируют и зондируют. Если пакеты от них отбрасывать, сканер видит закрытый сервер. iof пока только проверяет, применён ли список на узле."
+    "Список адресов, с которых узлы сканируют и зондируют. Если пакеты от них отбрасывать, сканер с этих адресов видит закрытый сервер. Это снижает заметность, но не прячет узел: сканеры меняют адреса. Применяет и обновляет список iof block."
   k asn rep "Сеть и хостер" \
     "Сети крупных хостеров VPS фильтры знают и относятся к ним строже, чем к домашним. Это справка: изменить её можно только переездом к другому хостеру."
   k registry rep "Адрес в реестре" \
@@ -3462,7 +4280,10 @@ audit_ports() {
 
 # Строка проверки для AUDIT_PY: id, статус (good, warn, crit, none), значение, подробности,
 # как исправить (текст) и команды. В подробностях и командах строки разделяет \x1f
-audit_chk() { printf 'C\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "${4:-}" "${5:-}" "${6:-}"; }
+# Строка проверки для AUDIT_PY: id, оценка, значение, подробности, как исправить, команды и действия
+# панели через пробел (hop_on, hop_off, hy2_upgrade, block_on, block_update, block_off): кнопки
+# на странице «Безопасность», которыми iof сам меняет узел
+audit_chk() { printf 'C\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "${4:-}" "${5:-}" "${6:-}" "${7:-}"; }
 audit_lines() { local IFS=$'\x1f'; printf '%s' "$*"; }
 # Аргументы через ", "
 audit_list() { local s; s="$(audit_lines "$@")"; printf '%s' "${s//$'\x1f'/, }"; }
@@ -4057,8 +4878,45 @@ def trace(ip, port, fp, hy2):
     return json.dumps(out, separators=(",", ":"))
 
 
+def blocklist(path, minpref, protect):
+    # Блок-лист для узлов: только IPv4, без частных и служебных сетей и без записей шире /minpref.
+    # Первая строка: S <записей> <IPv6> <шире> <частных и служебных> <нечитаемых> <с защищёнными адресами>
+    nets, v6, wide, special, bad = set(), 0, 0, 0, 0
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            s = line.split("#", 1)[0].strip().split()
+            if not s:
+                continue
+            try:
+                n = ipaddress.ip_network(s[0].strip(",;"), strict=False)
+            except ValueError:
+                bad += 1
+                continue
+            if n.version != 4:
+                v6 += 1
+            elif n.prefixlen < minpref:
+                wide += 1
+            elif not n.is_global:
+                special += 1
+            else:
+                nets.add(n)
+    nets = list(ipaddress.collapse_addresses(nets))
+    prot = []
+    for p in protect:
+        try:
+            prot.append(ipaddress.ip_network(p, strict=False))
+        except ValueError:
+            pass
+    hit = sum(1 for n in nets if any(n.overlaps(p) for p in prot))
+    out = [f"S {len(nets)} {v6} {wide} {special} {bad} {hit}"]
+    out += [str(n.network_address) if n.prefixlen == 32 else str(n) for n in nets]
+    return "\n".join(out)
+
+
 mode = sys.argv[1]
-if mode == "trace":
+if mode == "blocklist":
+    print(blocklist(sys.argv[2], int(sys.argv[3]), sys.argv[4:]))
+elif mode == "trace":
     print(trace(sys.argv[2], int(sys.argv[3]), sys.argv[4], int(sys.argv[5])))
 elif mode == "quic":
     print(quic(sys.argv[2], int(sys.argv[3])))
@@ -4422,9 +5280,7 @@ audit_eval_dpi() {
         "$(audit_lines "systemctl is-active hysteria-server" "ss -uln | grep ':$port '" "ufw status | grep -w $port")"
     fi
 
-    if [[ -n "${A[hy2_range]:-}" ]]; then
-      audit_chk hy2_port none "диапазон портов ${A[hy2_range]}/udp (смена портов), один порт оценивать нечего"
-    elif (( obfs )); then
+    if (( obfs )); then
       audit_chk hy2_port none "$port/udp: под Salamander трафик не похож на QUIC на любом порту"
     elif [[ "$port" == "443" ]]; then
       audit_chk hy2_port good "443/udp, как у HTTP/3"
@@ -4434,14 +5290,31 @@ audit_eval_dpi() {
         "sed -i -E 's/^listen:.*/listen: :443/' $conf && $restart"
     fi
 
-    if [[ -n "${A[hy2_range]:-}" ]]; then
-      audit_chk hy2_hop good "диапазон ${A[hy2_range]} в listen, Hysteria2 перенаправляет его сама"
+    # Смена портов: диапазон в listen, его Hysteria2 перенаправляет сама (iof hy2 hop). Правила,
+    # поставленные вручную, iof видит, но не трогает
+    s="${A[hy2_range]:-}"
+    v="${A[hy2_ver]:-}"
+    if [[ -n "$s" ]]; then
+      d=("$me" "$(hop_groups_line)" "Если у хостера свой файрвол в панели, в нём должен быть открыт UDP $s")
+      if grep -qxF "$s" <<<"${A[hy2_hop]//,/$'\n'}"; then
+        audit_chk hy2_hop good "диапазон $s на порт $port, правила ставит сама Hysteria2" "$(audit_lines "${d[@]}")" \
+          "" "" "hop_off"
+      else
+        audit_chk hy2_hop warn "диапазон $s в конфиге, а правил перенаправления нет" "$(audit_lines "${d[@]}")" \
+          "Клиенты со списком портов в ссылке попадают на закрытые порты. Служба не перезапущена после правки конфига, Hysteria2 старше $HY2_HOP_MIN или у службы нет прав на правила (CAP_NET_ADMIN в юните). Включить заново с проверкой и откатом при неудаче — на управляющем сервере:" \
+          "sudo iof hy2 hop on $name --ports $s" "hop_on hop_off"
+      fi
     elif [[ -n "${A[hy2_hop]:-}" ]]; then
-      audit_chk hy2_hop good "диапазон ${A[hy2_hop]//,/, } перенаправлен на порт $port"
+      audit_chk hy2_hop good "диапазон ${A[hy2_hop]//,/, } перенаправлен на порт $port правилами вне iof" \
+        "$(audit_lines "$me" "Такие правила iof не включает и не снимает: после перезагрузки их надо вернуть самому")"
+    elif [[ -n "$v" ]] && ! ver_ge "$v" "$HY2_HOP_MIN"; then
+      audit_chk hy2_hop warn "нет: клиенты всегда ходят на порт $port" "Hysteria2 на узле: $v" \
+        "Смене портов нужна Hysteria2 от $HY2_HOP_MIN: в старых версиях её правила заворачивали и исходящий UDP самого узла. Сначала обнови её (бинарник и юнит сохраняются на узле и возвращаются, если служба не поднимется), потом включи. На управляющем сервере:" \
+        "$(audit_lines "sudo iof hy2 upgrade $name" "sudo iof hy2 hop on $name")" "hy2_upgrade"
     else
       audit_chk hy2_hop warn "нет: клиенты всегда ходят на порт $port" "" \
-        "Из iof смена портов пока не включается: в ссылки групп попадает один порт, и после sudo iof hy2 refresh диапазон из ссылки пропадёт. Вручную: перенаправь диапазон на порт Hysteria2 командой ниже (после перезагрузки правило надо вернуть, файрвол должен пропускать этот диапазон UDP) и замени в ссылке клиента порт на диапазон, например :20000-50000. $where" \
-        "iptables -t nat -A PREROUTING -p udp --dport 20000:50000 -j REDIRECT --to-ports $port"
+        "Включить: в listen добавится диапазон $HY2_HOP (HY2_HOP в /root/iof/iof.env), основной порт $port останется, выданные ссылки продолжат работать как раньше. Список портов в ссылках получат только группы с --hop: такие ссылки импортируют Hiddify с 5.5.5 и официальный клиент, v2rayN и Hiddify старше — нет. На управляющем сервере:" \
+        "$(audit_lines "sudo iof hy2 hop on $name" "sudo iof hy2 add \"Подпись\" --hop")" "hop_on"
     fi
 
     # Блоки конфига узла против блоков шаблона, по хэшам этого запуска
@@ -4681,35 +5554,50 @@ audit_eval_dpi() {
     *)        audit_chk panel none "нет данных" ;;
   esac
 
-  # Блок-лист сканеров: iof его пока не применяет, только смотрит
+  # Блок-лист сканеров: iof block on применяет BLOCKLIST_URL на узле, iof block update обновляет
   s="$(audit_list_info blocklist)"
-  if [[ -z "$BLOCKLIST_URL" ]]; then
-    audit_chk blocklist none "список не задан: BLOCKLIST_URL в /root/iof/iof.env пуст" \
-      "Формат списка: текст, по одному IP или CIDR в строке, # — комментарий. Пример: BLOCKLIST_URL=\"https://example.org/scanners.txt\""
+  k="no"
+  if [[ "${A[block_set]:-}" == "yes" || "${A[block_chain]:-}" == "yes" || "${A[block_hook]:-}" == "yes" || -n "${A[block_at]:-}" ]]; then k="yes"; fi
+  at="$(audit_num "${A[block_at]:-}")"
+  if [[ "${A[block_ipt]:-}" == "no" ]]; then
+    audit_chk blocklist none "на узле нет iptables" "" \
+      "Блок-лист iof ставит правилом iptables с набором ipset (на Ubuntu 24.04 iptables работает поверх nftables). Узел только с nftables так не защитить, а своих правил nftables iof не пишет."
+  elif [[ -z "$BLOCKLIST_URL" ]]; then
+    if [[ "$k" == "yes" ]]; then
+      audit_chk blocklist warn "применён, но BLOCKLIST_URL пуст: список больше не обновляется" "" \
+        "Задай BLOCKLIST_URL в /root/iof/iof.env или сними список с узла. На управляющем сервере:" \
+        "sudo iof block off $name" "block_off"
+    else
+      audit_chk blocklist none "список не задан: BLOCKLIST_URL в /root/iof/iof.env пуст" \
+        "Формат списка: текст, по одному IP или CIDR в строке, # — комментарий. Пример: BLOCKLIST_URL=\"https://example.org/scanners.txt\". Применяет его на узле sudo iof block on <узел>"
+    fi
   elif [[ -z "$s" ]]; then
+    v=""
+    if [[ "$k" == "yes" ]]; then v="block_off"; fi
     audit_chk blocklist none "список не скачался: проверь BLOCKLIST_URL в /root/iof/iof.env" \
-      "Проверить вручную на управляющем сервере: curl -fsSL \"\$BLOCKLIST_URL\" | head"
+      "Проверить вручную на управляющем сервере: curl -fsSL \"\$BLOCKLIST_URL\" | head" "" "" "$v"
   else
-    d=("В списке записей: ${s%% *}, скачан $(audit_when "${s##* }")")
+    d=("В исходном списке строк с адресами: ${s%% *}, скачан $(audit_when "${s##* }")")
     if [[ -f "$AUDIT_DIR/cache/blocklist.txt.err" ]]; then d+=("Последняя загрузка не удалась, это прошлая копия"); fi
-    at="$(audit_num "${A[block_at]:-}")"
-    if [[ "${A[block_set]:-}" == "yes" && "${A[block_chain]:-}" == "yes" && "${A[block_hook]:-}" == "yes" ]]; then
+    hint="Обновлять раз в сутки: на управляющем сервере sudo crontab -e, строка 15 5 * * * /usr/local/bin/iof block update >/dev/null 2>&1"
+    if [[ "${A[block_set]:-}" == "yes" && "${A[block_chain]:-}" == "yes" && "${A[block_hook]:-}" == "yes" && "${A[block_svc]:-}" == "enabled" ]]; then
       val="применён: записей $(audit_num "${A[block_entries]:-}")"
+      d+=("Не блокируются: узлы из nodes.conf, этот сервер, BLOCK_ALLOW, сессии SSH на узле во время применения")
       if (( at > 0 && now - at > 7 * 86400 )); then
-        audit_chk blocklist warn "$val, но не обновлялся с $(audit_when "$at")" "$(audit_lines "${d[@]}")" \
-          "Список на узле старше недели: адреса сканеров меняются. Обновление списка из iof появится вместе с его применением."
-      elif (( at > 0 )); then
-        audit_chk blocklist good "$val, обновлён $(audit_when "$at")" "$(audit_lines "${d[@]}")"
+        audit_chk blocklist warn "$val, список скачан $(audit_when "$at")" "$(audit_lines "${d[@]}")" \
+          "Список на узле старше недели, а адреса сканеров меняются. Обновить сейчас: на управляющем сервере sudo iof block update $name. $hint" \
+          "sudo iof block update $name" "block_update block_off"
       else
-        audit_chk blocklist good "$val" "$(audit_lines "${d[@]}" "Когда список обновлялся, неизвестно: на узле нет /etc/iof/block.list")"
+        audit_chk blocklist good "$val, список скачан $(audit_when "$at")" "$(audit_lines "${d[@]}")" "" "" "block_update block_off"
       fi
-    elif [[ "${A[block_set]:-}" == "yes" || "${A[block_chain]:-}" == "yes" ]]; then
-      audit_chk blocklist warn "применён не полностью: набор iof-block ${A[block_set]:-no}, цепочка IOF-BLOCK ${A[block_chain]:-no}, правило в INPUT ${A[block_hook]:-no}" \
-        "$(audit_lines "${d[@]}")" "Пакеты от адресов из списка отбрасываются, только когда есть и набор, и цепочка, и переход в неё из INPUT. $where" \
-        "$(audit_lines "ipset list -t iof-block" "iptables -S INPUT | grep IOF-BLOCK")"
+    elif [[ "$k" == "yes" ]]; then
+      audit_chk blocklist warn "применён не полностью: набор iof-block ${A[block_set]:-no}, цепочка IOF-BLOCK ${A[block_chain]:-no}, переход из PREROUTING ${A[block_hook]:-no}, служба iof-block ${A[block_svc]:-нет}" \
+        "$(audit_lines "${d[@]}")" "Пакеты с адресов из списка отбрасываются, только когда есть и набор, и цепочка, и переход в неё, а после перезагрузки список возвращает служба. Применить заново — на управляющем сервере:" \
+        "sudo iof block on $name" "block_on block_off"
     else
       audit_chk blocklist warn "на узле не применён" "$(audit_lines "${d[@]}")" \
-        "Применять список iof пока не умеет, это появится отдельной командой. Сейчас проверка только показывает, что пакеты от адресов из списка узел принимает."
+        "Применить: пакеты с адресов из списка узел будет отбрасывать раньше NAT, ufw и Docker, в том числе на портах контейнеров и ретранслятора. Узлы из nodes.conf, этот сервер, BLOCK_ALLOW и текущие сессии SSH на узле не блокируются, записи шире /$BLOCK_MIN_PREFIX и IPv6 пропускаются. $hint. На управляющем сервере:" \
+        "sudo iof block on $name" "block_on"
     fi
   fi
 
@@ -4948,7 +5836,7 @@ def read_input():
     d = {"titles": {}, "groups": [], "catalog": [], "nodes": [], "settings": {}, "results": {}}
     cur, res = None, {}
     for raw in sys.stdin:
-        f = raw.rstrip("\n").split("\t") + [""] * 7
+        f = raw.rstrip("\n").split("\t") + [""] * 8
         if f[0] == "B":
             d["titles"][f[1]] = f[2]
         elif f[0] == "R":
@@ -4966,7 +5854,8 @@ def read_input():
             res[f[1]] = cur
         elif f[0] == "C" and cur is not None:
             cur["checks"].append({"id": f[1], "status": f[2] if f[2] in RANK else "none", "value": f[3],
-                                  "detail": split(f[4]), "hint": f[5], "cmd": "\n".join(split(f[6]))})
+                                  "detail": split(f[4]), "hint": f[5], "cmd": "\n".join(split(f[6])),
+                                  "act": f[7].split()})
     return d
 
 
@@ -5016,7 +5905,9 @@ def api(base):
     known = [n["name"] for n in d["nodes"]]
     out = {"blocks": {}, "titles": d["titles"], "groups": d["groups"], "catalog": d["catalog"],
            "nodes": d["nodes"], "history": history(base),
-           "settings": {"cron": d["settings"].get("cron", ""), "tg": d["settings"].get("tg") == "yes"}}
+           "settings": {"cron": d["settings"].get("cron", ""), "tg": d["settings"].get("tg") == "yes",
+                        "hop": d["settings"].get("hop", ""), "block_cron": d["settings"].get("block_cron", ""),
+                        "blocklist": d["settings"].get("blocklist") == "yes"}}
     for b in blocks(d):
         saved = load(os.path.join(base, b + ".json"), {}).get("nodes", {})
         out["blocks"][b] = {"nodes": {k: saved[k] for k in known if k in saved}}
@@ -5679,14 +6570,19 @@ audit_cron() {
 }
 
 # Для страницы «Безопасность» панели: JSON с последними проверками, справочником, историей
-# и настройками (строка cron с iof audit, настроен ли Telegram). Узлы не опрашивает
+# и настройками (строка cron с iof audit, настроен ли Telegram, диапазон HY2_HOP). Узлы не опрашивает
 api_audit() {
   local cron tg="no"
   audit_need_python
   read_nodes
+  local bcron bl="no"
   cron="$(crontab -l -u root 2>/dev/null | grep -v '^[[:space:]]*#' | grep -F 'iof audit' | head -n 1 || true)"
+  bcron="$(crontab -l -u root 2>/dev/null | grep -v '^[[:space:]]*#' | grep -F 'iof block update' | head -n 1 || true)"
   if [[ -n "$TG_TOKEN" && -n "$TG_CHAT" ]]; then tg="yes"; fi
-  { audit_catalog; audit_nodes; printf 'S\tcron\t%s\nS\ttg\t%s\n' "$cron" "$tg"; } | audit_py api "$AUDIT_DIR"
+  if [[ -n "$BLOCKLIST_URL" ]]; then bl="yes"; fi
+  { audit_catalog; audit_nodes
+    printf 'S\tcron\t%s\nS\ttg\t%s\nS\thop\t%s\nS\tblock_cron\t%s\nS\tblocklist\t%s\n' "$cron" "$tg" "$HY2_HOP" "$bcron" "$bl"
+  } | audit_py api "$AUDIT_DIR"
 }
 
 
@@ -6263,13 +7159,19 @@ Island of Freedom управление VPN-серверами // by meldevlp
 Hysteria2
   iof hy2 install all         поставить на все узлы, где её нет (конфиг по образцу этого сервера)
   iof hy2 install de-1 'nl-*' на выбранные узлы, --force перезапишет конфиг и там, где уже стоит
-  iof hy2 add "Подпись"       создать группу ссылок по всем узлам
+  iof hy2 add "Подпись"       создать группу ссылок по всем узлам (повтор пересобирает её)
+      --hop / --no-hop          список портов в ссылках группы для узлов со сменой портов: такие ссылки
+                                импортируют Hiddify с 5.5.5 и официальный клиент, v2rayN и старые Hiddify — нет
   iof hy2 del "Подпись"       удалить группу
   iof hy2 list                список групп
   iof hy2 show "Подпись"      показать ссылки группы
   iof hy2 refresh             пересобрать все группы
   iof hy2 status              состояние Hysteria2 на узлах
   iof hy2 restart узлы        перезапустить Hysteria2 (all — на всех) и проверить, что поднялась
+  iof hy2 hop on узлы         смена портов (port hopping): диапазон HY2_HOP (10000-19999) в listen узла,
+                              основной порт и выданные ссылки остаются; --ports a-b — свой диапазон
+  iof hy2 hop off узлы        вернуть один порт
+  iof hy2 upgrade узлы        обновить Hysteria2 официальным установщиком, при неудаче вернуть прежнюю
 
 AmneziaWG 2.0
   iof awg add "Имя"           создать клиента на всех узлах и выдать ключи vpn://
@@ -6298,6 +7200,11 @@ VLESS
   iof audit show [узел]       последняя проверка: все пункты, что не так и как исправить
   iof audit cron              для cron раз в сутки: проверка и сообщение в Telegram, если стало хуже
 
+Блок-лист сканеров (список BLOCKLIST_URL, адреса узлов и этого сервера не блокируются)
+  iof block on узлы           применить на узлах (all — на всех), переживает перезагрузку
+  iof block update [узлы]     скачать список заново и обновить там, где он включён (для cron раз в сутки)
+  iof block off узлы          снять целиком
+
 Доступность из РФ, проверка с ПК (на узлах на время проверки работают мишени)
   iof audit probe start       мишени на узлах на PROBE_TTL секунд (900) и проверка до них отсюда;
                               --ttl секунд — свой срок. Скрипт для ПК даёт страница «Безопасность» панели
@@ -6313,7 +7220,7 @@ VLESS
   iof migrate cancel          на старом: отменить перенос
   iof migrate status          идёт ли перенос
 
-Выбор узлов: -n перед командой ограничивает status, check, exec, hy2 status, awg status, awg clients, audit
+Выбор узлов: -n перед командой ограничивает status, check, exec, hy2 status, awg status, awg clients, audit, block update
   iof -n 'de-*' status
   iof -n de-1,de-2 exec "apt update"
 Сколько узлов одновременно: PARALLEL в /root/iof/iof.env (по умолчанию 20)
@@ -6337,7 +7244,8 @@ if [[ $# -gt 0 ]]; then shift; fi
 # Пока идёт перенос отсюда, команды, которые что-то меняют, запрещены
 case "$cmd:${1:-}" in
   init:*|refresh:*|node:add|node:import|node:del|relay:add|relay:del|relay:apply) migrate_guard ;;
-  hy2:add|hy2:del|hy2:refresh|hy2:install|awg:add|awg:del|awg:refresh) migrate_guard ;;
+  hy2:add|hy2:del|hy2:refresh|hy2:install|hy2:hop|hy2:upgrade|awg:add|awg:del|awg:refresh) migrate_guard ;;
+  block:on|block:update|block:off) migrate_guard ;;
 esac
 # Мишени проверки с ПК меняют узлы, а import пишет результат сюда, а не на новый сервер
 case "$cmd:${1:-}:${2:-}" in
@@ -6350,6 +7258,7 @@ case "$cmd" in
   vless)   cmd_vless "$@" ;;
   node)    cmd_node "$@" ;;
   relay)   cmd_relay "$@" ;;
+  block)   cmd_block "$@" ;;
   migrate) cmd_migrate "$@" ;;
   audit)   cmd_audit "$@" ;;
   status)  cmd_status ;;

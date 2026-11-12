@@ -40,6 +40,11 @@ fi
 if ! crontab -l -u root 2>/dev/null | grep -q 'iof audit cron'; then
   echo "iof audit: в cron не запланирован. Раз в сутки: sudo crontab -e, строка: 30 5 * * * /usr/local/bin/iof audit cron >/dev/null 2>&1"
 fi
+# Обновление блок-листа сканеров раз в сутки, если список задан. Тоже только подсказка
+if grep -qE '^BLOCKLIST_URL="?[^"[:space:]]' /root/iof/iof.env 2>/dev/null \
+   && ! crontab -l -u root 2>/dev/null | grep -q 'iof block update'; then
+  echo "iof block: обновление списка в cron не запланировано. Раз в сутки: sudo crontab -e, строка: 15 5 * * * /usr/local/bin/iof block update >/dev/null 2>&1"
+fi
 
 if (( ! WEB )); then exit 0; fi
 

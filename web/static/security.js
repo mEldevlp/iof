@@ -39,9 +39,9 @@ function blockNodes(block) {
   return sec.data.nodes.filter((n) => !pick || n.name === pick).map((n) => ({ ...n, res: saved[n.name] }));
 }
 
-// Оценка проверки на узле: результат iof или «нет данных» с причиной
+// Оценка проверки на узле: результат iof или «нет данных» с причиной. act — действия панели на этом узле
 function checkOf(res, id) {
-  const none = (value) => ({ status: "none", value, detail: [], hint: "", cmd: "" });
+  const none = (value) => ({ status: "none", value, detail: [], hint: "", cmd: "", act: [] });
   if (!res) return none("узел ещё не проверялся");
   if (!res.reachable) return none("нет связи с узлом");
   return res.checks.find((c) => c.id === id) || none("нет данных");
@@ -184,8 +184,97 @@ function checkRow(r, single, open) {
       <p class="check-why">${esc(r.k.why)}</p>
       ${body}
       ${fixes(r.per, single)}
+      ${checkActions(r)}
     </div>
   </details></li>`;
+}
+
+// Действия из проверок: iof сам меняет узел. Кнопка в строке проверки открывает диалог, в нём
+// выбирается один узел и действие. Что умеет каждый узел, говорит поле act проверки от iof
+const ACT_CHECKS = {
+  hy2_hop: { title: "Смена портов Hysteria2", button: "Включить или выключить…" },
+  blocklist: { title: "Блок-лист сканеров", button: "Применить или снять…" },
+};
+const ACTS = {
+  hop_on: { label: "Включить смену портов", cls: "primary",
+    text: (s) => `В listen Hysteria2 добавится диапазон ${s.hop || "HY2_HOP"} (HY2_HOP в /root/iof/iof.env). Основной порт останется, выданные ссылки продолжат работать как раньше. Служба перезапустится, клиенты переподключатся за несколько секунд. Если она не поднимется или не поставит правила, конфиг вернётся как был. Список портов попадёт только в ссылки групп с «Список портов в ссылках» на странице Hysteria2.` },
+  hop_off: { label: "Выключить смену портов", cls: "danger",
+    text: () => "В listen останется основной порт, служба перезапустится. Группы со списком портов в ссылках пересоберутся: их клиентам нужны новые ссылки, со старыми они будут попадать на закрытые порты." },
+  hy2_upgrade: { label: "Обновить Hysteria2", cls: "primary",
+    text: () => "Официальный установщик поставит последнюю версию, конфиг он не трогает. Служба перезапустится. Бинарник и юнит сохраняются на узле в /var/backups/iof-hy2: если служба не поднимется, они вернутся. После обновления можно включить смену портов." },
+  block_on: { label: "Применить блок-лист", cls: "primary",
+    text: () => "Пакеты с адресов из списка BLOCKLIST_URL узел будет отбрасывать раньше NAT, ufw и Docker. Не блокируются: узлы из nodes.conf, управляющий сервер, BLOCK_ALLOW и текущие сессии SSH на узле; записи шире /16 и IPv6 пропускаются. Список переживает перезагрузку. Если на узле нет ipset, он установится." },
+  block_update: { label: "Обновить список", cls: "",
+    text: () => "Список скачается заново (не чаще раза в сутки) и подменится на узле целиком: старый действует, пока не готов новый. Каждый день это делает строка cron с iof block update." },
+  block_off: { label: "Снять блок-лист", cls: "danger",
+    text: () => "С узла уйдут правило, цепочка IOF-BLOCK, наборы iof-block и iof-allow и служба iof-block. Пакеты со всех адресов узел снова будет принимать." },
+};
+
+function checkActions(r) {
+  const a = ACT_CHECKS[r.k.id];
+  if (!a) return "";
+  return `<div class="check-actions">
+    <button class="btn small" type="button" data-act-open="${esc(r.k.id)}">${esc(a.button)}</button>
+    <span class="hint">На одном узле, задачей iof. После неё узел проверяется заново.</span>
+  </div>`;
+}
+
+// Задачи действий (заголовки из AUDIT_ACTIONS в iof-web.py): у них свой итог в карточке задачи
+const ACT_JOB = /^(Смена портов Hysteria2|Обновление Hysteria2|Блок-лист сканеров)/;
+
+// Проверка, для которой открыт диалог действий (hy2_hop или blocklist)
+const actDlg = { id: "" };
+
+function actBlocked() {
+  return sec.running || !!(sec.data && sec.data.migrate && sec.data.migrate.role === "source");
+}
+
+function openActions(id) {
+  actDlg.id = id;
+  $("#act-title").textContent = ACT_CHECKS[id].title;
+  const all = sec.data.nodes.map((n) => n.name);
+  const saved = (sec.data.blocks.dpi || {}).nodes || {};
+  // Узел из списка блока, если выбран один; иначе первый, для которого есть действие
+  const pick = picked("dpi") || all.find((n) => checkOf(saved[n], id).act.length) || all[0] || "";
+  $("#act-node").innerHTML = all.map((n) => {
+    const c = checkOf(saved[n], id);
+    return `<option value="${esc(n)}">${esc(n)} — ${esc(WORDS[c.status])}</option>`;
+  }).join("");
+  $("#act-node").value = pick;
+  renderActDialog();
+  $("#act-dialog").showModal();
+}
+
+function renderActDialog() {
+  const name = $("#act-node").value;
+  const res = ((sec.data.blocks.dpi || {}).nodes || {})[name];
+  const c = checkOf(res, actDlg.id);
+  $("#act-state").innerHTML = `<span class="check-status">${icon(c.status)}<span>${esc(c.value)}</span></span>${detailLines(c)}`;
+  const blocked = actBlocked();
+  $("#act-list").innerHTML = c.act.length ? c.act.filter((a) => ACTS[a]).map((a) => `<div class="act-item">
+      <p>${esc(ACTS[a].text(sec.data.settings || {}))}</p>
+      <button class="btn${ACTS[a].cls ? ` ${ACTS[a].cls}` : ""}" type="button" data-act="${a}"${blocked ? " disabled" : ""}>${esc(ACTS[a].label)}</button>
+    </div>`).join("")
+    : `<p class="hint">${res && res.reachable
+      ? "Для этого узла действий нет: смотри «Как исправить» в проверке."
+      : "Узел не проверен или без связи: сначала «Проверить» в блоке «Защита от РКН»."}</p>`;
+  $("#act-note").hidden = !blocked;
+  $("#act-note").textContent = sec.running ? "Идёт другая задача, дождись её окончания."
+    : "Идёт перенос управления: здесь изменения заблокированы.";
+}
+
+async function runAction(action) {
+  const node = $("#act-node").value;
+  formError("", "#action-error");
+  $("#act-dialog").close();
+  try {
+    const id = DEMO ? demoActionJob({ action, node }) : (await postJson("api/security", { action, node })).job;
+    sec.kind = "audit";
+    job.start(id);
+    $("#job").scrollIntoView({ behavior: "smooth", block: "nearest" });
+  } catch (e) {
+    formError(e.message, "#action-error");
+  }
 }
 
 // Список перерисовывается целиком, раскрытые проверки остаются раскрытыми
@@ -215,11 +304,15 @@ function renderBlock(block) {
 function renderSchedule() {
   const d = sec.data, s = d.settings;
   const when = s.cron.trim().split(/\s+/).slice(0, 5).join(" ");
+  const bwhen = (s.block_cron || "").trim().split(/\s+/).slice(0, 5).join(" ");
   $("#sched").innerHTML =
     `<dt>Расписание</dt><dd>${s.cron ? `<code>${esc(when)}</code> · iof audit cron` : badge("warn", "не запланирована")}</dd>
-     <dt>Telegram</dt><dd>${s.tg ? badge("good", "настроен") : badge("none", "не настроен")}</dd>`;
+     <dt>Telegram</dt><dd>${s.tg ? badge("good", "настроен") : badge("none", "не настроен")}</dd>
+     <dt>Блок-лист</dt><dd>${!s.blocklist ? badge("none", "BLOCKLIST_URL не задан")
+       : s.block_cron ? `<code>${esc(bwhen)}</code> · iof block update` : badge("warn", "обновление не запланировано")}</dd>`;
   const hints = [];
   if (!s.cron) hints.push("Раз в сутки, после ночного обслуживания: <code>sudo crontab -e</code>, строка <code>30 5 * * * /usr/local/bin/iof audit cron >/dev/null 2>&1</code>");
+  if (s.blocklist && !s.block_cron) hints.push("Список сканеров на узлах обновляется раз в сутки строкой <code>15 5 * * * /usr/local/bin/iof block update >/dev/null 2>&1</code> в <code>sudo crontab -e</code>");
   if (!s.tg) hints.push("Сообщения о том, что стало хуже: <code>TG_TOKEN</code> и <code>TG_CHAT</code> в <code>/root/iof/iof.env</code>");
   else hints.push("В Telegram уходит сообщение, только когда проверка из cron оказалась хуже прошлой.");
   $("#sched-hint").hidden = !hints.length;
@@ -242,6 +335,8 @@ function renderSchedule() {
 function syncButtons() {
   const off = sec.running || !sec.data || !!sec.data.error;
   document.querySelectorAll("[data-run]").forEach((b) => { b.disabled = off; });
+  document.querySelectorAll("[data-act-open]").forEach((b) => { b.disabled = !sec.data || !!sec.data.error; });
+  if ($("#act-dialog").open) renderActDialog();
   // Мишени меняют узлы: во время переноса управления их не запустить
   $("#probe-start").disabled = off || !!(sec.data && sec.data.migrate && sec.data.migrate.role === "source");
   $("#probe-cancel").disabled = sec.running;
@@ -319,6 +414,12 @@ function renderJob(j) {
     // Этап карточки зависит от того, идёт ли задача
     if (was !== sec.running && sec.data && !sec.data.error) renderProbe();
     probeJobResult(j, lvl);
+  } else if (ACT_JOB.test(j.title)) {
+    const reason = failReason(j.log);
+    if (j.state === "ok") jobResult(lvl, `${icon("good")}<div>Готово, узел проверен заново: результат в проверке ниже</div>`);
+    else if (j.state === "warn") jobResult(lvl, `${icon("warn")}<div>Сделано не всё${reason ? `: <b>${esc(reason)}</b>` : ", подробности в логе"}</div>`);
+    else if (j.state === "error") jobResult(lvl, `${icon("crit")}<div>Не получилось${reason ? `: <b>${esc(reason)}</b>` : ", причина в логе"}</div>`);
+    else jobResult(lvl, "");
   } else if (j.state === "ok") {
     jobResult(lvl, `${icon("good")}<div>Проверка завершена, результат ниже</div>`);
   } else if (j.state === "warn") {
@@ -564,7 +665,16 @@ document.addEventListener("DOMContentLoaded", async () => {
   $("#probe-start").addEventListener("click", probeStart);
   $("#probe-cancel").addEventListener("click", probeCancel);
   $("#probe-node").addEventListener("change", () => sec.data && !sec.data.error && renderProbeResult((sec.data.probe || {}).last));
+  $("#act-node").addEventListener("change", renderActDialog);
+  $("#act-close").addEventListener("click", () => $("#act-dialog").close());
+  $("#act-dialog").addEventListener("click", (e) => {
+    if (e.target === e.currentTarget) e.currentTarget.close();
+    const b = e.target.closest("[data-act]");
+    if (b && !b.disabled) runAction(b.dataset.act);
+  });
   document.querySelector("main").addEventListener("click", async (e) => {
+    const open = e.target.closest("[data-act-open]");
+    if (open && !open.disabled) openActions(open.dataset.actOpen);
     const btn = e.target.closest("[data-copy]");
     if (btn) toast(await copyText(btn.previousElementSibling.textContent) ? "Скопировано" : "Не удалось скопировать");
     // Скрипт по ссылке забирается один раз: дальше страница покажет, что ждёт отчёт
@@ -715,7 +825,7 @@ const DEMO_DPI_CATALOG = [
   ["hy2_masq", "hy2", "Masquerade", "Тому, кто пришёл на порт Hysteria2 без пароля, сервер показывает сайт из masquerade. Если цель не отвечает, зонд увидит ошибку вместо сайта. Под Salamander masquerade снаружи не виден."],
   ["hy2_quic", "hy2", "Ответ на зонд QUIC", "Управляющий сервер отправляет на порт Hysteria2 пакет QUIC с несуществующей версией. Обычный сервер QUIC отвечает согласованием версий, под Salamander порт так не отвечает. Так видно, что получит тот, кто зондирует порт, и доходит ли до узла UDP."],
   ["hy2_port", "hy2", "Порт", "HTTP/3 работает на 443/udp, QUIC на другом порту встречается редко и заметнее. Под Salamander трафик не похож на QUIC на любом порту."],
-  ["hy2_hop", "hy2", "Смена портов (port hopping)", "Клиент раз в полминуты меняет порт, поэтому блокировка одного порта или долгого потока UDP не обрывает связь. Для этого нужен диапазон портов на сервере и он же в ссылке клиента."],
+  ["hy2_hop", "hy2", "Смена портов (port hopping)", "Клиент раз в полминуты меняет порт, поэтому блокировка одного порта или долгого потока UDP не обрывает связь. Для этого нужен диапазон портов на сервере и он же в ссылке клиента. iof включает диапазон на узле (iof hy2 hop), а список портов попадает только в ссылки групп с --hop: старые клиенты такую ссылку не импортируют."],
   ["hy2_template", "hy2", "Конфиг и шаблон", "iof hy2 install ставит на узлы конфиг по шаблону с управляющего сервера. Если конфиг узла потом правили вручную, маскировка на нём отличается от остальных, а повторная установка затрёт правки."],
   ["awg_params", "awg", "Параметры обфускации", "AmneziaWG отличается от WireGuard мусорными пакетами (Jc, Jmin, Jmax), добавками к пакетам (S1–S4) и своими заголовками (H1–H4). С нулями и заголовками 1, 2, 3, 4 это обычный WireGuard, который фильтры узнают по первому пакету."],
   ["awg_same", "awg", "Одинаковые параметры на узлах", "С одинаковыми параметрами трафик узлов выглядит одинаково: признак, найденный для одного узла, подойдёт ко всем. Сравнение идёт по хэшу, сами значения в панель и в файлы не попадают."],
@@ -725,7 +835,7 @@ const DEMO_DPI_CATALOG = [
   ["names", "probe", "Имя сервера и PTR", "Обратную запись DNS (PTR) видит любой по адресу узла, имя сервера попадает в приветствия служб. Слова vpn, proxy, wg в них говорят о назначении сервера."],
   ["banners", "probe", "Лишние порты снаружи", "Служба на лишнем порту отвечает приветствием с названием и версией программы. По нему сканер понимает, что стоит на сервере."],
   ["panel", "probe", "Панель iof-web", "Панель управляет всеми узлами от root. Она должна слушать только 127.0.0.1 и открываться через SSH-туннель: на внешнем адресе её найдёт любой сканер."],
-  ["blocklist", "scan", "Блок-лист сканеров", "Список адресов, с которых узлы сканируют и зондируют. Если пакеты от них отбрасывать, сканер видит закрытый сервер. iof пока только проверяет, применён ли список на узле."],
+  ["blocklist", "scan", "Блок-лист сканеров", "Список адресов, с которых узлы сканируют и зондируют. Если пакеты от них отбрасывать, сканер с этих адресов видит закрытый сервер. Это снижает заметность, но не прячет узел: сканеры меняют адреса. Применяет и обновляет список iof block."],
   ["asn", "rep", "Сеть и хостер", "Сети крупных хостеров VPS фильтры знают и относятся к ним строже, чем к домашним. Это справка: изменить её можно только переездом к другому хостеру."],
   ["registry", "rep", "Адрес в реестре", "Если адрес узла есть в выгрузке реестра блокировок, у части провайдеров он уже недоступен и клиенты до него не дойдут."],
   ["journald", "hyg", "Срок хранения журнала", "В журнале остаются адреса клиентов и время подключений. Если сервер изымут или взломают, журнал покажет, кто им пользовался. Чем короче срок хранения, тем меньше можно узнать."],
@@ -744,9 +854,6 @@ function demoDpiChecks(addr, over) {
     hy2_masq: ["good", "proxy на https://example.org/, цель с узла отвечает (200)"],
     hy2_quic: ["good", "порт 443/udp отвечает как сервер QUIC (согласование версий)"],
     hy2_port: ["good", "443/udp, как у HTTP/3"],
-    hy2_hop: ["warn", "нет: клиенты всегда ходят на порт 443", [],
-      "Из iof смена портов пока не включается: в ссылки групп попадает один порт, и после sudo iof hy2 refresh диапазон из ссылки пропадёт. Вручную: перенаправь диапазон на порт Hysteria2 командой ниже (после перезагрузки правило надо вернуть, файрвол должен пропускать этот диапазон UDP) и замени в ссылке клиента порт на диапазон, например :20000-50000. На узле от root:",
-      "iptables -t nat -A PREROUTING -p udp --dport 20000:50000 -j REDIRECT --to-ports 443"],
     hy2_template: ["good", "совпадает с шаблоном", ["Шаблон: /etc/hysteria/config.yaml. Пользователи auth.userpass не сравниваются: на узлах они свои"]],
     awg_params: ["none", "AmneziaWG на узле не установлен"],
     awg_same: ["none", "AmneziaWG на узле не установлен"],
@@ -757,8 +864,6 @@ function demoDpiChecks(addr, over) {
     names: ["good", "имя сервера: srv-12, PTR: нет"],
     banners: ["good", "лишних портов нет"],
     panel: ["good", "панели на узле нет"],
-    blocklist: ["warn", "на узле не применён", [`В списке записей: 1840, скачан ${listDay}`],
-      "Применять список iof пока не умеет, это появится отдельной командой. Сейчас проверка только показывает, что пакеты от адресов из списка узел принимает."],
     asn: ["good", "AS64500, Example Hosting B.V. (NL)", [`Адрес ${addr}, данные whois регионального реестра`]],
     registry: ["good", `адреса ${addr} в выгрузке нет`, [`В выгрузке записей: 412560, скачана ${listDay}`]],
     journald: ["good", "хранится не дольше 7day", ["Журнал занимает 48.0M"]],
@@ -769,7 +874,64 @@ function demoDpiChecks(addr, over) {
     time: ["good", "синхронизировано"],
   };
   const all = { ...base, ...over(restart) };
-  return Object.entries(all).map(([id, [status, value, detail = [], hint = "", cmd = ""]]) => ({ id, status, value, detail, hint, cmd }));
+  return Object.entries(all).map(([id, [status, value, detail = [], hint = "", cmd = "", act = []]]) => ({ id, status, value, detail, hint, cmd, act }));
+}
+
+// Что меняют действия в демо. hop — диапазон в listen (rules: правила стоят), ver — версия Hysteria2,
+// block — блок-лист на узле. Остальное как у узла в demoDpiNodes
+const demoAct = {
+  hop: { "node-2": { range: "10000-19999", rules: true }, "node-3": { range: "10000-19999", rules: false } },
+  ver: { "node-1": "2.11.0" },
+  block: {
+    "node-2": { entries: 1840, at: new Date().setHours(5, 30, 0, 0) / 1000 },
+    "node-3": { entries: 1795, at: Date.now() / 1000 - 12 * 86400 },
+  },
+};
+
+function demoVerGe(v, min) {
+  const a = v.split(".").map(Number), b = min.split(".").map(Number);
+  for (let i = 0; i < 3; i++) if ((a[i] || 0) !== (b[i] || 0)) return (a[i] || 0) > (b[i] || 0);
+  return true;
+}
+
+// Проверка «Смена портов» узла name с основным портом port, тексты как у iof audit
+function demoHopCheck(name, port) {
+  const h = demoAct.hop[name], ver = demoAct.ver[name] || "2.13.0";
+  const groups = `Групп ссылок со списком портов: ${demoState.groups.filter((g) => g.hop).length} из ${demoState.groups.length} (sudo iof hy2 add "Подпись" --hop)`;
+  if (h) {
+    const d = [groups, `Если у хостера свой файрвол в панели, в нём должен быть открыт UDP ${h.range}`];
+    if (h.rules) return ["good", `диапазон ${h.range} на порт ${port}, правила ставит сама Hysteria2`, d, "", "", ["hop_off"]];
+    return ["warn", `диапазон ${h.range} в конфиге, а правил перенаправления нет`, d,
+      "Клиенты со списком портов в ссылке попадают на закрытые порты. Служба не перезапущена после правки конфига, Hysteria2 старше 2.12.3 или у службы нет прав на правила (CAP_NET_ADMIN в юните). Включить заново с проверкой и откатом при неудаче — на управляющем сервере:",
+      `sudo iof hy2 hop on ${name} --ports ${h.range}`, ["hop_on", "hop_off"]];
+  }
+  if (!demoVerGe(ver, "2.12.3")) {
+    return ["warn", `нет: клиенты всегда ходят на порт ${port}`, [`Hysteria2 на узле: ${ver}`],
+      "Смене портов нужна Hysteria2 от 2.12.3: в старых версиях её правила заворачивали и исходящий UDP самого узла. Сначала обнови её (бинарник и юнит сохраняются на узле и возвращаются, если служба не поднимется), потом включи. На управляющем сервере:",
+      `sudo iof hy2 upgrade ${name}\nsudo iof hy2 hop on ${name}`, ["hy2_upgrade"]];
+  }
+  return ["warn", `нет: клиенты всегда ходят на порт ${port}`, [],
+    `Включить: в listen добавится диапазон 10000-19999 (HY2_HOP в /root/iof/iof.env), основной порт ${port} останется, выданные ссылки продолжат работать как раньше. Список портов в ссылках получат только группы с --hop: такие ссылки импортируют Hiddify с 5.5.5 и официальный клиент, v2rayN и Hiddify старше — нет. На управляющем сервере:`,
+    `sudo iof hy2 hop on ${name}\nsudo iof hy2 add "Подпись" --hop`, ["hop_on"]];
+}
+
+// Проверка «Блок-лист сканеров» узла name
+function demoBlockCheck(name) {
+  const b = demoAct.block[name];
+  const list = `В исходном списке строк с адресами: 1840, скачан ${fmtWhen(new Date().setHours(5, 30, 0, 0) / 1000)}`;
+  const cron = "Обновлять раз в сутки: на управляющем сервере sudo crontab -e, строка 15 5 * * * /usr/local/bin/iof block update >/dev/null 2>&1";
+  if (!b) {
+    return ["warn", "на узле не применён", [list],
+      `Применить: пакеты с адресов из списка узел будет отбрасывать раньше NAT, ufw и Docker, в том числе на портах контейнеров и ретранслятора. Узлы из nodes.conf, этот сервер, BLOCK_ALLOW и текущие сессии SSH на узле не блокируются, записи шире /16 и IPv6 пропускаются. ${cron}. На управляющем сервере:`,
+      `sudo iof block on ${name}`, ["block_on"]];
+  }
+  const val = `применён: записей ${b.entries}, список скачан ${fmtWhen(b.at)}`;
+  const d = [list, "Не блокируются: узлы из nodes.conf, этот сервер, BLOCK_ALLOW, сессии SSH на узле во время применения"];
+  if (Date.now() / 1000 - b.at > 7 * 86400) {
+    return ["warn", val, d, `Список на узле старше недели, а адреса сканеров меняются. Обновить сейчас: на управляющем сервере sudo iof block update ${name}. ${cron}`,
+      `sudo iof block update ${name}`, ["block_update", "block_off"]];
+  }
+  return ["good", val, d, "", "", ["block_update", "block_off"]];
 }
 
 function demoDpiNodes() {
@@ -802,9 +964,6 @@ function demoDpiNodes() {
       hy2_port: ["warn", "8443/udp, а HTTP/3 обычно на 443", [],
         "QUIC на нестандартном порту заметнее. Зато 443/udp фильтруют чаще: если так задумано, оставь. Сменить порт: команда на узле, затем на управляющем сервере sudo iof hy2 refresh (ссылки клиентов изменятся). На узле от root:",
         `sed -i -E 's/^listen:.*/listen: :443/' /etc/hysteria/config.yaml && ${restart}`],
-      hy2_hop: ["warn", "нет: клиенты всегда ходят на порт 8443", [],
-        "Из iof смена портов пока не включается: в ссылки групп попадает один порт, и после sudo iof hy2 refresh диапазон из ссылки пропадёт. Вручную: перенаправь диапазон на порт Hysteria2 командой ниже (после перезагрузки правило надо вернуть, файрвол должен пропускать этот диапазон UDP) и замени в ссылке клиента порт на диапазон, например :20000-50000. На узле от root:",
-        "iptables -t nat -A PREROUTING -p udp --dport 20000:50000 -j REDIRECT --to-ports 8443"],
       hy2_template: ["warn", "отличается от шаблона, блоки: listen, masquerade (на узле нет)", ["Шаблон: /etc/hysteria/config.yaml"],
         "Если правки на узле нужны, внеси их и в шаблон. Вернуть узлу конфиг по шаблону — команда ниже. При auth userpass пользователи узла создадутся заново с новыми паролями: ссылки на этот узел изменятся, раздай их снова (sudo iof hy2 show). На управляющем сервере:",
         "sudo iof hy2 install node-1 --force"],
@@ -831,10 +990,9 @@ function demoDpiNodes() {
       hy2_mode: ["good", "Salamander: трафик похож на случайный шум",
         ["Другой вариант — без Salamander с masquerade: сервер выглядит как сайт с HTTP/3. Это иной компромисс, а не улучшение"]],
       hy2_masq: ["none", "под Salamander masquerade снаружи не виден"],
-      hy2_quic: ["good", "порт 20000/udp на зонд QUIC не отвечает: так и выглядит Salamander", ["Доходит ли до узла UDP, под Salamander этот зонд не показывает"]],
-      hy2_port: ["none", "диапазон портов 20000-50000/udp (смена портов), один порт оценивать нечего"],
-      hy2_hop: ["good", "диапазон 20000-50000 в listen, Hysteria2 перенаправляет его сама"],
-      hy2_template: ["warn", "отличается от шаблона, блоки: listen, masquerade (на узле нет), obfs (в шаблоне нет)", ["Шаблон: /etc/hysteria/config.yaml"],
+      hy2_quic: ["good", "порт 443/udp на зонд QUIC не отвечает: так и выглядит Salamander", ["Доходит ли до узла UDP, под Salamander этот зонд не показывает"]],
+      hy2_port: ["none", "443/udp: под Salamander трафик не похож на QUIC на любом порту"],
+      hy2_template: ["warn", "отличается от шаблона, блоки: masquerade (на узле нет), obfs (в шаблоне нет)", ["Шаблон: /etc/hysteria/config.yaml"],
         "Если правки на узле нужны, внеси их и в шаблон. Вернуть узлу конфиг по шаблону — команда ниже. При auth userpass пользователи узла создадутся заново с новыми паролями: ссылки на этот узел изменятся, раздай их снова (sudo iof hy2 show). На управляющем сервере:",
         "sudo iof hy2 install node-2 --force"],
       awg_params: ["warn", "вне допустимых границ: Jc, S1 и S2", [...awg, "Jc: нужно от 1 до 128, иначе мусорные пакеты перед рукопожатием не идут",
@@ -842,8 +1000,6 @@ function demoDpiNodes() {
       awg_same: ["warn", "такие же параметры на: main", [], sameFix, "sudo iof awg refresh"],
       tcp_web: ["good", "закрыты: 80/tcp закрыт, 443/tcp не отвечает"],
       tls_cert: ["none", "снаружи не виден: 443/tcp закрыт, рукопожатие QUIC скрыто под Salamander"],
-      blocklist: ["good", `применён: записей 1840, обновлён ${fmtWhen(new Date().setHours(5, 31, 0, 0) / 1000)}`,
-        [`В списке записей: 1840, скачан ${fmtWhen(new Date().setHours(5, 30, 0, 0) / 1000)}`]],
       asn: ["none", "не определён", ["Реестр не отдал номер AS для 203.0.113.30. Сеть: Example Cloud LLC (US)"]],
       registry: ["crit", "адрес 203.0.113.30 есть в выгрузке (запись 203.0.113.0/27)", [`В выгрузке записей: 412560, скачана ${fmtWhen(new Date().setHours(5, 30, 0, 0) / 1000)}`],
         "У провайдеров, которые блокируют по реестру, узел недоступен. Помогает только другой адрес: новый IP у хостера или новый сервер (страница «Добавить сервер»). Старый узел убирается так, на управляющем сервере:",
@@ -867,9 +1023,6 @@ function demoDpiNodes() {
       tls_cert: ["warn", "Hysteria2: самоподписанный на чужое имя bing.com", ["Сертификат Hysteria2 виден при рукопожатии QUIC на 443/udp"],
         "Сертификат на имя чужого сайта снаружи выглядит подделкой. Варианты: свой домен и блок acme в конфиге Hysteria2 (сертификат выдаст Let's Encrypt, в ссылках клиентов пропадёт insecure) или Salamander, под которым рукопожатие снаружи не видно."],
       names: ["good", "имя сервера: srv-41, PTR: static.41.113.0.203.example-host.net"],
-      blocklist: ["warn", `применён: записей 1795, но не обновлялся с ${fmtWhen(Date.now() / 1000 - 12 * 86400)}`,
-        [`В списке записей: 1840, скачан ${fmtWhen(new Date().setHours(5, 30, 0, 0) / 1000)}`],
-        "Список на узле старше недели: адреса сканеров меняются. Обновление списка из iof появится вместе с его применением."],
     })),
     "node-4": demoDpiChecks("203.0.113.42", () => ({
       awg_params: ["none", "контейнер amnezia-awg2 остановлен"],
@@ -879,7 +1032,52 @@ function demoDpiNodes() {
       awg_log: ["good", "драйвер local: размер ограничен, старое удаляется само, сейчас 1.4 МБ"],
     })),
   };
+  // Смена портов и блок-лист зависят от действий в демо. Порядок проверок в списке не важен:
+  // страница берёт их по справочнику
+  const ports = { "node-1": 8443 };
+  for (const [name, list] of Object.entries(checks)) {
+    for (const [id, [status, value, detail, hint, cmd, act]] of [["hy2_hop", demoHopCheck(name, ports[name] || 443)], ["blocklist", demoBlockCheck(name)]]) {
+      list.push({ id, status, value, detail, hint, cmd, act });
+    }
+  }
   return demoBlockNodes(checks, demoAuditState.at.dpi);
+}
+
+// Действие из проверки в демо: задача как у iof, затем узел «проверяется заново»
+function demoActionJob(body) {
+  const n = body.node, now = Math.floor(Date.now() / 1000);
+  const titles = { hop_on: "Смена портов Hysteria2: включение", hop_off: "Смена портов Hysteria2: выключение",
+    hy2_upgrade: "Обновление Hysteria2", block_on: "Блок-лист сканеров: применение",
+    block_update: "Блок-лист сканеров: обновление", block_off: "Блок-лист сканеров: снятие" };
+  const range = (demoAct.hop[n] || {}).range || "10000-19999", port = n === "node-1" ? 8443 : 443;
+  const hopGroups = demoState.groups.filter((g) => g.hop).map((g) => `Пересобираю группу со сменой портов в ссылках: ${g.label}`);
+  const audit = [`$ iof -n ${n} audit run dpi`, "Проверяю узлы: 1, одновременно до 20", `== ${n}: проверен`];
+  const list = ["Список: записей 1840, скачан " + fmtWhen(new Date().setHours(5, 30, 0, 0) / 1000), "  пропущено: IPv6 12, шире /16 1, частных и служебных 3, нечитаемых 0"];
+  const steps = {
+    hop_on: [`$ iof hy2 hop on ${n}`, `Включаю смену портов ${range} на узлах: 1`, "", `Включено  ${n}: порты ${range} -> ${port}`, "", ...hopGroups,
+      "", `Если у хостера свой файрвол в панели, открой там UDP ${range}. Файрвол самого узла трогать не нужно:`,
+      "Hysteria2 перенаправляет диапазон на основной порт раньше, чем пакет до него дойдёт.", ...audit],
+    hop_off: [`$ iof hy2 hop off ${n}`, "Выключаю смену портов на узлах: 1", "", `Выключено ${n}: остался порт ${port}`, "", ...hopGroups,
+      ...(hopGroups.length ? ["Клиентам этих групп нужны новые ссылки: в старых диапазон, а его порты на этих узлах закрыты."] : []), ...audit],
+    hy2_upgrade: [`$ iof hy2 upgrade ${n}`, "Обновляю Hysteria2 на узлах: 1, одновременно до 20", "", "Обновлено: 1",
+      `  ${n}: ${demoAct.ver[n] || "2.13.0"} -> 2.13.0`, ...audit],
+    block_on: [`$ iof block on ${n}`, ...list, "Применяю на узлах: 1", "", `  ${n}: записей 1840, не блокируются 9`, ...audit],
+    block_update: [`$ iof block update ${n}`, ...list, "Обновляю на узлах, где список включён: 1 проверю", "", `  ${n}: записей 1840, не блокируются 9`, ...audit],
+    block_off: [`$ iof block off ${n}`, "Снимаю на узлах: 1", "", `  ${n}: снят`, ...audit],
+  };
+  if (n === "node-5") {
+    return demoRunJob("audit", `${titles[body.action]}, ${n}`, [steps[body.action][0], "Ошибки (1):", `  ${n}               нет связи по SSH`,
+      "Команда завершилась с кодом 1"], "error");
+  }
+  return demoRunJob("audit", `${titles[body.action]}, ${n}`, steps[body.action], "ok", () => {
+    if (body.action === "hop_on") demoAct.hop[n] = { range, rules: true };
+    if (body.action === "hop_off") delete demoAct.hop[n];
+    if (body.action === "hy2_upgrade") demoAct.ver[n] = "2.13.0";
+    if (body.action === "block_on" || body.action === "block_update") demoAct.block[n] = { entries: 1840, at: new Date().setHours(5, 30, 0, 0) / 1000 };
+    if (body.action === "block_off") delete demoAct.block[n];
+    demoAuditState.at.dpi = now;
+    demoAuditState.runs.push({ at: now, block: "dpi", nodes: 1 });
+  });
 }
 
 function demoAudit() {
@@ -904,7 +1102,8 @@ function demoAudit() {
     catalog: [...catalog("server", DEMO_AUDIT_CATALOG), ...catalog("dpi", DEMO_DPI_CATALOG)],
     nodes: demoNodes().map(({ name, addr, title }) => ({ name, addr, title })),
     history,
-    settings: { cron: "30 5 * * * /usr/local/bin/iof audit cron >/dev/null 2>&1", tg: true },
+    settings: { cron: "30 5 * * * /usr/local/bin/iof audit cron >/dev/null 2>&1", tg: true, hop: "10000-19999",
+      block_cron: "15 5 * * * /usr/local/bin/iof block update >/dev/null 2>&1", blocklist: true },
     probe: demoProbeData(),
     probe_state: demoProbeState(),
     error: null,
