@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Безопасность · Island of Freedom</title>
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="app.css">
+  <script src="common.js"></script>
+  <script src="demo.js" defer></script>
+  <script src="security.js" defer></script>
+</head>
+<body>
+  <div class="shell">
+    <aside id="sidebar" class="sidebar">
+      <a class="brand" href="./">
+        <svg class="logo" viewBox="0 0 64 64" aria-hidden="true">
+          <defs><clipPath id="logo-sky"><rect width="64" height="44"/></clipPath></defs>
+          <circle class="logo-sun" cx="42" cy="44" r="13" clip-path="url(#logo-sky)"/>
+          <path class="logo-palm" d="M14.4 48C15.8 37.5 18.6 28.5 24.2 21.4L27 22.8C22.2 30 20.2 39 19.6 48ZM25.5 21Q12 8 6 27Q15 18 25.5 21ZM25.5 21Q39 8 46 26Q37 17 25.5 21ZM25.5 21Q16 4 9 10Q19 11 25.5 21ZM25.5 21Q33 3 42 8Q31 12 25.5 21ZM25.5 21Q21 9 27.5 2.5Q28.5 13 25.5 21ZM4 50C16 43 28 44 38 47C46 49.5 54 48 60 43C55 50.5 46 53 37 51.5C27 50 16 48 4 50Z"/>
+          <path class="logo-wave" d="M12 56C22 52 32 52.5 41 54.5C48 56 55 55 60 51C56 57 48 59.5 40 58.5C31 57.5 22 55 12 56Z"/>
+        </svg>
+        <span><b>Island of Freedom</b><small>VPN-узлы: Hysteria2 и AWG</small></span>
+      </a>
+      <nav class="nav" aria-label="Разделы">
+        <p class="nav-label">Мониторинг</p>
+        <a href="./">
+          <svg class="nav-ico" viewBox="0 0 20 20" aria-hidden="true"><rect x="3" y="3" width="6" height="6" rx="1.5"/><rect x="11" y="3" width="6" height="6" rx="1.5"/><rect x="3" y="11" width="6" height="6" rx="1.5"/><rect x="11" y="11" width="6" height="6" rx="1.5"/></svg>
+          <span>Обзор</span>
+        </a>
+        <a href="hy2.html">
+          <svg class="nav-ico" viewBox="0 0 20 20" aria-hidden="true"><path d="M8.5 11.5l3-3M9.3 6.2l1.1-1.1a3 3 0 0 1 4.3 4.3l-1.1 1.1M10.7 13.8l-1.1 1.1a3 3 0 0 1-4.3-4.3l1.1-1.1"/></svg>
+          <span>Hysteria2</span>
+        </a>
+        <a href="security.html" aria-current="page">
+          <svg class="nav-ico" viewBox="0 0 20 20" aria-hidden="true"><path d="M10 2.5l6 2.2v4.5c0 3.7-2.4 6.6-6 8.3-3.6-1.7-6-4.6-6-8.3V4.7zM7.4 10l1.9 1.9 3.4-3.7"/></svg>
+          <span>Безопасность</span>
+        </a>
+        <p class="nav-label">Управление</p>
+        <a href="add.html">
+          <svg class="nav-ico" viewBox="0 0 20 20" aria-hidden="true"><rect x="2.5" y="3" width="15" height="5.5" rx="1.5"/><path d="M9.5 11.5H4A1.5 1.5 0 0 0 2.5 13v1.5A1.5 1.5 0 0 0 4 16h5.5M15 11v6M12 14h6M5.5 5.75h.01"/></svg>
+          <span>Добавить сервер</span>
+        </a>
+        <a href="migrate.html">
+          <svg class="nav-ico" viewBox="0 0 20 20" aria-hidden="true"><path d="M3 7h13M13 4l3 3-3 3M17 13H4M7 10l-3 3 3 3"/></svg>
+          <span>Перенос</span>
+          <span id="nav-migrate" class="nav-badge" hidden></span>
+        </a>
+        <a href="service.html">
+          <svg class="nav-ico" viewBox="0 0 20 20" aria-hidden="true"><path d="M12.6 3.3a4 4 0 0 0-5 5.1l-4.3 4.3a1.6 1.6 0 0 0 2.3 2.3l4.3-4.3a4 4 0 0 0 5.1-5l-2.4 2.4-2.1-.3-.3-2.1z"/></svg>
+          <span>Сервис</span>
+        </a>
+      </nav>
+      <div class="side-foot">
+        <p id="demo-chip" class="demo-chip" hidden>Демо-режим: данные выдуманы, сервер не нужен</p>
+        <div class="theme-row">
+          <span id="theme-label">Тема</span>
+          <div class="theme" role="group" aria-labelledby="theme-label">
+            <button type="button" data-set-theme="auto" title="Как в системе" aria-label="Как в системе"><svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="5.75"/><path class="fill" d="M8 2.25a5.75 5.75 0 0 1 0 11.5z"/></svg></button>
+            <button type="button" data-set-theme="light" title="Светлая" aria-label="Светлая"><svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="2.75"/><path d="M8 1.5v1.5M8 13v1.5M1.5 8H3M13 8h1.5M3.4 3.4l1.06 1.06M11.54 11.54l1.06 1.06M3.4 12.6l1.06-1.06M11.54 4.46l1.06-1.06"/></svg></button>
+            <button type="button" data-set-theme="dark" title="Тёмная" aria-label="Тёмная"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13.5 9.6A5.75 5.75 0 0 1 6.4 2.5a5.75 5.75 0 1 0 7.1 7.1z"/></svg></button>
+          </div>
+        </div>
+      </div>
+    </aside>
+
+    <div class="content">
+      <header class="page-head">
+        <button id="menu-btn" class="btn menu-btn" type="button" aria-controls="sidebar" aria-expanded="false" aria-label="Меню">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 4h11M2.5 8h11M2.5 12h11" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+        </button>
+        <div class="page-title">
+          <h1>Безопасность</h1>
+          <p>Настройки серверов и их заметность для фильтров: что проверка показала, почему это важно и как исправить</p>
+        </div>
+        <div class="controls">
+          <button id="refresh" class="btn" type="button">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9M13.5 2.5v3h-3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            <span>Обновить</span>
+          </button>
+        </div>
+      </header>
+
+      <main>
+        <div id="alert" class="alert" role="alert" hidden></div>
+        <div id="migrate-banner" class="note warn banner" role="status" hidden></div>
+        <div id="action-error" class="form-error banner" role="alert" hidden></div>
+
+        <section id="job" class="card" hidden>
+          <div class="card-head">
+            <h2 id="job-title">Выполнение</h2>
+            <div class="actions"><span id="job-state"></span><button id="job-hide" class="btn small" type="button" hidden>Скрыть</button></div>
+          </div>
+          <div id="job-result"></div>
+          <pre id="job-log" class="log" aria-live="polite"></pre>
+        </section>
+
+        <section id="server" class="card">
+          <div class="card-head">
+            <h2>Аудит сервера</h2>
+            <div class="actions">
+              <span id="server-stamp" class="card-note"></span>
+              <label class="sr-only" for="server-node">Узел</label>
+              <select id="server-node"></select>
+              <button id="server-run" class="btn primary" type="button" data-run="server">Проверить</button>
+            </div>
+          </div>
+          <p class="hint pad">SSH, файрвол, защита от подбора паролей, обновления, открытые порты, sudo и SUID-файлы.
+            Проверка только читает настройки узлов и ничего на них не меняет. Нагрузка на узлы — на «Обзоре».</p>
+          <div id="server-health" class="health"></div>
+          <div id="server-checks"></div>
+        </section>
+
+        <section id="dpi" class="card">
+          <div class="card-head">
+            <h2>Защита от РКН (ТСПУ)</h2>
+            <div class="actions">
+              <span id="dpi-stamp" class="card-note"></span>
+              <label class="sr-only" for="dpi-node">Узел</label>
+              <select id="dpi-node"></select>
+              <button id="dpi-run" class="btn primary" type="button" data-run="dpi">Проверить</button>
+            </div>
+          </div>
+          <p class="hint pad">Чем узел заметен для фильтров и зондов: маскировка Hysteria2 и AmneziaWG, что отвечает
+            снаружи, блок-лист сканеров, репутация адреса, журналы. Проверка показывает признаки, а не обещает,
+            что узел не найдут. Пароли и параметры обфускации в панель не попадают. Узлы она только читает,
+            снаружи на них смотрит управляющий сервер.</p>
+          <div id="dpi-health" class="health"></div>
+          <div id="dpi-checks"></div>
+        </section>
+
+        <section id="probe" class="card">
+          <div class="card-head">
+            <h2>Доступность из РФ: проверка с ПК</h2>
+            <div class="actions">
+              <span id="probe-stamp" class="card-note"></span>
+              <label class="sr-only" for="probe-node">Узел</label>
+              <select id="probe-node"></select>
+              <button id="probe-start" class="btn primary" type="button">Начать проверку</button>
+              <button id="probe-cancel" class="btn" type="button" hidden>Остановить</button>
+            </div>
+          </div>
+          <p class="hint pad">Доходит ли трафик до узлов через твоего провайдера. На узлах на время проверки
+            (PROBE_TTL, по умолчанию 15 минут) поднимаются мишени, и управляющий сервер сразу проходит до них
+            все слои: это контроль. Затем скрипт PowerShell на ПК проходит те же слои и сдаёт отчёт сюда.
+            Где ПК не дошёл, а контроль дошёл, там и режут. Проверка показывает, что прошло из этой сети
+            в этот раз, и не обещает, что так будет всегда.</p>
+          <div id="probe-wait" class="probe-wait" hidden></div>
+          <div id="probe-health" class="health"></div>
+          <div id="probe-nodes"></div>
+          <div id="probe-history" class="list"></div>
+        </section>
+
+        <section class="card">
+          <div class="card-head">
+            <h2>Проверка по расписанию</h2>
+            <span class="card-note">оба блока; последние запуски, из панели и из cron</span>
+          </div>
+          <dl id="sched" class="kv"></dl>
+          <p id="sched-hint" class="hint pad" hidden></p>
+          <div id="history" class="list"></div>
+        </section>
+      </main>
+
+      <footer class="foot">iof-web · проверку выполняют <code>iof audit run</code> и <code>iof audit probe</code>, результат хранится в <code>/root/iof/audit</code>. Набор проверок по мотивам vps-audit и rkn-block-checker</footer>
+    </div>
+  </div>
+
+  <dialog id="act-dialog" class="dialog" aria-labelledby="act-title">
+    <div class="dialog-head">
+      <h2 id="act-title"></h2>
+      <button id="act-close" class="btn" type="button">Закрыть</button>
+    </div>
+    <div class="dialog-body">
+      <label class="dialog-field">
+        <span>Узел</span>
+        <select id="act-node"></select>
+      </label>
+      <div id="act-state" class="act-state"></div>
+      <div id="act-list" class="act-list"></div>
+      <p id="act-note" class="form-error" hidden></p>
+    </div>
+  </dialog>
+</body>
+</html>

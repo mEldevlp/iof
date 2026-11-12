@@ -177,6 +177,7 @@ function renderGroup(d, name) {
         <label class="check"><input id="reveal" type="checkbox"${page.reveal ? " checked" : ""}> показать пароль</label>
         <button id="copy-all" class="btn primary" type="button"${g.links.length ? "" : " disabled"}>Скопировать все (${g.links.length})</button>
         <button class="btn" type="button" data-hy2="rebuild" data-lock>Пересобрать</button>
+        <button class="btn" type="button" data-hy2="hop" data-lock>Список портов: ${g.hop ? "вкл" : "выкл"}</button>
         <button class="btn danger" type="button" data-hy2="del" data-lock>Удалить</button>
       </div>
     </div>
@@ -185,7 +186,7 @@ function renderGroup(d, name) {
       <ol class="links">
         ${g.links.map((l, i) => `<li class="link">
           <div class="link-main">
-            <div class="link-title">${esc(l.node || l.title)}${l.relay ? ' <span class="tag">ретранслятор</span>' : ""}
+            <div class="link-title">${esc(l.node || l.title)}${l.relay ? ' <span class="tag">ретранслятор</span>' : ""}${l.hop ? ' <span class="tag">смена портов</span>' : ""}
               <span class="mono muted">${esc(l.host)}:${esc(l.port)}</span></div>
             <code class="link-url"${page.reveal ? ` title="${esc(l.url)}"` : ""}>${esc(displayUrl(l.url))}</code>
           </div>
@@ -208,6 +209,7 @@ function renderGroup(d, name) {
     toast(await copyText(all) ? `Скопировано ссылок: ${g.links.length}` : "Не удалось скопировать");
   });
   el.querySelector('[data-hy2="rebuild"]').addEventListener("click", () => run({ action: "add", label: g.label }));
+  el.querySelector('[data-hy2="hop"]').addEventListener("click", () => openHop(g));
   el.querySelector('[data-hy2="del"]').addEventListener("click", () => {
     const keep = authMode(d) === "password"
       ? "В режиме общего пароля выданные ссылки продолжат работать: отключить их можно только сменой пароля на всех узлах."
@@ -225,6 +227,30 @@ function renderGroup(d, name) {
       `<p class="hint">Hiddify: «+», затем «Сканировать QR-код».</p>`;
     $("#qr-dialog").showModal();
   }));
+}
+
+// Список портов в ссылках группы (iof hy2 add --hop). Порт узла со сменой портов в ссылке становится
+// списком 443,10000-19999. Включается по группе, потому что не все клиенты такую ссылку импортируют
+function openHop(g) {
+  const on = !g.hop;
+  const text = on
+    ? `<p>В ссылках группы «${esc(g.label)}» на узлы со сменой портов порт станет списком, например <code>443,10000-19999</code>:
+         клиент будет сам менять порт раз в полминуты. На узлах без смены портов ссылки останутся как есть.</p>
+       <p class="note warn">${icon("warn")}<span>Такие ссылки импортируют <b>Hiddify с версии 5.5.5</b> и официальный клиент Hysteria2.
+         <b>v2rayN и Hiddify старше 5.5.5 их не импортируют</b>: включай, только если у всех клиентов этой группы
+         свежий Hiddify. Уже выданные обычные ссылки продолжат работать.</span></p>
+       <p>Смену портов на узле включает страница «Безопасность» (проверка «Смена портов») или <code>sudo iof hy2 hop on &lt;узел&gt;</code>.</p>`
+    : `<p>В ссылках группы «${esc(g.label)}» снова будет один порт, их импортирует любой клиент.</p>
+       <p class="note warn">${icon("warn")}<span>Ссылки со списком портов у клиентов продолжат работать, пока смена портов включена на узлах.
+         Новые ссылки раздай клиентам заново.</span></p>`;
+  $("#hop-title").textContent = `Список портов в ссылках: ${on ? "включить" : "выключить"}`;
+  $("#hop-body").innerHTML = `${text}
+    <div class="btn-row"><button id="hop-go" class="btn primary" type="button">${on ? "Включить и пересобрать группу" : "Выключить и пересобрать группу"}</button></div>`;
+  $("#hop-go").addEventListener("click", () => {
+    $("#hop-dialog").close();
+    run({ action: "add", label: g.label, hop: on });
+  });
+  $("#hop-dialog").showModal();
 }
 
 function renderNodes(d) {

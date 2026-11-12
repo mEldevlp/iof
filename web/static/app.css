@@ -414,13 +414,25 @@ img.qr { display: block; width: 100%; max-width: 240px; height: auto; margin: 0 
 .cmds dt { margin: 0; }
 .cmds dd { margin: 0; color: var(--ink-2); }
 
-.qr-dialog {
+/* Диалог: QR-код на Hysteria2, подтверждение действий на «Безопасности» и Hysteria2 */
+.dialog {
   border: 1px solid var(--ring); border-radius: 12px; padding: 16px;
-  background: var(--surface); color: var(--ink); width: min(340px, calc(100vw - 32px));
+  background: var(--surface); color: var(--ink); width: min(520px, calc(100vw - 32px));
 }
-.qr-dialog::backdrop { background: rgba(0, 0, 0, 0.45); }
-.qr-dialog-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 12px; }
-.qr-dialog h2 { font-size: 14px; font-weight: 600; overflow-wrap: anywhere; }
+.dialog::backdrop { background: rgba(0, 0, 0, 0.45); }
+.dialog-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 12px; }
+.dialog h2 { margin: 0; font-size: 14px; font-weight: 600; overflow-wrap: anywhere; }
+.dialog-body { display: grid; gap: 12px; font-size: 13px; }
+.dialog-body p { margin: 0; }
+.dialog-field { display: grid; gap: 4px; font-weight: 500; }
+.dialog-field select { width: 100%; }
+.act-state { display: grid; gap: 0; padding: 8px 12px; border: 1px solid var(--grid); border-radius: 8px; overflow-wrap: anywhere; }
+.act-list { display: grid; gap: 12px; }
+.act-item { display: grid; gap: 8px; justify-items: start; padding-top: 12px; border-top: 1px solid var(--grid); }
+.act-item p { color: var(--ink-2); }
+.dialog-body .note { margin: 0; }
+.dialog-body .btn-row { padding: 0; }
+.qr-dialog { width: min(340px, calc(100vw - 32px)); }
 .qr-dialog img.qr { max-width: 280px; }
 .qr-dialog .hint { padding: 12px 0 0; text-align: center; }
 
@@ -545,12 +557,61 @@ pre.log {
 .inline-form input[aria-invalid="true"] { border-color: var(--crit); }
 .inline-form .hint { flex-basis: 100%; }
 
-/* Список задач панели: строка задачи раскрывается в лог */
-.jobs { list-style: none; margin: 0; padding: 0 16px 8px; }
-.jobs li { border-top: 1px solid var(--grid); }
-.jobs summary { display: flex; align-items: center; gap: 8px 16px; flex-wrap: wrap; padding: 12px 0; cursor: pointer; }
+/* Списки с раскрывающимися строками: задачи панели (строка раскрывается в лог) и проверки
+   на странице «Безопасность» */
+.jobs, .checks { list-style: none; margin: 0; padding: 0 16px 8px; }
+.jobs li, .checks li { border-top: 1px solid var(--grid); }
+.jobs summary, .checks summary { display: flex; align-items: center; gap: 8px 16px; flex-wrap: wrap; padding: 12px 0; cursor: pointer; }
 .jobs summary .item-title { flex: 1 1 200px; }
 .jobs pre.log { margin: 0 0 12px; }
+
+/* Страница «Безопасность». Сводка блока — .health внутри карточки. Строка проверки: оценка,
+   название, значение; раскрывается в «почему это важно», значения по узлам и «как исправить».
+   Колонка оценки 112px, содержимое раскрытой строки начинается под названием */
+.card > .health { margin: 0 16px 16px; padding: 12px 16px; border-radius: 8px; }
+.check-group { margin: 0; padding: 8px 16px 8px; font-size: 13px; font-weight: 600; color: var(--ink-2); }
+.checks summary { align-items: baseline; }
+.checks summary .st { flex: 0 0 112px; }
+.checks summary .item-title { flex: 0 1 220px; }
+.check-value { flex: 1 1 280px; min-width: 0; font-size: 13px; color: var(--ink-2); overflow-wrap: anywhere; }
+.check-body { display: grid; gap: 12px; padding: 0 0 16px 128px; font-size: 13px; }
+.check-body p { margin: 0; }
+.check-why { max-width: 760px; color: var(--ink-2); }
+.check-nodes { margin: 0; display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 8px 16px; }
+.check-nodes dt { font-weight: 500; }
+.check-nodes dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+.check-status { display: flex; gap: 6px; align-items: flex-start; }
+.check-status .ico { margin-top: 3px; }
+.check-detail { display: block; margin-top: 4px; font-size: 12px; line-height: 16px; color: var(--ink-2); overflow-wrap: anywhere; }
+.check-facts .check-detail:first-child { margin-top: 0; }
+.fix { display: grid; gap: 4px; min-width: 0; }
+.fix h4 { margin: 0; font-size: 13px; font-weight: 600; }
+.fix h4 .muted { font-weight: 400; margin-left: 4px; }
+/* Команда с кнопкой «Копировать» */
+.cmd { display: flex; gap: 8px; align-items: flex-start; min-width: 0; }
+.cmd pre.code { flex: 1; min-width: 0; margin: 0; }
+.cmd .btn { flex: none; }
+.check-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+.check-note { display: flex; gap: 6px; align-items: flex-start; margin-top: 4px; }
+.check-note .ico { margin-top: 3px; }
+
+/* Проверка с ПК: ожидание отчёта (обратный отсчёт, шаги, мишени по узлам) и слои узла в таблице
+   «с ПК — контроль — итог». Таблица без фона в шапке: она внутри раскрытой строки проверки */
+.probe-wait { display: grid; gap: 12px; margin: 0 16px 16px; padding: 12px 16px; border: 1px solid var(--ring); border-radius: 8px; font-size: 13px; }
+.probe-wait .note { margin: 0; }
+.probe-line { margin: 0; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.countdown { font-weight: 500; font-variant-numeric: tabular-nums; }
+.probe-steps { margin: 0; padding-left: 20px; display: grid; gap: 8px; }
+.probe-steps li { padding-left: 4px; }
+.probe-steps .cmd { margin-top: 4px; }
+.probe-steps code, .probe-wait .note code { font-family: var(--mono); font-size: 12px; }
+.probe-wait a { color: var(--accent); text-underline-offset: 2px; }
+table.trace { width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }
+.trace th { text-align: left; font-size: 12px; font-weight: 500; color: var(--ink-2); padding: 0 12px 8px 0; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+.trace td { padding: 8px 12px 8px 0; border-bottom: 1px solid var(--grid); vertical-align: top; overflow-wrap: anywhere; }
+.trace tbody tr:last-child td { border-bottom: 0; }
+.trace td:first-child { font-weight: 500; white-space: nowrap; }
+.trace td:last-child, .trace th:last-child { padding-right: 0; white-space: nowrap; }
 .commits { list-style: none; margin: 0; padding: 0 16px 12px; display: grid; gap: 4px; font-size: 13px; }
 .commits code { color: var(--ink-2); margin-right: 8px; }
 
@@ -652,4 +713,19 @@ pre.log {
   .seg { display: flex; }
   .seg label { flex: 1; text-align: center; }
   .term-box { height: 360px; margin: 0 8px; }
+  .checks summary .st, .checks summary .item-title { flex: 0 1 auto; }
+  .check-value { flex-basis: 100%; }
+  .check-body { padding-left: 0; }
+  .check-nodes { grid-template-columns: minmax(0, 1fr); gap: 2px; }
+  .check-nodes dd { margin-bottom: 8px; }
+  .cmd { flex-wrap: wrap; }
+  .cmd pre.code { flex-basis: 100%; }
+  .probe-wait { margin: 0 8px 16px; padding: 12px; }
+  .trace thead { display: none; }
+  .trace, .trace tbody, .trace tr, .trace td { display: block; }
+  .trace tr { padding: 8px 0; border-bottom: 1px solid var(--grid); }
+  .trace tbody tr:last-child { border-bottom: 0; }
+  .trace td, .trace td:last-child { padding: 0; border: 0; white-space: normal; }
+  .trace td[data-label]::before { content: attr(data-label) ": "; color: var(--muted); }
+  .trace td:last-child { margin-top: 4px; }
 }

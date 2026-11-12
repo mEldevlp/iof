@@ -2,9 +2,14 @@
 
 # Проверка iof на поднятом стенде, её же запускает CI на каждый push. Управляющий сервер видит
 # узлы и выполняет на них команды, ссылки Hysteria2 из iof работают с другого сервера, ретранслятор
-# пересылает трафик, панель отвечает, отбивает чужие запросы, выполняет задачи и открывает терминал
-# на каждый узел (stand.sh setup включает его в web.env). Созданные группы
-# ссылок и ретранслятор удаляются, стенд остаётся как был.
+# пересылает трафик, смена портов Hysteria2 включается и выключается (клиент ходит по ссылке со списком
+# портов), аудит безопасности видит изменения на узле (в том числе расхождение конфига Hysteria2
+# с шаблоном в блоке dpi), блок-лист отбрасывает пакеты с адресов из списка и не трогает защищённые,
+# действия запрещены во время переноса, мишени проверки с ПК отвечают только с токеном, готовый отчёт
+# даёт ожидаемые оценки, мишени исчезают по сроку; панель отвечает, отбивает чужие
+# запросы, выполняет задачи, выдаёт скрипт для ПК по билету и открывает терминал на каждый узел
+# (stand.sh setup включает его в web.env). Созданные группы ссылок и ретранслятор удаляются,
+# изменения на узле для аудита, смены портов, блок-листа и проверки с ПК откатываются, стенд остаётся как был.
 #   bash stand/stand.sh test [сервер]   сервер — управляющий, по умолчанию old (после переноса: new)
 # Имена узлов в nodes.conf совпадают с именами контейнеров, как после stand.sh setup. Узлов нужно
 # хотя бы два, а стенду — интернет: трафик через туннель идёт на PROBE_URL.
@@ -16,12 +21,20 @@ PROBE_URL="${PROBE_URL:-http://connectivitycheck.gstatic.com/generate_204}"
 # Группы ссылок, которые проверка создаёт и удаляет: из консоли и из панели
 GROUP="CI проверка"
 PANEL_GROUP="CI панель"
+HOP_GROUP="CI смена портов"
 export MSYS_NO_PATHCONV=1
 
 PASSED=0
 FAILED=0
 GROUP_LEFT=0
 RELAY_LEFT=""
+AUDIT_LEFT=""
+PROBE_LEFT=0        # 1 — могли остаться мишени проверки с ПК
+PROBE_FW_LEFT=""    # узел, где для проверки с ПК запрещены входящие
+PROBE_PY=()         # узлы с python3: на них поднимаются мишени
+HOP_LEFT=0          # 1 — могла остаться смена портов на узлах и группа со списком портов
+BLOCK_LEFT=""       # «узел|сервер с тестовыми адресами»: там мог остаться блок-лист
+GUARD_LEFT=0        # 1 — на управляющем сервере остался поддельный migrate.conf
 NAMES=()
 declare -A ADDR=()
 
@@ -46,6 +59,32 @@ summary() {
 
 # Если проверка оборвалась посередине, убирает созданное ею
 cleanup() {
+  if (( GUARD_LEFT )); then
+    echo "Убираю поддельный migrate.conf"
+    on "$M" rm -f /root/iof/migrate.conf || true
+  fi
+  if (( HOP_LEFT )); then
+    echo "Выключаю смену портов и убираю группу «$HOP_GROUP»"
+    iofm hy2 hop off all >/dev/null 2>&1 || true
+    iofm hy2 del "$HOP_GROUP" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$BLOCK_LEFT" ]]; then
+    echo "Снимаю блок-лист с ${BLOCK_LEFT%%|*}"
+    block_restore "${BLOCK_LEFT%%|*}" "${BLOCK_LEFT#*|}"
+  fi
+  if [[ -n "$AUDIT_LEFT" ]]; then
+    echo "Возвращаю $AUDIT_LEFT как был"
+    audit_restore "$AUDIT_LEFT"
+  fi
+  if (( PROBE_LEFT )); then
+    echo "Останавливаю мишени проверки с ПК"
+    iofm audit probe stop >/dev/null 2>&1 || true
+    on "$M" bash -c 'rm -f /root/iof-test-probe-*.json' || true
+  fi
+  if [[ -n "$PROBE_FW_LEFT" ]]; then
+    echo "Возвращаю файрвол $PROBE_FW_LEFT как был"
+    probe_fw "$PROBE_FW_LEFT" off
+  fi
   if [[ -n "$RELAY_LEFT" ]]; then
     echo "Убираю ретранслятор $RELAY_LEFT"
     # shellcheck disable=SC2086 # два слова: узел и через какой
@@ -100,6 +139,70 @@ tunnel() {
     if [[ "$code" != 2* ]]; then echo "ответ $code, лог клиента:"; tail -n 5 "$log"; fi
     rm -f "$cfg" "$log"
     [[ "$code" == 2* ]]' _ "$PROBE_URL"
+}
+
+# То же со сменой портов: клиент меняет порт каждые 5 с и 14 секунд подряд открывает PROBE_URL.
+# Код 0, если удачных запросов хотя бы 12, печатает их число
+tunnel_hop() {
+  printf '%s\n' "$2" | on_in "$1" bash -c '
+    command -v hysteria >/dev/null || { echo "на сервере нет hysteria"; exit 1; }
+    link="$(cat)"
+    cfg="$(mktemp --suffix=.yaml)"
+    log="$(mktemp)"
+    printf "server: \"%s\"\ntransport:\n  udp:\n    hopInterval: 5s\nsocks5:\n  listen: 127.0.0.1:10804\n" "$link" > "$cfg"
+    timeout 90 hysteria client -c "$cfg" > "$log" 2>&1 &
+    good=0
+    for _ in $(seq 1 14); do
+      code="$(curl -s -o /dev/null -w "%{http_code}" -m 5 --socks5-hostname 127.0.0.1:10804 "$1")" || true
+      if [[ "$code" == 2* ]]; then good=$((good + 1)); fi
+      sleep 1
+    done
+    kill %1 2>/dev/null
+    wait 2>/dev/null
+    echo "удачных запросов: $good из 14"
+    if (( good < 12 )); then tail -n 5 "$log"; fi
+    rm -f "$cfg" "$log"
+    (( good >= 12 ))' _ "$PROBE_URL"
+}
+
+# Сколько новых потоков ушло в перенаправление Hysteria2 на узле $1 (счётчик перехода в HYSTERIA-PR-*).
+# Пусто, если правила стоят в nftables: там счётчиков нет
+hop_flows() {
+  on "$1" bash -c 'iptables -w -t nat -L PREROUTING -v -n -x 2>/dev/null | awk "/HYSTERIA-PR-/ { s += \$1; f = 1 } END { if (f) print s }"'
+}
+
+# Доходит ли TCP с сервера $1 до порта 22 сервера $2, $3 — ключи curl (например, --interface адрес)
+reach() {
+  on "$1" bash -c "curl -sv -m 3 $3 telnet://$2:22 </dev/null 2>&1 | grep -q 'Connected to'"
+}
+
+# Задача панели: POST /api/security с телом $1 (JSON) на управляющем сервере, ждёт её конца.
+# Печатает «состояние заголовок» и хвост лога, при отказе — «refused код текст»
+panel_act() {
+  on_in "$M" python3 - "$1" <<'PY'
+import json, sys, time, urllib.error, urllib.request
+
+BASE = "http://127.0.0.1:8088"
+POST = {"X-IOF-Request": "1", "Content-Type": "application/json", "Origin": BASE}
+r = urllib.request.Request(BASE + "/api/security", data=sys.argv[1].encode(), method="POST", headers=POST)
+try:
+    with urllib.request.urlopen(r, timeout=30) as resp:
+        code, data = resp.status, json.loads(resp.read())
+except urllib.error.HTTPError as e:
+    code, data = e.code, json.loads(e.read() or b"{}")
+if code != 202:
+    print(f"refused {code} {data.get('error', '')}")
+    sys.exit(0)
+for _ in range(600):
+    with urllib.request.urlopen(BASE + "/api/jobs", timeout=30) as resp:
+        job = next((j for j in json.loads(resp.read())["jobs"] if j["id"] == data["job"]), None)
+    if job and job["state"] != "running":
+        print(job["state"], job["title"])
+        print("\n".join(job["log"][-15:]))
+        sys.exit(0)
+    time.sleep(1)
+print("timeout")
+PY
 }
 
 # Все узлы на связи, без проблем, Hysteria2 работает. Заполняет NAMES и ADDR
@@ -283,16 +386,627 @@ check_restart() {
   if out="$(iofm hy2 restart all 2>&1)"; then ok "iof hy2 restart all"; else fail "iof hy2 restart all"; details "$out"; fi
 }
 
+# Ссылка группы $1 на сервер с адресом $2
+group_link_to() {
+  local l
+  while IFS= read -r l; do
+    if [[ "$(link_host "$l")" == "$2" ]]; then echo "$l"; return 0; fi
+  done < <(group_links "$1")
+  return 1
+}
+
+# Смена портов Hysteria2: iof hy2 hop on на всех узлах; по ссылке группы с --hop клиент с другого сервера
+# меняет порт каждые 5 с (где правила в iptables, видно по счётчику, что потоков было несколько), прямой заход
+# на порт из диапазона, оценка аудита, refresh не теряет диапазон; затем hop off — снова один порт, ссылки
+# рабочие, на узлах нет правил и drop-in. Включение и выключение из панели задачей. На первом узле, который
+# не управляющий сервер, входящие запрещены политикой DROP, открыты только 22/tcp и 443/udp
+check_hop() {
+  local out n link one client got range lo before after fwnode="" count
+  for n in "${NAMES[@]}"; do
+    if [[ "$n" != "$M" && -z "$fwnode" ]]; then fwnode="$n"; fi
+  done
+  HOP_LEFT=1
+  if [[ -n "$fwnode" ]]; then
+    PROBE_FW_LEFT="$fwnode"
+    probe_fw "$fwnode" on
+  fi
+  if out="$(iofm hy2 hop on all 2>&1)" && (( $(grep -c '^Включено ' <<<"$out" || true) == ${#NAMES[@]} )); then
+    ok "iof hy2 hop on all: включено на узлах: ${#NAMES[@]}"
+  else
+    fail "iof hy2 hop on all"
+    details "$out"
+    return 1
+  fi
+  if grep -q 'через iptables' <<<"$out"; then
+    echo "      $(grep 'через iptables' <<<"$out" | head -n 3 | sed 's/^Включено *//' | paste -sd';' -)"
+  fi
+  range="$(grep -m1 -oE 'порты [0-9]+-[0-9]+' <<<"$out" | cut -d' ' -f2)"
+  lo="${range%-*}"
+  out="$(iofm hy2 hop on all 2>&1)" || true
+  if grep -q "^Уже было так (${#NAMES[@]})" <<<"$out"; then ok "повтор hop on: ничего не меняет"; else fail "повтор hop on"; details "$out"; fi
+  if out="$(iofm hy2 add "$HOP_GROUP" --hop 2>&1)"; then ok "iof hy2 add «$HOP_GROUP» --hop"; else fail "iof hy2 add «$HOP_GROUP» --hop"; details "$out"; return 1; fi
+
+  for n in "${NAMES[@]}"; do
+    link="$(group_link_to "$HOP_GROUP" "${ADDR[$n]}")" || { fail "в группе «$HOP_GROUP» нет ссылки на $n"; continue; }
+    if [[ "$(link_hostport "$link")" != *",$range" ]]; then fail "ссылка на $n без диапазона: $(link_hostport "$link")"; continue; fi
+    client="$(other_server "${ADDR[$n]}")" || { fail "не с какого сервера проверить $n"; continue; }
+    before="$(hop_flows "$n")"
+    if out="$(tunnel_hop "$client" "$link" 2>&1)"; then
+      ok "туннель со сменой портов $client -> $n ($(link_hostport "$link")): $(head -n 1 <<<"$out")"
+    else
+      fail "туннель со сменой портов $client -> $n ($(link_hostport "$link"))"
+      details "$out"
+    fi
+    after="$(hop_flows "$n")"
+    if [[ -n "$before" && -n "$after" ]]; then
+      if (( after - before >= 2 )); then ok "$n: клиент менял порт, новых потоков на диапазон: $((after - before))"
+      else fail "$n: новых потоков на диапазон $((after - before)), ожидалось хотя бы 2"; fi
+    fi
+    one="$(sed -E "s#@([^/?@]*):[0-9,-]+/#@\\1:$((lo + 123))/#" <<<"$link")"
+    if out="$(tunnel "$client" "$one" 2>&1)"; then ok "туннель $client -> $n на порт $((lo + 123)) из диапазона"
+    else fail "туннель $client -> $n на порт $((lo + 123)) из диапазона"; details "$out"; fi
+  done
+
+  iofm audit run dpi >/dev/null 2>&1 || true
+  for n in "${NAMES[@]}"; do
+    got="$(audit_get "$n" hy2_hop dpi)"
+    if [[ "$got" == good*"$range"* ]]; then ok "dpi $n: смена портов — $got"; else fail "dpi $n: смена портов — «$got»"; fi
+    got="$(audit_get "$n" hy2_template dpi)"
+    if [[ "$got" == good* ]]; then ok "dpi $n: диапазон в listen не считается расхождением с шаблоном"; else fail "dpi $n: конфиг и шаблон — «$got»"; fi
+  done
+  iofm hy2 refresh >/dev/null 2>&1 || true
+  count="$(group_links "$HOP_GROUP" | grep -c ":[0-9]*,$range/" || true)"
+  if (( count == ${#NAMES[@]} )); then ok "iof hy2 refresh: диапазон в ссылках остался ($count)"; else fail "после refresh ссылок с диапазоном: $count из ${#NAMES[@]}"; fi
+
+  # Выключение: снова один порт
+  if out="$(iofm hy2 hop off all 2>&1)" && (( $(grep -c '^Выключено ' <<<"$out" || true) == ${#NAMES[@]} )); then
+    ok "iof hy2 hop off all: выключено на узлах: ${#NAMES[@]}"
+  else
+    fail "iof hy2 hop off all"
+    details "$out"
+  fi
+  count="$(group_links "$HOP_GROUP" | grep -c ':[0-9]*,' || true)"
+  if (( count == 0 )); then ok "после hop off в ссылках группы один порт"; else fail "после hop off ссылок со списком портов: $count"; fi
+  for n in "${NAMES[@]}"; do
+    out="$(on "$n" bash -c 'grep "^listen" /etc/hysteria/config.yaml; ls /etc/systemd/system/hysteria-server.service.d/iof-hop.conf 2>/dev/null
+      iptables -w -t nat -S 2>/dev/null | grep -c HYSTERIA-PR || true; nft list tables 2>/dev/null | grep -c hysteria_ || true')"
+    if [[ "$(head -n 1 <<<"$out")" == "listen: :443" && "$(tail -n 2 <<<"$out" | paste -sd' ' -)" == "0 0" && "$out" != *iof-hop.conf* ]]; then
+      ok "$n: в listen один порт, правил и drop-in нет"
+    else
+      fail "$n после hop off: $(paste -sd' ' - <<<"$out")"
+    fi
+    link="$(group_link_to "$HOP_GROUP" "${ADDR[$n]}")" || continue
+    client="$(other_server "${ADDR[$n]}")" || continue
+    if out="$(tunnel "$client" "$link" 2>&1)"; then ok "туннель $client -> $n ($(link_hostport "$link")) после hop off"
+    else fail "туннель $client -> $n после hop off"; details "$out"; fi
+  done
+
+  # Из панели: задача включает и выключает на одном узле, после неё узел проверен заново
+  n="${fwnode:-${NAMES[0]}}"
+  out="$(panel_act "{\"action\": \"hop_on\", \"node\": \"$n\"}")"
+  if [[ "$out" == ok* ]] && [[ "$(audit_get "$n" hy2_hop dpi)" == good* ]]; then ok "панель: смена портов на $n включена задачей, проверка — good"
+  else fail "панель: включение смены портов на $n"; details "$out"; fi
+  out="$(panel_act "{\"action\": \"hop_off\", \"node\": \"$n\"}")"
+  if [[ "$out" == ok* ]] && [[ "$(audit_get "$n" hy2_hop dpi)" == warn* ]]; then ok "панель: смена портов на $n выключена задачей"
+  else fail "панель: выключение смены портов на $n"; details "$out"; fi
+  out="$(panel_act '{"action": "hop_on", "node": "all"}')"
+  if [[ "$out" == refused* ]]; then ok "панель: действие на «all» не принято (${out#refused })"; else fail "панель приняла действие на all"; details "$out"; fi
+
+  if [[ -n "$fwnode" ]]; then
+    probe_fw "$fwnode" off
+    PROBE_FW_LEFT=""
+  fi
+  if iofm hy2 del "$HOP_GROUP" >/dev/null 2>&1; then HOP_LEFT=0; ok "группа «$HOP_GROUP» удалена"; else fail "не удалилась группа «$HOP_GROUP»"; fi
+}
+
+# Возвращает как было после проверки блок-листа на узле $1 с тестовыми адресами на сервере $2
+block_restore() {
+  iofm block off "$1" >/dev/null 2>&1 || true
+  on "$2" bash -c 'ip addr del 1.2.3.4/32 dev eth0; ip addr del 1.2.3.5/32 dev eth0' >/dev/null 2>&1 || true
+  on "$1" ip route del 1.2.3.0/24 >/dev/null 2>&1 || true
+  on "$M" bash -c 'systemctl stop iof-test-www 2>/dev/null; systemctl reset-failed iof-test-www 2>/dev/null; rm -rf /root/iof-test-www
+    if [[ -f /root/iof-test-env.bak ]]; then cat /root/iof-test-env.bak > /root/iof/iof.env; rm -f /root/iof-test-env.bak; fi
+    rm -f /root/iof/audit/cache/blocklist.txt*' >/dev/null 2>&1 || true
+}
+
+# Блок-лист сканеров на первом узле, который не управляющий сервер. У другого сервера стенда два внешних
+# адреса: 1.2.3.4 из списка и 1.2.3.5 из BLOCK_ALLOW, узел ходит к ним через этот сервер. Список
+# (с частными сетями, IPv6, слишком широкими записями и мусором, их iof пропускает) раздаёт управляющий
+# сервер python3 -m http.server на 127.0.0.1. Пакеты с 1.2.3.4 узел отбрасывает, с остальных — нет,
+# после перезапуска службы список на месте, update без изменений ничего не меняет, снятие убирает всё
+check_block() {
+  local out node="" src="" n got me
+  for n in "${NAMES[@]}"; do
+    if [[ "$n" != "$M" && -z "$node" ]]; then node="$n"; fi
+  done
+  if [[ -z "$node" ]]; then echo "      блок-лист: нет узла, кроме управляющего сервера, пропускаю"; return 0; fi
+  src="$(other_server "${ADDR[$node]}")" || { fail "блок-лист: не с какого сервера проверить $node"; return 1; }
+  BLOCK_LEFT="$node|$src"
+  on_in "$M" bash -s <<'EOF'
+mkdir -p /root/iof-test-www
+printf '# тестовый список iof\n1.2.3.0/24\n172.30.0.0/24\n10.0.0.0/8\n1.0.0.0/4\n2001:db8::/32\nне адрес\n' > /root/iof-test-www/list.txt
+systemctl stop iof-test-www 2>/dev/null; systemctl reset-failed iof-test-www 2>/dev/null
+systemd-run --quiet --unit iof-test-www python3 -m http.server 8765 --bind 127.0.0.1 --directory /root/iof-test-www
+[[ -f /root/iof-test-env.bak ]] || cp -p /root/iof/iof.env /root/iof-test-env.bak
+grep -vE '^(BLOCKLIST_URL|BLOCK_ALLOW)=' /root/iof-test-env.bak > /root/iof/iof.env
+printf 'BLOCKLIST_URL="http://127.0.0.1:8765/list.txt"\nBLOCK_ALLOW="1.2.3.5"\n' >> /root/iof/iof.env
+rm -f /root/iof/audit/cache/blocklist.txt*
+sleep 1
+EOF
+  on "$src" bash -c 'ip addr add 1.2.3.4/32 dev eth0; ip addr add 1.2.3.5/32 dev eth0' >/dev/null 2>&1 || true
+  on "$node" ip route replace 1.2.3.0/24 via "${ADDR[$src]}"
+
+  if out="$(iofm block on "$node" 2>&1)" && grep -q "^  $node: записей 1," <<<"$out"; then
+    ok "iof block on $node: $(grep "^  $node:" <<<"$out" | sed 's/^ *//')"
+  else
+    fail "iof block on $node"
+    details "$out"
+    return 1
+  fi
+  if grep -q 'пропущено: IPv6 1, шире /16 2, частных и служебных 1, нечитаемых 1' <<<"$out"; then
+    ok "из списка пропущены IPv6, слишком широкие записи, частные сети и мусор"
+  else
+    fail "пропущено не то: $(grep 'пропущено' <<<"$out")"
+  fi
+  me="$(on "$M" hostname -I | awk '{ print $1 }')"
+  out="$(on "$node" cat /etc/iof/block.allow)"
+  got="ok"
+  for n in "${NAMES[@]}"; do grep -qx "${ADDR[$n]}" <<<"$out" || got="нет ${ADDR[$n]}"; done
+  grep -qx "$me" <<<"$out" || got="нет $me"
+  grep -qx "1.2.3.5" <<<"$out" || got="нет 1.2.3.5"
+  if [[ "$got" == ok ]]; then ok "$node: не блокируются узлы из nodes.conf, управляющий сервер ($me) и BLOCK_ALLOW"
+  else fail "$node: в block.allow $got"; fi
+
+  if ! reach "$src" "${ADDR[$node]}" "--interface 1.2.3.4"; then ok "$node отбрасывает пакеты с 1.2.3.4 (в списке)"; else fail "$node принимает пакеты с 1.2.3.4"; fi
+  if reach "$src" "${ADDR[$node]}" "--interface 1.2.3.5"; then ok "$node принимает 1.2.3.5 (BLOCK_ALLOW)"; else fail "$node отбрасывает 1.2.3.5 из BLOCK_ALLOW"; fi
+  if reach "$src" "${ADDR[$node]}" ""; then ok "$node принимает $src с его адреса из nodes.conf"; else fail "$node отбрасывает $src"; fi
+  if reach "$M" "${ADDR[$node]}" ""; then ok "$node принимает управляющий сервер $M"; else fail "$node отбрасывает управляющий сервер"; fi
+
+  out="$(on "$node" bash -c 'systemctl restart iof-block && ipset list -t iof-block | sed -n "s/^Number of entries: //p"; iptables -w -t raw -C PREROUTING -j IOF-BLOCK && echo hook')"
+  if [[ "$out" == $'1\nhook' ]] && ! reach "$src" "${ADDR[$node]}" "--interface 1.2.3.4"; then
+    ok "$node: после перезапуска iof-block список на месте"
+  else
+    fail "$node после перезапуска iof-block: $(paste -sd' ' - <<<"$out")"
+  fi
+  out="$(iofm block update 2>&1)" || true
+  if grep -q "^Список тот же, не менялся (1): $node" <<<"$out"; then ok "iof block update: тот же список не трогает"; else fail "iof block update"; details "$out"; fi
+  iofm -n "$node" audit run dpi >/dev/null 2>&1 || true
+  got="$(audit_get "$node" blocklist dpi)"
+  if [[ "$got" == good*"применён"* ]]; then ok "dpi $node: блок-лист — $got"; else fail "dpi $node: блок-лист — «$got»"; fi
+
+  out="$(panel_act "{\"action\": \"block_update\", \"node\": \"$node\"}")"
+  if [[ "$out" == ok* ]]; then ok "панель: обновление блок-листа на $node задачей"; else fail "панель: обновление блок-листа на $node"; details "$out"; fi
+  out="$(panel_act "{\"action\": \"block_off\", \"node\": \"$node\"}")"
+  got="$(on "$node" bash -c 'ipset list -n 2>/dev/null | grep -c "^iof-" || true; iptables -w -t raw -S 2>/dev/null | grep -c IOF-BLOCK || true
+    ls /etc/iof/block.list /etc/systemd/system/iof-block.service /usr/local/sbin/iof-block 2>/dev/null | wc -l')"
+  if [[ "$out" == ok* && "$(paste -sd' ' - <<<"$got")" == "0 0 0" ]]; then
+    ok "панель: блок-лист снят с $node целиком (наборов, правил и файлов нет)"
+  else
+    fail "панель: снятие блок-листа с $node: $(paste -sd' ' - <<<"$got")"
+    details "$out"
+  fi
+  if reach "$src" "${ADDR[$node]}" "--interface 1.2.3.4"; then ok "$node после снятия принимает 1.2.3.4"; else fail "$node после снятия отбрасывает 1.2.3.4"; fi
+  got="$(audit_get "$node" blocklist dpi)"
+  if [[ "$got" == warn*"не применён"* ]]; then ok "dpi $node после снятия: $got"; else fail "dpi $node после снятия: «$got»"; fi
+  block_restore "$node" "$src"
+  BLOCK_LEFT=""
+}
+
+# Во время переноса управления (migrate.conf с role=source) действия запрещены и в консоли, и в панели,
+# а проверка разрешена. migrate.conf подделывается, если переноса нет
+check_guard() {
+  local out n="${NAMES[0]}"
+  if on "$M" test -f /root/iof/migrate.conf; then echo "      идёт настоящий перенос, проверку запрета пропускаю"; return 0; fi
+  GUARD_LEFT=1
+  on "$M" bash -c 'printf "role=source\nid=iof-test\npeer=root@192.0.2.1\nstarted=%s\n" "$(date +%s)" > /root/iof/migrate.conf'
+  if out="$(iofm hy2 hop on "$n" 2>&1)"; then fail "hy2 hop on во время переноса выполнилась"
+  elif grep -q 'идёт перенос' <<<"$out"; then ok "во время переноса: iof hy2 hop on запрещена"
+  else fail "hy2 hop on во время переноса: не та ошибка"; details "$out"; fi
+  if out="$(iofm block on "$n" 2>&1)"; then fail "block on во время переноса выполнилась"
+  elif grep -q 'идёт перенос' <<<"$out"; then ok "во время переноса: iof block on запрещена"
+  else fail "block on во время переноса: не та ошибка"; details "$out"; fi
+  if out="$(iofm hy2 upgrade "$n" 2>&1)"; then fail "hy2 upgrade во время переноса выполнилась"
+  elif grep -q 'идёт перенос' <<<"$out"; then ok "во время переноса: iof hy2 upgrade запрещена"
+  else fail "hy2 upgrade во время переноса: не та ошибка"; details "$out"; fi
+  out="$(panel_act "{\"action\": \"hop_on\", \"node\": \"$n\"}")"
+  if [[ "$out" == refused*перенос* ]]; then ok "панель: действие во время переноса не принято (${out#refused })"; else fail "панель приняла действие во время переноса"; details "$out"; fi
+  if out="$(iofm -n "$n" audit run dpi 2>&1)"; then ok "во время переноса: iof audit run разрешена"; else fail "audit run во время переноса"; details "$out"; fi
+  on "$M" rm -f /root/iof/migrate.conf
+  GUARD_LEFT=0
+}
+
+# Оценка проверки $2 на узле $1 из iof api audit: "статус значение", down — узел не ответил.
+# $3 — блок, по умолчанию server
+audit_get() {
+  iofm api audit 2>/dev/null | on_in "$M" python3 -c '
+import json, sys
+node = json.load(sys.stdin)["blocks"][sys.argv[3]]["nodes"].get(sys.argv[1])
+check = next((c for c in node["checks"] if c["id"] == sys.argv[2]), None) if node else None
+print("нет" if not node else "down" if not node["reachable"] else "%s %s" % (check["status"], check["value"]) if check else "нет")
+' "$1" "$2" "${3:-server}"
+}
+
+# То, что check_audit и check_dpi меняют на узле $1: лишний слушатель, настройка sshd, остановленный
+# ssh, конфиг Hysteria2 (его копия лежит рядом, служба с правленым конфигом не перезапускалась)
+audit_restore() {
+  on "$1" bash -c 'systemctl stop iof-test-listen 2>/dev/null; systemctl reset-failed iof-test-listen 2>/dev/null
+    rm -f /etc/ssh/sshd_config.d/00-iof-test.conf; systemctl start ssh
+    if [[ -f /etc/hysteria/config.yaml.iof-test ]]; then mv -f /etc/hysteria/config.yaml.iof-test /etc/hysteria/config.yaml; fi' >/dev/null 2>&1 || true
+}
+
+# Аудит безопасности: все узлы проверены, вход root по паролю (на стенде он включён) оценён как
+# проблема. Меняется то, что меняется на узле: лишний слушающий порт попадает в «лишние», а
+# iof audit cron сообщает об ухудшении; PasswordAuthentication no снимает проблему; узел без ssh
+# остаётся без оценок. Узел для этого — первый, который не управляющий сервер
+check_audit() {
+  local out n node="" got
+  if out="$(iofm audit run 2>&1)"; then ok "iof audit run"; else fail "iof audit run"; details "$out"; return 1; fi
+  for n in "${NAMES[@]}"; do
+    if [[ "$n" != "$M" && -z "$node" ]]; then node="$n"; fi
+    got="$(audit_get "$n" ssh_password)"
+    if [[ "$got" == crit* ]]; then ok "аудит $n: вход по паролю — $got"; else fail "аудит $n: вход по паролю — «$got», ожидалась проблема"; fi
+  done
+  got="$(audit_get "$node" ports)"
+  if [[ "$got" == good* ]]; then ok "аудит $node: слушающие порты — $got"; else fail "аудит $node: слушающие порты — «$got»"; fi
+
+  AUDIT_LEFT="$node"
+  on "$node" systemd-run --quiet --collect --unit=iof-test-listen perl -MIO::Socket::INET \
+    -e '@keep = (IO::Socket::INET->new(Listen => 1, LocalPort => 18080, ReuseAddr => 1)); sleep 300' >/dev/null 2>&1
+  sleep 1
+  out="$(iofm audit cron 2>&1)" || true
+  got="$(audit_get "$node" ports)"
+  if [[ "$got" == crit*18080/tcp* ]]; then ok "аудит $node: лишний порт найден — $got"; else fail "аудит $node: лишний порт 18080 не найден — «$got»"; fi
+  if grep -q "^$node: Слушающие порты" <<<"$out"; then
+    ok "iof audit cron: сообщил, что на $node стало хуже"
+  else
+    fail "iof audit cron не сообщил об ухудшении на $node"
+    details "$out"
+  fi
+  on "$node" systemctl stop iof-test-listen >/dev/null 2>&1
+
+  on "$node" bash -c 'echo "PasswordAuthentication no" > /etc/ssh/sshd_config.d/00-iof-test.conf'
+  iofm -n "$node" audit run server >/dev/null 2>&1
+  got="$(audit_get "$node" ssh_password)"
+  if [[ "$got" == good* ]]; then ok "аудит $node: после PasswordAuthentication no — $got"; else fail "аудит $node: после PasswordAuthentication no — «$got»"; fi
+  got="$(audit_get "$node" ports)"
+  if [[ "$got" == good* ]]; then ok "аудит $node: лишний порт пропал — $got"; else fail "аудит $node: слушающие порты после остановки слушателя — «$got»"; fi
+  on "$node" rm -f /etc/ssh/sshd_config.d/00-iof-test.conf
+
+  on "$node" systemctl stop ssh >/dev/null 2>&1
+  out="$(iofm -n "$node" audit run server 2>&1)" || true
+  got="$(audit_get "$node" ssh_password)"
+  on "$node" systemctl start ssh >/dev/null 2>&1
+  if [[ "$got" == "down" ]] && grep -q '^Ошибки (1):' <<<"$out"; then
+    ok "аудит $node без ssh: узел без оценок, в выводе «Ошибки (1)»"
+  else
+    fail "аудит $node без ssh: «$got»"
+    details "$out"
+  fi
+  for _ in $(seq 1 20); do
+    if [[ "$(on "$node" systemctl is-active ssh 2>/dev/null || true)" == "active" ]]; then break; fi
+    sleep 0.5
+  done
+  if out="$(iofm -n "$node" audit run server 2>&1)" && [[ "$(audit_get "$node" ssh_password)" == crit* ]]; then
+    AUDIT_LEFT=""
+    ok "аудит $node: узел снова проверен, стенд как был"
+  else
+    fail "аудит $node после возврата ssh"
+    details "$out"
+  fi
+}
+
+# Блок «Защита от РКН» (dpi), его уже проверил iof audit run в check_audit: у каждого узла конфиг
+# Hysteria2 совпадает с шаблоном, порт отвечает на зонд QUIC, AmneziaWG «не установлен» (на стенде
+# его нет). На узле, который не управляющий сервер, в конфиг дописывается блок (служба не
+# перезапускается): проверка видит расхождение с шаблоном, iof audit cron сообщает об ухудшении,
+# после возврата конфига расхождения нет. Пароль Hysteria2 из шаблона в результаты не попадает
+check_dpi() {
+  local out n node="" got secret
+  for n in "${NAMES[@]}"; do
+    if [[ "$n" != "$M" && -z "$node" ]]; then node="$n"; fi
+    got="$(audit_get "$n" hy2_template dpi)"
+    if [[ "$got" == good* ]]; then ok "dpi $n: конфиг и шаблон — $got"; else fail "dpi $n: конфиг и шаблон — «$got», ожидалось совпадение"; fi
+    got="$(audit_get "$n" hy2_quic dpi)"
+    if [[ "$got" == good* ]]; then ok "dpi $n: зонд QUIC — $got"; else fail "dpi $n: зонд QUIC — «$got»"; fi
+    got="$(audit_get "$n" awg_params dpi)"
+    if [[ "$got" == none*"не установлен"* ]]; then ok "dpi $n: AmneziaWG — $got"; else fail "dpi $n: AmneziaWG — «$got», ожидалось «не установлен»"; fi
+  done
+
+  AUDIT_LEFT="$node"
+  on "$node" bash -c 'cp -p /etc/hysteria/config.yaml /etc/hysteria/config.yaml.iof-test
+    printf "\nmasquerade:\n  type: string\n  string:\n    content: iof-test\n" >> /etc/hysteria/config.yaml'
+  out="$(iofm audit cron 2>&1)" || true
+  got="$(audit_get "$node" hy2_template dpi)"
+  if [[ "$got" == warn*masquerade* ]]; then ok "dpi $node: правка конфига найдена — $got"; else fail "dpi $node: правка конфига не найдена — «$got»"; fi
+  if grep -q "^$node: Конфиг и шаблон" <<<"$out"; then
+    ok "iof audit cron: сообщил, что на $node конфиг разошёлся с шаблоном"
+  else
+    fail "iof audit cron не сообщил о расхождении с шаблоном на $node"
+    details "$out"
+  fi
+  on "$node" mv -f /etc/hysteria/config.yaml.iof-test /etc/hysteria/config.yaml
+  if out="$(iofm -n "$node" audit run dpi 2>&1)" && [[ "$(audit_get "$node" hy2_template dpi)" == good* ]]; then
+    AUDIT_LEFT=""
+    ok "dpi $node: конфиг возвращён, расхождения нет"
+  else
+    fail "dpi $node после возврата конфига: «$(audit_get "$node" hy2_template dpi)»"
+    details "$out"
+  fi
+
+  secret="$(on "$M" bash -c 'f="$(. /root/iof/iof.env 2>/dev/null; echo "${HY2_TEMPLATE:-/etc/hysteria/config.yaml}")"
+    sed -n "s/^[[:space:]]*password:[[:space:]]*//p" "$f" | head -n 1')"
+  if [[ -z "$secret" ]]; then
+    fail "dpi: в шаблоне Hysteria2 на $M не нашёлся пароль, проверить утечку нечем"
+  elif on "$M" bash -c 'grep -rqF -- "$0" /root/iof/audit || iof audit show 2>/dev/null | grep -qF -- "$0" || iof api audit 2>/dev/null | grep -qF -- "$0"' "$secret"; then
+    fail "dpi: пароль Hysteria2 попал в результаты аудита"
+  else
+    ok "dpi: пароля Hysteria2 нет в /root/iof/audit, iof audit show и iof api audit"
+  fi
+}
+
+# Что осталось от мишеней на узле $1: «юнитов папок_в_/run правил_iptables»
+probe_left() {
+  on "$1" bash -c 'printf "%s %s %s" "$(systemctl list-units --all --plain --no-legend "iof-probe-*" | wc -l)" \
+    "$(ls -d /run/iof-probe-* 2>/dev/null | wc -l)" "$(iptables -w -S INPUT 2>/dev/null | grep -c iof-probe || true)"'
+}
+
+# Входящие на узле $1 запрещены политикой DROP, открыты только SSH, Hysteria2 и ответы (on); off — как было
+probe_fw() {
+  if [[ "$2" == "on" ]]; then
+    on "$1" bash -c 'c="-m comment --comment iof-test-fw"
+      iptables -w -A INPUT -i lo $c -j ACCEPT
+      iptables -w -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED $c -j ACCEPT
+      iptables -w -A INPUT -p tcp --dport 22 $c -j ACCEPT
+      iptables -w -A INPUT -p udp --dport 443 $c -j ACCEPT
+      iptables -w -P INPUT DROP'
+  else
+    on "$1" bash -c 'iptables -w -P INPUT ACCEPT
+      iptables -w -S INPUT | grep -- "--comment iof-test-fw" | sed "s/^-A/-D/" | while read -r r; do iptables -w $r; done' >/dev/null 2>&1 || true
+  fi
+}
+
+# Последний результат проверки с ПК по узлу $1: «статус уверенность», нет — узла в результате нет
+probe_result() {
+  iofm api audit 2>/dev/null | on_in "$M" python3 -c '
+import json, sys
+r = json.load(sys.stdin)["probe"]["last"] or {}
+n = r.get("nodes", {}).get(sys.argv[1])
+print("%s %s" % (n["status"], r["confidence"]) if n else "нет")' "$1"
+}
+
+# Готовые отчёты probe.ps1 из контроля текущей сессии, в /root/iof-test-probe-<вид>.json на управляющем
+# сервере: block — у первого узла с ПК не проходит TCP, остальное как у контроля; vpn — IP источника
+# равен адресу узла; token — в отчёте токен мишеней; alien — отчёт от другой проверки
+probe_reports() {
+  on_in "$M" python3 - "$1" <<'PY'
+import copy, json, sys
+s = json.load(open("/root/iof/audit/probe/session.json"))
+token = open("/root/iof/audit/probe/token").read().strip()
+first = sys.argv[1]
+
+
+def report(kind):
+    targets = []
+    for name, n in s["nodes"].items():
+        if n["state"] != "started":
+            continue
+        t = copy.deepcopy(n["control"])
+        t["node"] = name
+        t["icmp"] = {"sent": 3, "got": 3, "ms": 40}
+        t["tunnel"] = {"tested": False, "reason": "nohysteria"}
+        if kind == "block" and name == first:
+            t["conn"] = [{"tcp": None, "tls": None, "fp": "", "bytes": 0, "ms": 0, "src": "", "err": "tcp: timeout"}] * 3
+        if kind == "vpn":
+            for c in t["conn"]:
+                c["src"] = s["nodes"][first]["ip"]
+        targets.append(t)
+    lists = [{"host": h, "list": "white", "ok": True, "err": ""} for h in s["lists"]["white"]]
+    lists += [{"host": h, "list": "black", "ok": False, "err": "tls: timeout"} for h in s["lists"]["black"]]
+    rep = {"v": 1, "session": "deadbeef" if kind == "alien" else s["id"], "remap": kind != "vpn",
+           "client": {"os": "Windows 10.0", "vpn": [], "proxy": "none"}, "lists": lists, "targets": targets}
+    if kind == "token":
+        rep["note"] = token
+    return rep
+
+
+for kind in ("block", "vpn", "token", "alien"):
+    with open(f"/root/iof-test-probe-{kind}.json", "w") as f:
+        json.dump(report(kind), f)
+PY
+}
+
+# Мишень узла $1 из текущей сессии отвечает с токеном и молчит без него, по TLS и по UDP. Строки ok/fail
+probe_answers() {
+  on_in "$M" python3 - "$1" <<'PY'
+import json, socket, ssl, sys
+s = json.load(open("/root/iof/audit/probe/session.json"))
+token = open("/root/iof/audit/probe/token").read().strip().encode()
+n = s["nodes"][sys.argv[1]]
+ip, port = n["ip"], n["port"]
+
+
+def tls(line):
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    got = b""
+    try:
+        c = ctx.wrap_socket(socket.create_connection((ip, port), timeout=10))
+        c.sendall(line)
+        while len(got) < 262144 + 64:
+            x = c.recv(65536)
+            if not x:
+                break
+            got += x
+            if got.startswith(b"OK ") and b"\n" in got and len(got.split(b"\n", 1)[1]) >= 262144:
+                break
+        c.close()
+    except OSError:
+        pass
+    return got
+
+
+def udp(data):
+    u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    u.settimeout(1.5)
+    u.sendto(data, (ip, port))
+    try:
+        return u.recv(2048)
+    except OSError:
+        return b""
+
+
+def say(good, text):
+    print(("ok" if good else "fail") + "\t" + text)
+
+
+a, b = tls(b"hello\n"), tls(b"IOF-PROBE " + token + b"\n")
+say(a == b"", f"мишень {sys.argv[1]}: TLS без токена — ничего ({len(a)} байт)")
+say(b.startswith(b"OK ") and len(b.split(b"\n", 1)[1]) == 262144, f"мишень {sys.argv[1]}: TLS с токеном — ответ и 256 КБ ({len(b)} байт)")
+c, d = udp(b"hello" * 8), udp(b"IOFP" + token + b"12345678")
+say(c == b"", f"мишень {sys.argv[1]}: UDP без токена — ничего ({len(c)} байт)")
+say(d == b"IOFP" + b"\0" * len(token) + b"12345678", f"мишень {sys.argv[1]}: UDP с токеном — пакет с затёртым токеном ({len(d)} байт)")
+PY
+}
+
+# Строки ok/fail от python на сервере в итоги проверки
+tally() {
+  local line
+  while IFS= read -r line; do
+    case "$line" in
+      ok$'\t'*)   ok "${line#ok$'\t'}" ;;
+      fail$'\t'*) fail "${line#fail$'\t'}" ;;
+      *)          echo "$line" | mask ;;
+    esac
+  done <<<"$1"
+}
+
+# Проверка с ПК (iof audit probe). Мишени поднимаются на узлах с python3, узел без него получает
+# «не проверяется». На первом узле с python3, который не управляющий сервер, входящие запрещены
+# политикой DROP: мишень открывает свой порт правилом и снимает его. Мишени отвечают с токеном
+# и молчат без него, готовый отчёт даёт ожидаемые оценки, отчёт с токеном и чужой не принимаются,
+# токена нет в выводе и результатах. После stop и по сроку (RuntimeMaxSec) на узлах ничего не остаётся
+check_probe() {
+  local out start n node="" got token nopy=() first
+  PROBE_PY=()
+  for n in "${NAMES[@]}"; do
+    if on "$n" bash -c 'command -v python3' >/dev/null 2>&1; then
+      PROBE_PY+=("$n")
+      if [[ "$n" != "$M" && -z "$node" ]]; then node="$n"; fi
+    else
+      nopy+=("$n")
+    fi
+  done
+  if (( ${#PROBE_PY[@]} == 0 )); then fail "проверка с ПК: ни на одном узле нет python3"; return 1; fi
+  first="${PROBE_PY[0]}"
+  PROBE_LEFT=1
+  iofm audit probe stop >/dev/null 2>&1 || true
+  if [[ -n "$node" ]]; then
+    PROBE_FW_LEFT="$node"
+    probe_fw "$node" on
+  fi
+
+  if start="$(iofm audit probe start --ttl 600 2>&1)"; then ok "iof audit probe start"; else fail "iof audit probe start"; details "$start"; return 1; fi
+  for n in "${PROBE_PY[@]}"; do
+    if grep -qE "^  $n +порт [0-9]+ +контроль: (ping [0-9]/[0-9] · )?TCP 3/3 · TLS 3/3 · данные 3/3 · UDP 5/5 · QUIC 5/5" <<<"$start"; then
+      ok "мишень $n: контроль с управляющего сервера прошёл все слои"
+    else
+      fail "мишень $n: контроль прошёл не все слои"
+      details "$start"
+    fi
+  done
+  for n in "${nopy[@]}"; do
+    if grep -qE "^  $n +не проверяется: нет python3.*apt install python3" <<<"$start"; then
+      ok "мишень $n: нет python3 — не проверяется, с командой"
+    else
+      fail "мишень $n без python3: нет строки «не проверяется»"
+    fi
+  done
+  if (( ${#nopy[@]} == 0 )); then echo "      узла без python3 нет: этот случай не проверялся"; fi
+  if [[ -n "$node" ]]; then
+    got="$(probe_left "$node")"
+    if [[ "$got" == "1 1 2" ]]; then ok "мишень $node: входящие запрещены, порт открыт правилами iof-probe"; else fail "мишень $node при запрете входящих: «$got», ожидалось «1 1 2»"; fi
+  fi
+  tally "$(probe_answers "$first")"
+
+  probe_reports "$first"
+  if out="$(on "$M" bash -c 'iof audit probe import < /root/iof-test-probe-block.json' 2>&1)"; then ok "iof audit probe import"; else fail "iof audit probe import"; details "$out"; fi
+  got="$(probe_result "$first")"
+  if [[ "$got" == "crit high" ]]; then ok "отчёт: у $first с ПК не проходит TCP — проблема, уверенность высокая"; else fail "отчёт: $first — «$got», ожидалось «crit high»"; fi
+  for n in "${PROBE_PY[@]:1}"; do
+    got="$(probe_result "$n")"
+    if [[ "$got" == "good high" ]]; then ok "отчёт: $n — всё проходит"; else fail "отчёт: $n — «$got», ожидалось «good high»"; fi
+  done
+  for n in "${nopy[@]}"; do
+    got="$(probe_result "$n")"
+    if [[ "$got" == none* ]]; then ok "отчёт: $n без мишени — нет данных"; else fail "отчёт: $n — «$got», ожидалось «none»"; fi
+  done
+  if out="$(on "$M" bash -c 'iof audit probe import < /root/iof-test-probe-vpn.json' 2>&1)" \
+     && [[ "$(probe_result "$first")" == "none low" ]] && grep -q "адрес узла $first" <<<"$out"; then
+    ok "отчёт через VPN (IP источника — адрес $first): уверенность низкая, оценок нет"
+  else
+    fail "отчёт через VPN: «$(probe_result "$first")»"
+    details "$out"
+  fi
+  if out="$(on "$M" bash -c 'iof audit probe import < /root/iof-test-probe-token.json' 2>&1)"; then
+    fail "отчёт с токеном мишеней принят"
+  elif grep -q 'токен' <<<"$out"; then ok "отчёт с токеном мишеней отклонён"; else fail "отчёт с токеном: «$out»"; fi
+  if out="$(on "$M" bash -c 'iof audit probe import < /root/iof-test-probe-alien.json' 2>&1)"; then
+    fail "отчёт от другой проверки принят"
+  elif grep -q 'другой проверки' <<<"$out"; then ok "отчёт от другой проверки отклонён"; else fail "отчёт от другой проверки: «$out»"; fi
+
+  token="$(on "$M" cat /root/iof/audit/probe/token)"
+  if [[ -z "$token" ]]; then
+    fail "проверка с ПК: нет токена мишеней, утечку проверить нечем"
+  elif grep -qF -- "$token" <<<"$start" \
+     || on "$M" bash -c 'grep -rqF --exclude=token -- "$0" /root/iof/audit || iof api audit | grep -qF -- "$0" || iof audit probe list | grep -qF -- "$0"' "$token"; then
+    fail "токен мишеней попал в вывод iof или результаты"
+  else
+    ok "токена мишеней нет в выводе probe start, /root/iof/audit, iof api audit и probe list"
+  fi
+
+  out="$(iofm audit probe stop 2>&1)" || true
+  for n in "${PROBE_PY[@]}"; do
+    got="$(probe_left "$n")"
+    if [[ "$got" == "0 0 0" ]]; then ok "мишень $n: после stop ничего не осталось"; else fail "мишень $n после stop: «$got» (юнитов, папок, правил)"; details "$out"; fi
+  done
+
+  # По сроку: systemd останавливает мишени сам, ExecStopPost снимает правило и файлы
+  if ! out="$(iofm audit probe start --ttl 20 2>&1)"; then fail "iof audit probe start --ttl 20"; details "$out"; fi
+  sleep 28
+  for n in "${PROBE_PY[@]}"; do
+    got="$(probe_left "$n")"
+    if [[ "$got" == "0 0 0" ]]; then ok "мишень $n: по сроку (RuntimeMaxSec) исчезла вместе с правилами"; else fail "мишень $n через 28 с при сроке 20 с: «$got»"; fi
+  done
+  iofm audit probe stop >/dev/null 2>&1 || true
+  on "$M" bash -c 'rm -f /root/iof-test-probe-*.json'
+  PROBE_LEFT=0
+  if [[ -n "$node" ]]; then
+    probe_fw "$node" off
+    PROBE_FW_LEFT=""
+  fi
+}
+
+# После проверки с ПК из панели (check_panel): задача с отчётом остановила мишени
+check_probe_after() {
+  local n got
+  for n in "${PROBE_PY[@]}"; do
+    got="$(probe_left "$n")"
+    if [[ "$got" == "0 0 0" ]]; then ok "панель: после отчёта мишени на $n остановлены"; else fail "панель: после отчёта на $n осталось «$got»"; fi
+  done
+}
+
 # Панель на управляющем сервере: страницы и API, защита от DNS rebinding и CSRF, задача iof
 # из панели (создать и удалить группу ссылок), терминал на каждый узел через WebSocket.
 # Проверяет python3 на сервере, он там есть для панели
 check_panel() {
   local out rc line
-  out="$(on_in "$M" python3 - "$PANEL_GROUP" "${NAMES[*]}" 2>&1 <<'PY'
-import base64, json, os, socket, struct, sys, time, urllib.error, urllib.request
+  out="$(on_in "$M" python3 - "$PANEL_GROUP" "${NAMES[*]}" "${PROBE_PY[*]}" 2>&1 <<'PY'
+import base64, json, os, re, socket, struct, sys, time, urllib.error, urllib.request
 
 BASE = "http://127.0.0.1:8088"
 label, nodes = sys.argv[1], set(sys.argv[2].split())
+probe_nodes = sys.argv[3].split() if len(sys.argv) > 3 else []
 POST = {"X-IOF-Request": "1", "Content-Type": "application/json", "Origin": BASE}
 
 
@@ -310,22 +1024,29 @@ def report(good, text):
     print(("ok" if good else "fail") + "\t" + text, flush=True)
 
 
-def job(body, title):
-    code, resp = req("/api/hy2", "POST", body, POST)
+def job(body, title, path="/api/hy2"):
+    code, resp = req(path, "POST", body, POST)
     if code != 202:
         report(False, f"{title}: ответ {code} {resp.decode('utf-8', 'replace')[:200]}")
-        return
-    jid = json.loads(resp)["job"]
+        return None
+    data = json.loads(resp)
+    wait_job(lambda j: j["id"] == data["job"], title)
+    return data
+
+
+# Ждёт первую задачу, подходящую под match, и отчитывается, как она закончилась
+def wait_job(match, title):
     deadline = time.time() + 300
     while time.time() < deadline:
-        j = next((j for j in json.loads(req("/api/jobs")[1])["jobs"] if j["id"] == jid), None)
+        j = next((j for j in json.loads(req("/api/jobs")[1])["jobs"] if match(j)), None)
         if j and j["state"] != "running":
             report(j["state"] == "ok", f"{title}: задача завершилась ({j['state']})")
             if j["state"] != "ok":
                 print("\n".join("      " + line for line in j["log"][-10:]))
-            return
+            return j
         time.sleep(1)
     report(False, f"{title}: задача не завершилась за 5 минут")
+    return None
 
 
 def group(data):
@@ -454,6 +1175,90 @@ if g:
     code, body = req("/api/hy2")
     report(code == 200 and group(json.loads(body)) is None, f"панель: группы «{label}» больше нет")
 
+# Страница «Безопасность»: результаты аудита по всем узлам, проверка одного узла задачей панели
+code, body = req("/api/security")
+sec = json.loads(body) if code == 200 else {}
+checked = set(sec.get("blocks", {}).get("server", {}).get("nodes", {}))
+report(code == 200 and not sec.get("error") and checked == nodes and len(sec.get("catalog", [])) >= 15,
+       f"панель: /api/security ({code}), проверены узлы: {' '.join(sorted(checked)) or 'нет'}"
+       + (f", ошибка: {sec['error']}" if sec.get("error") else ""))
+dpi = sec.get("blocks", {}).get("dpi", {}).get("nodes", {})
+ids = {c["id"] for c in sec.get("catalog", []) if c["block"] == "dpi"}
+done = {n for n, v in dpi.items() if v.get("reachable") and {c["id"] for c in v["checks"]} == ids}
+report(done == nodes and len(ids) >= 20,
+       f"панель: блок dpi в /api/security, проверок в справочнике: {len(ids)}, узлы со всеми оценками: {' '.join(sorted(done)) or 'нет'}")
+code, _ = req("/api/security", "POST", {"block": "нет-такого", "node": ""}, POST)
+report(code == 400, f"панель: проверка неизвестного блока отклонена ({code})")
+code, _ = req("/api/security", "POST", {"block": "server", "node": "нет-такого"}, POST)
+report(code == 400, f"панель: проверка неизвестного узла отклонена ({code})")
+one = sorted(nodes)[0]
+before = sec.get("blocks", {}).get("server", {}).get("nodes", {}).get(one, {}).get("at", 0)
+time.sleep(1)
+job({"block": "server", "node": one}, f"панель: аудит узла {one}", "/api/security")
+code, body = req("/api/security")
+after = json.loads(body)["blocks"]["server"]["nodes"].get(one, {}) if code == 200 else {}
+report(after.get("reachable") is True and after.get("at", 0) > before, f"панель: результат аудита {one} обновился")
+before = dpi.get(one, {}).get("at", 0)
+job({"block": "dpi", "node": one}, f"панель: проверка блока dpi на {one}", "/api/security")
+code, body = req("/api/security")
+after = json.loads(body)["blocks"]["dpi"]["nodes"].get(one, {}) if code == 200 else {}
+report(after.get("reachable") is True and after.get("at", 0) > before, f"панель: результат блока dpi на {one} обновился")
+
+# Проверка с ПК из панели: мишени задачей, скрипт по одноразовому билету с данными проверки, отчёт
+# по тому же билету, задача остановки мишеней и импорта. Чужой и повторный билет отклоняются,
+# токена мишеней нет в ответах панели и логах задач. Функция, чтобы имена не затёрли ticket() терминала
+def probe_panel(one):
+    started = job({"action": "start", "nodes": [one], "origin": BASE}, f"панель: мишень проверки с ПК на {one}", "/api/probe")
+    ticket = (started or {}).get("ticket") or ""
+    try:
+        token = open("/root/iof/audit/probe/token", encoding="utf-8").read().strip()
+    except OSError:
+        token = ""
+    code, body = req("/api/probe")
+    st = json.loads(body) if code == 200 else {}
+    panel = st.get("panel") or {}
+    report(bool(ticket) and panel.get("ticket") == ticket and (st.get("session") or {}).get("nodes", {}).get(one, {}).get("state") == "started",
+           f"панель: /api/probe — сессия с мишенью на {one}, билет для ПК")
+    leaks = [p for p in ("/api/probe", "/api/security", "/api/jobs") if token and token in req(p)[1].decode("utf-8", "replace")]
+    report(bool(token) and not leaks, "панель: токена мишеней нет в /api/probe, /api/security и логах задач" + (f" (есть в {', '.join(leaks)})" if leaks else ""))
+    code, _ = req("/api/probe/script?t=wrong")
+    report(code == 403, f"панель: скрипт по неверному билету не выдан ({code})")
+    code, _ = req(f"/api/probe/script?t={ticket}", headers={"Host": "evil.example"})
+    report(code == 403, f"панель: скрипт с чужим Host не выдан ({code})")
+    code, body = req(f"/api/probe/script?t={ticket}")
+    m = re.search(r"\$IofProbeConfig = '([A-Za-z0-9+/=]+)'", body.decode("utf-8", "replace")) if code == 200 else None
+    cfg = json.loads(base64.b64decode(m.group(1))) if m else {}
+    report(code == 200 and cfg.get("ticket") == ticket and cfg.get("token") == token
+           and [t["node"] for t in cfg.get("targets", [])] == [one],
+           f"панель: скрипт для ПК выдан с мишенью {one} и билетом ({code})")
+    code, _ = req(f"/api/probe/script?t={ticket}")
+    report(code == 403, f"панель: второй раз скрипт по тому же билету не выдан ({code})")
+    ok_conn = {"tcp": 2, "tls": 3, "fp": "match", "bytes": 262144, "ms": 50, "src": "172.30.0.99", "err": ""}
+    rep = {"v": 1, "session": cfg.get("session", ""), "remap": True, "client": {"os": "Windows 10.0", "vpn": [], "proxy": "none"},
+           "lists": [], "targets": [{"node": t["node"], "icmp": {"sent": 3, "got": 3, "ms": 40}, "conn": [ok_conn] * 3,
+                                     "udp": {"sent": 5, "got": 5, "closed": False}, "quic": {"sent": 5, "got": 5, "closed": False},
+                                     "hy2": "vn" if t.get("hy2") else "", "tunnel": {"tested": False, "reason": "nohysteria"}}
+                                    for t in cfg.get("targets", [])]}
+    code, _ = req("/api/probe/result?t=wrong", "POST", rep, POST)
+    report(code == 403, f"панель: отчёт по неверному билету отклонён ({code})")
+    code, _ = req(f"/api/probe/result?t={ticket}", "POST", rep, {"Content-Type": "application/json"})
+    report(code == 403, f"панель: отчёт без X-IOF-Request отклонён ({code})")
+    # Как PowerShell: без Origin и без пароля панели
+    code, _ = req(f"/api/probe/result?t={ticket}", "POST", rep, {"Content-Type": "application/json", "X-IOF-Request": "1"})
+    report(code == 202, f"панель: отчёт с ПК принят ({code})")
+    wait_job(lambda j: j["kind"] == "probe" and "результат" in j["title"] and j["started"] > time.time() - 120,
+             "панель: остановка мишеней и приём отчёта")
+    code, body = req("/api/security")
+    last = (json.loads(body).get("probe") or {}).get("last") or {} if code == 200 else {}
+    report(last.get("session") == cfg.get("session") and last.get("nodes", {}).get(one, {}).get("status") == "good",
+           f"панель: результат проверки с ПК — {one} доступен")
+    code, _ = req(f"/api/probe/result?t={ticket}", "POST", rep, {"Content-Type": "application/json", "X-IOF-Request": "1"})
+    report(code == 403, f"панель: второй отчёт по тому же билету отклонён ({code})")
+
+
+if probe_nodes:
+    probe_panel(probe_nodes[0])
+
 # Терминал: stand.sh setup включает его в web.env (IOF_WEB_TERMINAL=1)
 for node in sorted(nodes):
     terminal(node)
@@ -470,13 +1275,7 @@ if t:
 PY
 )"
   rc=$?
-  while IFS= read -r line; do
-    case "$line" in
-      ok$'\t'*)   ok "${line#ok$'\t'}" ;;
-      fail$'\t'*) fail "${line#fail$'\t'}" ;;
-      *)          echo "$line" | mask ;;
-    esac
-  done <<<"$out"
+  tally "$out"
   if (( rc != 0 )); then fail "проверка панели завершилась с кодом $rc"; fi
 }
 
@@ -500,8 +1299,21 @@ step "Ретранслятор"
 check_relay
 check_hy2_del
 check_restart
+step "Смена портов Hysteria2"
+check_hop
+step "Аудит безопасности"
+check_audit
+step "Защита от РКН"
+check_dpi
+step "Блок-лист сканеров"
+check_block
+step "Действия во время переноса"
+check_guard
+step "Проверка с ПК"
+check_probe
 step "Веб-панель"
 check_panel
+check_probe_after
 step "Узлы после проверки"
 check_nodes
 

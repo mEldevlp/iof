@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # Статические проверки репозитория: синтаксис, shellcheck, pyflakes и правила проекта из CLAUDE.md,
-# которые легко забыть (NODE_FUNCS, STATIC_FILES, CSP панели, переводы строк LF).
+# которые легко забыть (NODE_FUNCS, STATIC_FILES, CSP панели, probe.ps1, переводы строк LF).
 # CI запускает её на каждый push, локально: bash ci/lint.sh (Linux, WSL или Git Bash).
 # Если shellcheck, python3 или pyflakes не установлены, их проверки пропускаются, а в CI это ошибка.
 set -uo pipefail
@@ -138,6 +138,23 @@ check_csp() {
   fi
 }
 
+# Боковое меню повторено в каждом html: пункты должны совпадать, отличается только отметка
+# текущего пункта aria-current (page, а на странице узла true у «Обзора»)
+check_menu() {
+  local f ref cur bad=""
+  ref="$(sed -n '/<nav class="nav"/,/<\/nav>/p' web/static/index.html | sed -E 's/ aria-current="[a-z]+"//')"
+  for f in web/static/*.html; do
+    cur="$(sed -n '/<nav class="nav"/,/<\/nav>/p' "$f")"
+    if [[ "$(sed -E 's/ aria-current="[a-z]+"//' <<<"$cur")" != "$ref" ]]; then bad+="$f "; fi
+    if [[ "$(grep -c 'aria-current=' <<<"$cur")" != "1" ]]; then bad+="$f(aria-current) "; fi
+  done
+  if [[ -z "$bad" ]]; then
+    ok "меню: одинаковое во всех html ($(grep -c '<a href' <<<"$ref") пунктов)"
+  else
+    fail "меню отличается от index.html или текущий пункт не отмечен: $bad"
+  fi
+}
+
 # Сторонний код на месте и с заголовком: какой пакет npm и какая версия
 check_vendor() {
   local f head bad=""
@@ -149,6 +166,36 @@ check_vendor() {
     ok "сторонний код: $(head -n 1 web/static/xterm.js | grep -oE '@xterm/[a-z-]+ [0-9.]+'), $(head -n 1 web/static/xterm-fit.js | grep -oE '@xterm/[a-z-]+ [0-9.]+')"
   else
     fail "сторонний код: нет файла или первой строки с пакетом и версией: $bad"
+  fi
+}
+
+# Скрипт проверки с ПК: на месте, только ASCII (Windows PowerShell 5.1 читает файл без BOM в кодировке
+# ANSI), одна метка, куда панель вписывает данные проверки, и разбирается парсером PowerShell, если он
+# есть: pwsh на раннерах GitHub, powershell.exe в Windows. Без PowerShell разбор пропускается
+check_probe() {
+  local f="web/probe.ps1" n ps path out
+  if [[ ! -f "$f" ]]; then fail "probe.ps1: нет $f, его отдаёт панель для проверки с ПК"; return; fi
+  n="$(LC_ALL=C tr -d '\000-\177' < "$f" | wc -c)"
+  if (( n == 0 )); then ok "probe.ps1: только ASCII"; else fail "probe.ps1: не ASCII байт: $n"; fi
+  n="$(grep -c '__IOF_PROBE_CONFIG__' "$f")"
+  if [[ "$n" == "1" ]]; then ok "probe.ps1: одна метка для данных проверки"; else fail "probe.ps1: метка __IOF_PROBE_CONFIG__ должна быть одна, а их $n"; fi
+  if command -v pwsh >/dev/null 2>&1; then
+    ps=pwsh
+    path="$ROOT/$f"
+  elif command -v powershell.exe >/dev/null 2>&1 && command -v cygpath >/dev/null 2>&1; then
+    ps=powershell.exe
+    path="$(cygpath -w "$ROOT/$f")"
+  else
+    echo "skip  probe.ps1: нет PowerShell для разбора"
+    return
+  fi
+  local script="\$t = \$null; \$e = \$null; [void][Management.Automation.Language.Parser]::ParseFile('$path', [ref]\$t, [ref]\$e);"
+  script+=" \$e | ForEach-Object { [string]\$_.Extent.StartLineNumber + ': ' + \$_.Message }; exit [int](\$e.Count -gt 0)"
+  if out="$("$ps" -NoProfile -NonInteractive -Command "$script" 2>&1)"; then
+    ok "probe.ps1: разбирается ($ps)"
+  else
+    fail "probe.ps1: ошибки разбора ($ps)"
+    details "$out"
   fi
 }
 
@@ -167,7 +214,9 @@ check_js
 check_node_funcs
 check_static
 check_csp
+check_menu
 check_vendor
+check_probe
 check_eol
 
 echo

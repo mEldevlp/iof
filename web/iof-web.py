@@ -6,9 +6,11 @@
 Ссылки Hysteria2 (в них пароль) отдаёт на странице hy2, ключи и конфиги AWG не отдаёт.
 Меняет что-то только через команды iof (добавление сервера: iof node add, iof hy2 install;
 группы ссылок: iof hy2 add | del | refresh; действия с узлом: iof hy2 restart | install, iof node del;
-обновление: iof update; перенос управляющего сервера: iof migrate), по одной задаче за раз,
+обновление: iof update; перенос управляющего сервера: iof migrate; проверка безопасности:
+iof audit run, она узлы только читает; проверка с ПК: iof audit probe), по одной задаче за раз,
 с логом выполнения. Исключение — терминал на узел со страницы узла (ssh с ключом iof через
-WebSocket): он включается отдельно, IOF_WEB_TERMINAL=1.
+WebSocket): он включается отдельно, IOF_WEB_TERMINAL=1. Скрипт проверки с ПК и его отчёт ходят
+по одноразовому билету вместо пароля панели.
 
 Без зависимостей, нужен только python3. По умолчанию слушает 127.0.0.1:8088,
 снаружи заходить через SSH-туннель:  ssh -L 8088:127.0.0.1:8088 admin@сервер
@@ -63,6 +65,8 @@ STATIC_FILES = {
     "/node.js": ("node.js", "text/javascript; charset=utf-8"),
     "/service.html": ("service.html", "text/html; charset=utf-8"),
     "/service.js": ("service.js", "text/javascript; charset=utf-8"),
+    "/security.html": ("security.html", "text/html; charset=utf-8"),
+    "/security.js": ("security.js", "text/javascript; charset=utf-8"),
     "/term.js": ("term.js", "text/javascript; charset=utf-8"),
     "/xterm.js": ("xterm.js", "text/javascript; charset=utf-8"),
     "/xterm-fit.js": ("xterm-fit.js", "text/javascript; charset=utf-8"),
@@ -144,6 +148,7 @@ def shape_node(r):
             "state": r.get("hy2_state", ""),
             "udp": r.get("hy2_udp") == "yes",
             "port": r.get("hy2_port", ""),
+            "range": r.get("hy2_range", ""),
             "auth": r.get("hy2_auth", ""),
             "users": to_int(r.get("hy2_users")),
             "version": r.get("hy2_ver", ""),
@@ -266,17 +271,21 @@ def read_relays(base):
 SAFE_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
+HY2_PORTS = re.compile(r"^[0-9]+([,-][0-9]+)*$")
+
+
 def parse_hy2_link(url):
-    """hy2://пароль@хост:порт/?...#Подпись%20%7C%20Узел -> поля для страницы без пароля."""
+    """hy2://пароль@хост:порт/?...#Подпись%20%7C%20Узел -> поля для страницы без пароля. У группы
+    со сменой портов порт — список «443,10000-19999»: urlsplit его не разбирает, он берётся строкой."""
     u = urlsplit(url)
     title = unquote(u.fragment)
     node = title.split(" | ", 1)[1] if " | " in title else title
-    try:
-        port = u.port
-    except ValueError:
-        port = None
-    return {"url": url, "title": title, "node": node, "host": u.hostname or "",
-            "port": port, "relay": " via " in node}
+    hostport = u.netloc.rsplit("@", 1)[-1]
+    host, _, ports = hostport.rpartition(":")
+    if not host or not HY2_PORTS.match(ports):
+        host, ports = hostport, ""
+    return {"url": url, "title": title, "node": node, "host": host.strip("[]"),
+            "port": ports or None, "hop": "," in ports or "-" in ports, "relay": " via " in node}
 
 
 def hy2_group_file(base, name):
@@ -299,6 +308,8 @@ def read_hy2_groups(base):
             continue
         g["file"] = str(path)
         g["links"] = [parse_hy2_link(url) for url in read_hy2_links(path)]
+        # Метка iof hy2 add --hop: в ссылках группы список портов
+        g["hop"] = (base / "hy2" / f"{g['name']}.hop").exists()
         groups.append(g)
     return groups
 
@@ -442,6 +453,27 @@ def iof_api(iof, args, timeout):
     return out, None
 
 
+def iof_json(iof, args, timeout):
+    """Вывод iof api ... в виде JSON (iof api audit) -> (объект, ошибка или None)."""
+    env = dict(os.environ, LC_ALL="C.UTF-8", LANG="C.UTF-8")
+    try:
+        p = subprocess.run([iof, *args], capture_output=True, timeout=timeout, env=env, stdin=subprocess.DEVNULL)
+    except FileNotFoundError:
+        return {}, f"не найден {iof}"
+    except subprocess.TimeoutExpired:
+        return {}, f"iof {' '.join(args)} не уложился в {timeout} секунд"
+    if p.returncode != 0:
+        err = p.stderr.decode("utf-8", "replace").strip().splitlines()
+        return {}, (err[-1] if err else f"iof завершился с кодом {p.returncode}").removeprefix("Ошибка: ")
+    try:
+        data = json.loads(p.stdout.decode("utf-8", "replace"))
+    except ValueError:
+        data = None
+    if not isinstance(data, dict):
+        return {}, f"iof {' '.join(args)} вернул не JSON"
+    return data, None
+
+
 # Задачи: команды iof, которые что-то меняют. Одна за раз, лог хранится в памяти
 
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
@@ -474,7 +506,7 @@ class Jobs:
 
     def start(self, title, steps, kind):
         """steps: [(подпись для лога, argv, stdin bytes или None)], kind: по нему страница находит
-        свои задачи (node, migrate, hy2, service, node:<имя>). None, если занято."""
+        свои задачи (node, migrate, hy2, service, audit, node:<имя>). None, если занято."""
         with self.lock:
             if self.running:
                 return None
@@ -652,9 +684,17 @@ def hy2_steps(iof, body, groups, migrate):
             raise ValueError("подпись: обязательна")
         if any(c in label for c in "|\t\r\n"):
             raise ValueError("подпись не может содержать |")
-        # Повтор с той же подписью пересобирает группу, как и в терминале
-        verb = "Пересборка" if any(g["label"] == label for g in groups) else "Создание"
-        return f"{verb} группы «{label}»", [step(iof, "hy2", "add", label)]
+        # Повтор с той же подписью пересобирает группу, как и в терминале. hop: true или false
+        # включает или выключает список портов в ссылках группы, без него остаётся как было
+        hop = body.get("hop")
+        if hop is not None and not isinstance(hop, bool):
+            raise ValueError("hop: true или false")
+        extra = [] if hop is None else ["--hop" if hop else "--no-hop"]
+        if hop is not None:
+            verb = "Список портов в ссылках: " + ("включение" if hop else "выключение") + ", группа"
+        else:
+            verb = "Пересборка группы" if any(g["label"] == label for g in groups) else "Создание группы"
+        return f"{verb} «{label}»", [step(iof, "hy2", "add", label, *extra)]
     if action == "del":
         name = text_field(body, "name", 100)
         group = next((g for g in groups if g["name"] == name), None)
@@ -705,6 +745,201 @@ def service_steps(iof, body):
     argv = ["systemd-run", "--unit=iof-update", "--collect", "--quiet", "--wait", "--pipe",
             "--setenv=LC_ALL=C.UTF-8", "/bin/bash", "-c", script]
     return "Обновление iof и панели", [("iof update", argv, None)]
+
+
+# Блоки страницы «Безопасность», которые умеет проверять iof audit run
+AUDIT_BLOCKS = {"server": "Аудит сервера", "dpi": "Защита от РКН"}
+
+# Действия из проверок блока «Защита от РКН»: iof сам меняет узел. Всегда на одном узле,
+# после действия узел проверяется заново, чтобы проверка показала новое состояние
+AUDIT_ACTIONS = {
+    "hop_on": ("Смена портов Hysteria2: включение", ("hy2", "hop", "on")),
+    "hop_off": ("Смена портов Hysteria2: выключение", ("hy2", "hop", "off")),
+    "hy2_upgrade": ("Обновление Hysteria2", ("hy2", "upgrade")),
+    "block_on": ("Блок-лист сканеров: применение", ("block", "on")),
+    "block_update": ("Блок-лист сканеров: обновление", ("block", "update")),
+    "block_off": ("Блок-лист сканеров: снятие", ("block", "off")),
+}
+
+
+def audit_steps(iof, body, nodes, migrate):
+    """Кнопки «Проверить» и действия в проверках на странице «Безопасность» -> (заголовок задачи,
+    шаги). nodes — имена из nodes.conf. Проверка узлы не меняет и идёт во время переноса управления,
+    действия меняют, поэтому при переносе запрещены и выполняются только на одном узле."""
+    action = body.get("action")
+    if action is not None:
+        if action not in AUDIT_ACTIONS:
+            raise ValueError("неизвестное действие")
+        not_migrating(migrate)
+        name = text_field(body, "node", 40)
+        # iof принимает шаблоны узлов, а all значит «все»: из панели — только один узел по имени
+        if not name or name not in nodes or name == "all":
+            raise ValueError("выбери узел из nodes.conf")
+        title, args = AUDIT_ACTIONS[action]
+        return f"{title}, {name}", [step(iof, *args, name), step(iof, "-n", name, "audit", "run", "dpi")]
+    block, name = body.get("block"), text_field(body, "node", 40)
+    if block not in AUDIT_BLOCKS:
+        raise ValueError("неизвестный блок проверок")
+    if not name:
+        return f"{AUDIT_BLOCKS[block]}: все узлы", [step(iof, "audit", "run", block)]
+    # iof -n принимает шаблоны, а all значит «все»
+    if name not in nodes or name == "all":
+        raise ValueError(f"узла {name} нет в nodes.conf")
+    return f"{AUDIT_BLOCKS[block]}: {name}", [step(iof, "-n", name, "audit", "run", block)]
+
+
+# Проверка доступности узлов с ПК (iof audit probe). Страница запускает мишени задачей Jobs и
+# получает одноразовый билет. По билету скрипт probe.ps1 забирается один раз (в него вписываются
+# мишени, их отпечатки, токен и сам билет) и один раз сдаёт сырой отчёт. Пароль панели на этих
+# двух адресах не спрашивается: PowerShell его не знает, вместо него билет. Отчёт уходит в
+# iof audit probe import задачей Jobs после остановки мишеней, а если Jobs занят, ждёт в памяти
+
+PROBE_SCRIPT = Path(__file__).resolve().parent / "probe.ps1"
+PROBE_PLACEHOLDER = "__IOF_PROBE_CONFIG__"
+PANEL_ORIGIN = re.compile(r"^https?://[A-Za-z0-9.:\[\]-]+$")
+
+
+class Probes:
+    MAX_REPORT = 262144  # байт в отчёте
+    GRACE = 300          # секунд после конца мишеней, пока отчёт ещё принимается
+    START_WAIT = 600     # секунд на запуск мишеней, пока сессии ещё нет
+
+    def __init__(self, base):
+        self.dir = base / "audit" / "probe"
+        self.lock = threading.Lock()
+        self.s = None  # проверка, начатая из панели: билет, адрес панели, что уже забрано
+
+    def session(self):
+        """session.json от iof audit probe start или None."""
+        try:
+            data = json.loads((self.dir / "session.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        return data if isinstance(data, dict) and isinstance(data.get("nodes"), dict) else None
+
+    def mine(self, s, sess):
+        """Сессия iof создана этой проверкой панели, а не раньше неё или из терминала."""
+        return bool(s and sess and sess.get("started", 0) >= s["created"] - 5)
+
+    def active(self):
+        sess, now = self.session(), time.time()
+        with self.lock:
+            s = self.s
+            if not s or s["result_at"] or s["cancelled"]:
+                return False
+            if self.mine(s, sess):
+                return not sess.get("stopped") and now < sess.get("expires", 0) + self.GRACE
+            return now < s["created"] + self.START_WAIT
+
+    def begin(self, origin, job):
+        ticket = secrets.token_urlsafe(24)
+        with self.lock:
+            self.s = {"ticket": ticket, "origin": origin, "created": time.time(), "start_job": job,
+                      "script_at": None, "result_at": None, "pending": None, "job": None, "cancelled": False}
+        return ticket
+
+    def cancel(self):
+        with self.lock:
+            if self.s:
+                self.s["cancelled"] = True
+                self.s["pending"] = None
+
+    def check(self, ticket):
+        """Билет текущей проверки -> (проверка, сессия) или текст отказа."""
+        sess = self.session()
+        s = self.s
+        if not s or not ticket or not hmac.compare_digest(ticket.encode(), s["ticket"].encode()):
+            return "билет проверки неверный или устарел"
+        if s["cancelled"]:
+            return "проверку остановили, начни новую на странице «Безопасность»"
+        if not self.mine(s, sess):
+            return None
+        return s, sess
+
+    def take_script(self, ticket):
+        """Скрипт по билету один раз -> текст или (код, ошибка)."""
+        try:
+            template = PROBE_SCRIPT.read_text(encoding="utf-8")
+            token = (self.dir / "token").read_text(encoding="utf-8").strip()
+        except OSError:
+            template, token = "", ""
+        with self.lock:
+            got = self.check(ticket)
+            if isinstance(got, str):
+                return HTTPStatus.FORBIDDEN, got
+            if got is None:
+                return HTTPStatus.CONFLICT, "мишени ещё запускаются: подожди окончания задачи и повтори"
+            s, sess = got
+            if s["script_at"]:
+                return HTTPStatus.FORBIDDEN, "скрипт по этому билету уже выдан: начни новую проверку"
+            if sess.get("stopped") or time.time() > sess.get("expires", 0):
+                return HTTPStatus.FORBIDDEN, "мишени уже остановлены: начни новую проверку"
+            if PROBE_PLACEHOLDER not in template or not token:
+                return HTTPStatus.INTERNAL_SERVER_ERROR, f"нет {PROBE_SCRIPT} или токена мишеней, переустанови панель: sudo iof update"
+            s["script_at"] = time.time()
+        cfg = {
+            "v": 1, "session": sess["id"], "expires": sess["expires"], "origin": s["origin"], "ticket": s["ticket"],
+            "token": token, "lists": sess.get("lists", {}),
+            "targets": [{"node": name, "addr": n.get("addr", ""), "ip": n.get("ip", ""), "port": n.get("port", 0),
+                         "fp": n.get("fp", ""), "hy2": n.get("hy2_port") or 0}
+                        for name, n in sess["nodes"].items() if n.get("state") == "started"],
+        }
+        # base64 из JSON только с ASCII: Windows PowerShell 5.1 читает скрипт без BOM не как UTF-8
+        blob = base64.b64encode(json.dumps(cfg, ensure_ascii=True).encode("ascii")).decode("ascii")
+        return template.replace(PROBE_PLACEHOLDER, blob, 1)
+
+    def accept(self, ticket, report):
+        """Отчёт по билету один раз. None или текст отказа."""
+        with self.lock:
+            got = self.check(ticket)
+            if not isinstance(got, tuple):
+                return got or "мишени ещё запускаются"
+            s, sess = got
+            if not s["script_at"]:
+                return "по этому билету скрипт не выдавался"
+            if s["result_at"]:
+                return "отчёт по этому билету уже принят"
+            if report.get("session") != sess.get("id"):
+                return "отчёт от другой проверки"
+            if time.time() > sess.get("expires", 0) + self.GRACE:
+                return "проверка закончилась давно, отчёт больше не принимается: sudo iof audit probe import < файл"
+            s["result_at"] = time.time()
+            s["pending"] = json.dumps(report, ensure_ascii=False).encode("utf-8")
+        return None
+
+    def kick(self, jobs, iof):
+        """Отчёт, ожидающий своей очереди, в задачу: остановить мишени, затем import. Так мишени
+        не переживут проверку, даже если import откажет."""
+        with self.lock:
+            s = self.s
+            if not s or not s["pending"]:
+                return
+            report = s["pending"]
+            job = jobs.start("Проверка с ПК: результат", [step(iof, "audit", "probe", "stop"),
+                             ("iof audit probe import < отчёт с ПК", [iof, "audit", "probe", "import"], report)], "probe")
+            if job:
+                s["pending"], s["job"] = None, job["id"]
+
+    def state(self):
+        """Состояние для страницы: сессия iof без токена и отпечатков, билет, пока скрипт не забран."""
+        sess, now = self.session(), time.time()
+        with self.lock:
+            s = dict(self.s) if self.s else None
+        mine = self.mine(s, sess)
+        pub = None
+        if sess:
+            pub = {k: sess.get(k) for k in ("id", "started", "expires", "stopped")}
+            pub["nodes"] = {name: {k: n.get(k) for k in ("addr", "state", "port", "fw", "error", "local", "check")}
+                            for name, n in sess["nodes"].items()}
+        out = {"session": pub, "now": now, "panel": None}
+        if s and not s["cancelled"]:
+            live = mine and not sess.get("stopped") and now < sess.get("expires", 0)
+            out["panel"] = {
+                "mine": mine, "origin": s["origin"], "start_job": s["start_job"], "job": s["job"],
+                "ticket": s["ticket"] if (live or not mine) and not s["script_at"] else None,
+                "script_at": s["script_at"], "result_at": s["result_at"], "pending": bool(s["pending"]),
+            }
+        return out
 
 
 # Терминал на узел со страницы узла: xterm.js в браузере, WebSocket к панели, на сервере ssh на узел
@@ -1034,6 +1269,9 @@ class Handler(BaseHTTPRequestHandler):
         # Заголовок Authorization на WebSocket браузеры отправляют не всегда
         if url.path == "/api/term/ws":
             return self.term_ws(query.get("t", ""))
+        # Скрипт проверки с ПК тоже по одноразовому билету: его забирает PowerShell без пароля панели
+        if url.path == "/api/probe/script":
+            return self.probe_script(query.get("t", ""))
         if not self.authorized():
             return
         force = query.get("force") == "1"
@@ -1051,6 +1289,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.node_info(query.get("n", ""), force)
         if url.path == "/api/service":
             return self.service_info(query.get("fetch") == "1")
+        if url.path == "/api/security":
+            return self.security_info()
+        if url.path == "/api/probe":
+            return self.send_json(self.server.probes.state())
         if url.path == "/api/jobs":
             return self.send_json({"jobs": self.server.jobs.list()})
         if url.path in STATIC_FILES:
@@ -1058,16 +1300,27 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json({"error": "не найдено"}, HTTPStatus.NOT_FOUND)
 
     def do_POST(self):
-        if not self.host_allowed() or not self.authorized() or not self.same_origin():
+        if not self.host_allowed():
             return
-        path = urlsplit(self.path).path
-        if path not in ("/api/nodes", "/api/migrate", "/api/hy2", "/api/node", "/api/service", "/api/term"):
+        url = urlsplit(self.path)
+        path = url.path
+        # Отчёт скрипта с ПК: вместо пароля панели одноразовый билет, остальная защита как у всех POST
+        if path == "/api/probe/result":
+            if self.same_origin():
+                self.probe_result(parse_qs(url.query).get("t", [""])[0])
+            return
+        if not self.authorized() or not self.same_origin():
+            return
+        if path not in ("/api/nodes", "/api/migrate", "/api/hy2", "/api/node", "/api/service", "/api/security",
+                        "/api/term", "/api/probe"):
             return self.send_json({"error": "не найдено"}, HTTPStatus.NOT_FOUND)
         body = self.read_json()
         if body is None:
             return
         if path == "/api/term":
             return self.term_ticket(body)
+        if path == "/api/probe":
+            return self.probe_action(body)
         try:
             kind, title, steps = self.job_for(path, body)
         except ValueError as e:
@@ -1095,6 +1348,8 @@ class Handler(BaseHTTPRequestHandler):
             name, title, steps = node_steps(srv.iof, body, read_conf(srv.base / "nodes.conf", 4),
                                             read_relays(srv.base), srv.hy2_template, migrate)
             return f"node:{name}", title, steps
+        if path == "/api/security":
+            return ("audit", *audit_steps(srv.iof, body, self.node_names(), migrate))
         return ("service", *service_steps(srv.iof, body))
 
     # Защита от DNS rebinding: чужой домен, указывающий на 127.0.0.1, не получит ответ панели
@@ -1298,6 +1553,85 @@ class Handler(BaseHTTPRequestHandler):
             }
         self.send_json(data)
 
+    # Страница «Безопасность»: последние проверки iof audit по блокам и узлам, справочник проверок,
+    # история запусков. Узлы не опрашиваются: проверку запускает POST /api/security
+    def security_info(self):
+        data, error = iof_json(self.server.iof, ["api", "audit"], 20)
+        data.update({
+            "error": error,
+            "busy": self.server.jobs.busy(),
+            "migrate": read_migrate(self.server.base),
+            "probe_state": self.server.probes.state(),
+        })
+        self.send_json(data)
+
+    # POST /api/probe {action: start, nodes, origin} — мишени и билет для ПК; {action: cancel} — остановить.
+    # origin — адрес панели в браузере: по нему скрипт с ПК сдаст отчёт
+    def probe_action(self, body):
+        srv = self.server
+        action, ticket = body.get("action"), None
+        try:
+            not_migrating(read_migrate(srv.base))
+            if action == "start":
+                origin = text_field(body, "origin", 300).rstrip("/")
+                if not PANEL_ORIGIN.match(origin) or host_only(origin) not in srv.hosts:
+                    raise ValueError("адрес панели не из IOF_WEB_HOSTS: открой панель по имени из этого списка")
+                names = body.get("nodes") or []
+                if not isinstance(names, list) or len(names) > 500 or not all(isinstance(n, str) for n in names):
+                    raise ValueError("узлы: список имён")
+                known = self.node_names()
+                bad = next((n for n in names if n not in known or n == "all"), None)
+                if bad is not None:
+                    raise ValueError(f"узла {bad} нет в nodes.conf")
+                if srv.probes.active():
+                    raise ValueError("проверка с ПК уже идёт: дождись отчёта или останови её")
+                args = ["audit", "probe", "start"]
+                if names:
+                    args = ["-n", ",".join(names), *args]
+                title, steps = "Проверка с ПК: запуск мишеней", [step(srv.iof, *args)]
+            elif action == "cancel":
+                title, steps = "Проверка с ПК: остановка мишеней", [step(srv.iof, "audit", "probe", "stop")]
+            else:
+                raise ValueError("неизвестное действие")
+        except ValueError as e:
+            return self.send_json({"error": str(e)}, HTTPStatus.BAD_REQUEST)
+        job = srv.jobs.start(title, steps, "probe")
+        if job is None:
+            return self.send_json({"error": "уже идёт другая задача, дождись её окончания"}, HTTPStatus.CONFLICT)
+        if action == "start":
+            ticket = srv.probes.begin(origin, job["id"])
+        else:
+            srv.probes.cancel()
+        self.send_json({"job": job["id"], "ticket": ticket}, HTTPStatus.ACCEPTED)
+
+    # GET /api/probe/script?t=<билет>: probe.ps1 с данными этой проверки, один раз
+    def probe_script(self, ticket):
+        got = self.server.probes.take_script(ticket)
+        if isinstance(got, tuple):
+            return self.send_json({"error": got[1]}, got[0])
+        self.send_body(got.encode("utf-8"), "text/plain; charset=utf-8", "no-store",
+                       extra={"Content-Disposition": 'attachment; filename="iof-probe.ps1"'})
+
+    # POST /api/probe/result?t=<билет>: сырой отчёт probe.ps1, один раз, до MAX_REPORT байт
+    def probe_result(self, ticket):
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = -1
+        if not 0 < length <= Probes.MAX_REPORT:
+            return self.send_json({"error": "пустой или слишком большой отчёт"}, HTTPStatus.BAD_REQUEST)
+        try:
+            report = json.loads(self.rfile.read(length).decode("utf-8-sig"))
+        except (ValueError, UnicodeDecodeError):
+            report = None
+        if not isinstance(report, dict):
+            return self.send_json({"error": "нужен JSON-объект"}, HTTPStatus.BAD_REQUEST)
+        error = self.server.probes.accept(ticket, report)
+        if error:
+            return self.send_json({"error": error}, HTTPStatus.FORBIDDEN)
+        self.server.probes.kick(self.server.jobs, self.server.iof)
+        self.send_json({"ok": True}, HTTPStatus.ACCEPTED)
+
     # QR одной ссылки (i = номер строки) или всей группы (i = all), как iof hy2 show
     def hy2_qr(self, name, index):
         base = self.server.base
@@ -1328,12 +1662,12 @@ class Handler(BaseHTTPRequestHandler):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_body(body, "application/json; charset=utf-8", "no-store", status)
 
-    def send_body(self, body, ctype, cache, status=HTTPStatus.OK):
+    def send_body(self, body, ctype, cache, status=HTTPStatus.OK, extra=None):
         self.send_response(status)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", cache)
-        for k, v in SECURITY_HEADERS.items():
+        for k, v in {**SECURITY_HEADERS, **(extra or {})}.items():
             self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
@@ -1378,7 +1712,14 @@ def main():
     srv.ssh_pub = Path(ssh_key + ".pub")
     srv.hy2_template = Path(os.environ.get("HY2_TEMPLATE", "/etc/hysteria/config.yaml"))
     srv.cache = StatusCache(args.iof, args.ttl)
-    srv.jobs = Jobs(on_done=srv.cache.invalidate)
+    srv.probes = Probes(srv.base)
+
+    # После каждой задачи: свежий статус узлов и отчёт с ПК, если он ждал своей очереди
+    def on_done():
+        srv.cache.invalidate()
+        srv.probes.kick(srv.jobs, srv.iof)
+
+    srv.jobs = Jobs(on_done=on_done)
     srv.terms = Terminals(os.environ.get("IOF_WEB_TERMINAL", "").strip() == "1", ssh_key)
     print(f"iof-web: http://{args.listen}/" + ("  (терминал включён)" if srv.terms.enabled else ""), file=sys.stderr)
     try:

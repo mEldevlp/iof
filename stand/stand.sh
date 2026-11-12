@@ -11,13 +11,17 @@
 #
 #   bash stand/stand.sh up [сервер...]   собрать образ и поднять серверы (по умолчанию все, CI: old node1)
 #   bash stand/stand.sh setup         поставить iof на old из рабочей копии, подключить поднятые node1
-#                                     и node2, Hysteria2, группу ссылок, задания cron, терминал в панели
+#                                     и node2, Hysteria2, группу ссылок, задания cron, терминал в панели,
+#                                     python3 на node1 для мишеней проверки с ПК
 #   bash stand/stand.sh test [сервер] проверить, что iof работает (stand/test.sh); сервер — управляющий,
 #                                     по умолчанию old
 #   bash stand/stand.sh sync [сервер] обновить iof из рабочей копии (по умолчанию на old и new, где он стоит)
 #   bash stand/stand.sh tunnel        туннели к панелям: old -> http://127.0.0.1:8081/, new -> :8082
 #   bash stand/stand.sh probe start|show|stop   VPN-клиент на node2 через Hysteria2 на old и проверка
 #                                     связи раз в 2 секунды: видно, рвётся ли она при переносе
+#   bash stand/stand.sh pc on [сервер] | pc off   проверка с ПК (iof audit probe) с Windows против
+#                                     стенда: пробросы с адреса WSL к мишеням и Hysteria2 серверов,
+#                                     печатает $env:IOF_PROBE_MAP для probe.ps1; сервер — управляющий
 #   bash stand/stand.sh iof old status   команда iof на сервере
 #   bash stand/stand.sh sh old        оболочка на сервере
 #   bash stand/stand.sh down          убрать серверы (образ остаётся)
@@ -105,12 +109,22 @@ cmd_setup() {
   for n in node1:11 node2:12; do
     if grep -qx "${n%%:*}" <<<"$up"; then nodes+=("$n"); fi
   done
+  # Мишеням проверки с ПК нужен python3: на node1 он ставится, на node2 нет. Так стенд проверяет оба
+  # случая, а new остаётся чистым сервером для переноса
+  if grep -qx node1 <<<"$up"; then
+    echo "== node1: python3 для мишеней проверки с ПК"
+    run_script node1 <<'EOS'
+command -v python3 >/dev/null || { apt-get update -qq >/dev/null && apt-get install -y -qq python3 >/dev/null; }
+EOS
+  fi
   push_src old
   { printf 'NODES="%s"\n' "${nodes[*]}"; cat; } <<'EOS' | run_script old
 set -euo pipefail
 echo "== old: пакеты и iof"
 apt-get update -qq >/dev/null
-apt-get install -y -qq git python3 qrencode sshpass >/dev/null
+# nftables: с ним Hysteria2 ставит правила смены портов через nft (в ядре WSL нет fib для IPv6,
+# и iof переходит на iptables), на остальных узлах — через iptables. Так test проверяет оба пути
+apt-get install -y -qq git python3 qrencode sshpass nftables >/dev/null
 bash /opt/iof/install.sh
 
 echo "== old: шаблон Hysteria2 и nodes.conf"
@@ -118,6 +132,8 @@ mkdir -p /etc/hysteria /root/iof
 chmod 700 /root/iof
 [[ -f /etc/hysteria/config.yaml ]] || cp /opt/iof/stand/hy2-template.yaml /etc/hysteria/config.yaml
 [[ -f /root/iof/nodes.conf ]] || printf 'old | 172.30.0.10 | local | Old\n' > /root/iof/nodes.conf
+# Мишени проверки с ПК на одном порту: stand.sh pc on пробрасывает к нему порты с адреса WSL
+grep -q '^PROBE_PORTS=' /root/iof/iof.env 2>/dev/null || (umask 077; echo 'PROBE_PORTS=47000' >> /root/iof/iof.env)
 
 echo "== old: терминал в панели (IOF_WEB_TERMINAL=1)"
 if ! grep -qx 'IOF_WEB_TERMINAL=1' /root/iof/web.env 2>/dev/null; then
@@ -206,6 +222,40 @@ EOS
   esac
 }
 
+# Проверка с ПК против стенда с Windows. UDP с Windows доходит до WSL только по адресу WSL (через
+# 127.0.0.1 пересылается один TCP), а до сети стенда 172.30.0.0/24 не доходит вовсе. pc on ставит
+# в WSL DNAT с адреса WSL на сервер стенда .N: порт 470NN на мишень 47000 (TCP и UDP, PROBE_PORTS на
+# управляющем сервере), 471NN на Hysteria2 443/udp, и ACCEPT в DOCKER-USER. Контейнеры не
+# пересоздаются, права администратора в Windows не нужны. Адрес WSL меняется при её перезапуске:
+# тогда pc on заново. Печатает строку для PowerShell
+cmd_pc() {
+  local action="${1:-on}" m="${2:-old}" ip s t r oct spec proto port to map=()
+  local -A octet=([old]=10 [node1]=11 [node2]=12 [new]=20)
+  [[ "$action" == "on" || "$action" == "off" ]] || die "используй: pc on [управляющий сервер] | pc off"
+  for t in nat:PREROUTING filter:DOCKER-USER; do
+    while IFS= read -r r; do
+      # shellcheck disable=SC2086 # правило из iptables -S в слова
+      iptables -w -t "${t%%:*}" ${r/#-A/-D}
+    done < <(iptables -w -t "${t%%:*}" -S "${t#*:}" 2>/dev/null | grep -- '--comment iof-stand-pc' || true)
+  done
+  if [[ "$action" == "off" ]]; then echo "Пробросы для проверки с ПК убраны"; return 0; fi
+  ip="$(ip -4 -o addr show eth0 2>/dev/null | awk '{ print $4 }' | cut -d/ -f1 | head -n 1)"
+  [[ -n "$ip" ]] || die "нет адреса на eth0: pc on запускается в WSL"
+  for s in $(running); do
+    oct="${octet[$s]}"
+    for spec in "tcp $((47000 + oct)) 47000" "udp $((47000 + oct)) 47000" "udp $((47100 + oct)) 443"; do
+      read -r proto port to <<<"$spec"
+      iptables -w -t nat -A PREROUTING -i eth0 -p "$proto" --dport "$port" -m comment --comment iof-stand-pc \
+        -j DNAT --to-destination "172.30.0.$oct:$to"
+    done
+    map+=("$s=$ip:$((47000 + oct)):$((47100 + oct))")
+  done
+  iptables -w -I DOCKER-USER -m conntrack --ctstate DNAT -m comment --comment iof-stand-pc -j ACCEPT
+  on "$m" bash -c 'f=/root/iof/iof.env; grep -q "^PROBE_PORTS=" "$f" 2>/dev/null || (umask 077; echo PROBE_PORTS=47000 >> "$f")'
+  echo "Пробросы с $ip готовы, мишени на $m: PROBE_PORTS=47000. В PowerShell на Windows перед запуском скрипта:"
+  echo "\$env:IOF_PROBE_MAP = \"$(IFS=,; echo "${map[*]}")\""
+}
+
 case "${1:-}" in
   up)     shift; cmd_up "$@" ;;
   setup)  cmd_setup ;;
@@ -213,8 +263,9 @@ case "${1:-}" in
   sync)   shift; cmd_sync "$@" ;;
   tunnel) cmd_tunnel ;;
   probe)  shift; cmd_probe "$@" ;;
+  pc)     shift; cmd_pc "$@" ;;
   iof)    shift; s="${1:?укажи сервер}"; shift; on "$s" iof "$@" ;;
   sh)     dc exec "${2:?укажи сервер}" bash ;;
   down)   dc down ;;
-  *)      sed -n '3,23p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *)      sed -n '3,27p' "$0" | sed 's/^# \{0,1\}//' ;;
 esac

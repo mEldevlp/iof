@@ -16,8 +16,8 @@ const DEMO_RELAYS = [{
 
 const demoState = {
   groups: [
-    { name: "Hysteria", label: "Hysteria", created: "2026-09-14 18:22:05", nodes: null },
-    { name: "Family", label: "Family", created: "2026-10-02 09:41:37", nodes: ["Main", "Node 1", "Node 2"] },
+    { name: "Hysteria", label: "Hysteria", created: "2026-09-14 18:22:05", nodes: null, hop: false },
+    { name: "Family", label: "Family", created: "2026-10-02 09:41:37", nodes: ["Main", "Node 1", "Node 2"], hop: true },
   ],
   deleted: [],
   version: "e741874 2026-11-01",
@@ -45,7 +45,7 @@ function demoNodes() {
   const node = (name, addr, title, o) => ({
     name, addr, title, reachable: true, issues: [], ok: true,
     ms: jitter(o.ms, Math.min(200, o.ms)), uptime_s: o.up,
-    hy2: { installed: true, state: "active", udp: true, port: "443", auth: "password", users: 0, version: "v2.13.0", ...o.hy2 },
+    hy2: { installed: true, state: "active", udp: true, port: "443", range: "", auth: "password", users: 0, version: "v2.13.0", ...o.hy2 },
     awg: { state: "running", port: o.awgPort, peers: o.peers, online: jitter(o.online, 2), ...o.awg },
     cpu: { pct: o.cpu, load1: (o.cpu / 100 * o.cpus).toFixed(2), cpus: o.cpus },
     mem: { pct: Math.round(o.mem[0] / o.mem[1] * 100), used_mb: o.mem[0], total_mb: o.mem[1] },
@@ -53,8 +53,8 @@ function demoNodes() {
   });
   const nodes = [
     node("main", "192.0.2.10", "Main", { ms: 40, up: 11400, awgPort: "41234", peers: 5, online: 1, cpus: 2, cpu: 12, mem: [742, 1967], disk: [9.1, 24] }),
-    node("node-1", "198.51.100.20", "Node 1", { ms: 1100, up: 181020, awgPort: "42345", peers: 3, online: 0, cpus: 1, cpu: 7, mem: [403, 963], disk: [5.2, 15] }),
-    node("node-2", "203.0.113.30", "Node 2", { ms: 1350, up: 46800, awgPort: "43456", peers: 4, online: 2, cpus: 2, cpu: 31, mem: [1210, 1967], disk: [12.6, 24] }),
+    node("node-1", "198.51.100.20", "Node 1", { ms: 1100, up: 181020, awgPort: "42345", peers: 3, online: 0, cpus: 1, cpu: 7, mem: [403, 963], disk: [5.2, 15], hy2: { version: "v2.11.0" } }),
+    node("node-2", "203.0.113.30", "Node 2", { ms: 1350, up: 46800, awgPort: "43456", peers: 4, online: 2, cpus: 2, cpu: 31, mem: [1210, 1967], disk: [12.6, 24], hy2: { range: "10000-19999" } }),
     node("node-3", "203.0.113.41", "Node 3", { ms: 1600, up: 604800, awgPort: "", peers: 0, online: 0, cpus: 1, cpu: 4, mem: [388, 963], disk: [8.4, 10], awg: { state: "none" } }),
     node("node-4", "203.0.113.42", "Node 4", { ms: 1900, up: 93000, awgPort: "", peers: 0, online: 0, cpus: 1, cpu: 96, mem: [902, 963], disk: [6.1, 15], awg: { state: "stopped" } }),
     { name: "node-5", addr: "203.0.113.43", title: "Node 5", reachable: false, issues: ["нет связи по SSH"], ok: false },
@@ -96,16 +96,21 @@ function demoDashboard() {
 function demoHy2() {
   const pass = "Zk3pQ9vLx2mR7tYwB4nD";
   const pin = "3F:A1:9C:07:5E:D2:B8:44:61:0A:CE:72:19:F3:8B:55:2D:E6:90:4C:13:7A:B5:08:6F:C1:2E:94:D7:3B:A0:58";
-  const link = (label, host, port, node, relay = false) => ({
-    url: `hy2://${pass}@${host}:${port}/?sni=bing.com&insecure=1&pinSHA256=${encodeURIComponent(pin)}#${encodeURIComponent(`${label} | ${node}`)}`,
-    title: `${label} | ${node}`, node, host, port, relay,
-  });
+  // Смена портов включена на Node 2: в группах со списком портов у него порт 443,10000-19999
+  const ranges = Object.fromEntries(demoNodes().filter((n) => n.reachable && n.hy2.range).map((n) => [n.title, n.hy2.range]));
+  const link = (g, host, port, node, relay = false) => {
+    const ports = g.hop && !relay && ranges[node] ? `${port},${ranges[node]}` : String(port);
+    return {
+      url: `hy2://${pass}@${host}:${ports}/?sni=bing.com&insecure=1&pinSHA256=${encodeURIComponent(pin)}#${encodeURIComponent(`${g.label} | ${node}`)}`,
+      title: `${g.label} | ${node}`, node, host, port: ports, hop: ports.includes(","), relay,
+    };
+  };
   return demoDelay({
     ...demoStatus(),
     qr: true,
     groups: demoState.groups.map((g) => ({
-      name: g.name, label: g.label, created: g.created, file: `/root/iof/hy2/${g.name}.txt`,
-      links: demoGroupNodes(g).map((n) => link(g.label, ...n)),
+      name: g.name, label: g.label, created: g.created, file: `/root/iof/hy2/${g.name}.txt`, hop: !!g.hop,
+      links: demoGroupNodes(g).map((n) => link(g, ...n)),
     })),
   });
 }
@@ -193,13 +198,20 @@ function demoHy2Job(body) {
   if (body.action === "add") {
     const name = body.label.replace(/[^A-Za-z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 32) || "user_3f2a9c1b";
     const old = demoState.groups.find((g) => g.name === name);
-    return demoRunJob("hy2", `${old ? "Пересборка" : "Создание"} группы «${body.label}»`, [
-      `$ iof hy2 add ${body.label}`, "Создаю на узлах: 6", "", `Подпись: ${body.label}`, `Файл:    /root/iof/hy2/${name}.txt`, "",
-      ...DEMO_LINK_NODES.slice(0, 5).map(([h, p, n]) => `hy2://••••••••@${h}:${p}/?sni=bing.com&insecure=1#${encodeURIComponent(`${body.label} | ${n}`)}`),
-      "", "Скопируй строки выше и добавь в Hiddify из буфера обмена.", "", ...DEMO_DOWN,
+    const hop = typeof body.hop === "boolean" ? body.hop : !!(old && old.hop);
+    const title = typeof body.hop === "boolean" ? `Список портов в ссылках: ${hop ? "включение" : "выключение"}, группа «${body.label}»`
+      : `${old ? "Пересборка группы" : "Создание группы"} «${body.label}»`;
+    const hopLines = hop ? ["", "Смена портов в ссылках группы включена, со списком портов ссылок: 1.",
+      "Такие ссылки импортируют Hiddify с версии 5.5.5 и официальный клиент Hysteria2, а v2rayN",
+      `и Hiddify старше — нет. Вернуть обычные ссылки: sudo iof hy2 add "${body.label}" --no-hop`] : [];
+    return demoRunJob("hy2", title, [
+      `$ iof hy2 add ${body.label}${typeof body.hop === "boolean" ? (hop ? " --hop" : " --no-hop") : ""}`, "Создаю на узлах: 6", "",
+      `Подпись: ${body.label}`, `Файл:    /root/iof/hy2/${name}.txt`, "",
+      ...DEMO_LINK_NODES.slice(0, 5).map(([h, p, n]) => `hy2://••••••••@${h}:${hop && n === "Node 2" ? `${p},10000-19999` : p}/?sni=bing.com&insecure=1#${encodeURIComponent(`${body.label} | ${n}`)}`),
+      "", "Скопируй строки выше и добавь в Hiddify из буфера обмена.", ...hopLines, "", ...DEMO_DOWN,
     ], "warn", () => {
-      if (old) old.nodes = null;
-      else demoState.groups.push({ name, label: body.label, created: new Date().toISOString().slice(0, 19).replace("T", " "), nodes: null });
+      if (old) { old.nodes = null; old.hop = hop; }
+      else demoState.groups.push({ name, label: body.label, created: new Date().toISOString().slice(0, 19).replace("T", " "), nodes: null, hop });
     });
   }
   if (body.action === "del") {

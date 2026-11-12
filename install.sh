@@ -36,6 +36,15 @@ echo "iof-nightly: /usr/local/sbin/iof-nightly"
 if ! crontab -l -u root 2>/dev/null | grep -q '/usr/local/sbin/iof-nightly'; then
   echo "  в cron не запланирован. Каждую ночь в 4:00: sudo crontab -e, строка: 0 4 * * * /usr/local/sbin/iof-nightly"
 fi
+# Аудит безопасности раз в сутки, после ночного обслуживания. Тоже только подсказка
+if ! crontab -l -u root 2>/dev/null | grep -q 'iof audit cron'; then
+  echo "iof audit: в cron не запланирован. Раз в сутки: sudo crontab -e, строка: 30 5 * * * /usr/local/bin/iof audit cron >/dev/null 2>&1"
+fi
+# Обновление блок-листа сканеров раз в сутки, если список задан. Тоже только подсказка
+if grep -qE '^BLOCKLIST_URL="?[^"[:space:]]' /root/iof/iof.env 2>/dev/null \
+   && ! crontab -l -u root 2>/dev/null | grep -q 'iof block update'; then
+  echo "iof block: обновление списка в cron не запланировано. Раз в сутки: sudo crontab -e, строка: 15 5 * * * /usr/local/bin/iof block update >/dev/null 2>&1"
+fi
 
 if (( ! WEB )); then exit 0; fi
 
@@ -48,6 +57,8 @@ install -m 644 "$SRC/web/iof-web.py" "$WEB_DIR/iof-web.py"
 # Статику заменяем целиком, чтобы не оставались удалённые из репозитория файлы
 rm -f "$WEB_DIR"/static/*
 install -m 644 "$SRC"/web/static/* "$WEB_DIR/static/"
+# Скрипт проверки с ПК не статика: панель отдаёт его только по одноразовому билету, вписав данные проверки
+install -m 644 "$SRC/web/probe.ps1" "$WEB_DIR/probe.ps1"
 install -m 644 "$SRC/web/iof-web.service" "$UNIT"
 systemctl daemon-reload
 
