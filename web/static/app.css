@@ -581,6 +581,24 @@ pre.log {
 .cmd .btn { flex: none; }
 .check-note { display: flex; gap: 6px; align-items: flex-start; margin-top: 4px; }
 .check-note .ico { margin-top: 3px; }
+
+/* Проверка с ПК: ожидание отчёта (обратный отсчёт, шаги, мишени по узлам) и слои узла в таблице
+   «с ПК — контроль — итог». Таблица без фона в шапке: она внутри раскрытой строки проверки */
+.probe-wait { display: grid; gap: 12px; margin: 0 16px 16px; padding: 12px 16px; border: 1px solid var(--ring); border-radius: 8px; font-size: 13px; }
+.probe-wait .note { margin: 0; }
+.probe-line { margin: 0; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.countdown { font-weight: 500; font-variant-numeric: tabular-nums; }
+.probe-steps { margin: 0; padding-left: 20px; display: grid; gap: 8px; }
+.probe-steps li { padding-left: 4px; }
+.probe-steps .cmd { margin-top: 4px; }
+.probe-steps code, .probe-wait .note code { font-family: var(--mono); font-size: 12px; }
+.probe-wait a { color: var(--accent); text-underline-offset: 2px; }
+table.trace { width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }
+.trace th { text-align: left; font-size: 12px; font-weight: 500; color: var(--ink-2); padding: 0 12px 8px 0; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+.trace td { padding: 8px 12px 8px 0; border-bottom: 1px solid var(--grid); vertical-align: top; overflow-wrap: anywhere; }
+.trace tbody tr:last-child td { border-bottom: 0; }
+.trace td:first-child { font-weight: 500; white-space: nowrap; }
+.trace td:last-child, .trace th:last-child { padding-right: 0; white-space: nowrap; }
 .commits { list-style: none; margin: 0; padding: 0 16px 12px; display: grid; gap: 4px; font-size: 13px; }
 .commits code { color: var(--ink-2); margin-right: 8px; }
 
@@ -689,4 +707,12 @@ pre.log {
   .check-nodes dd { margin-bottom: 8px; }
   .cmd { flex-wrap: wrap; }
   .cmd pre.code { flex-basis: 100%; }
+  .probe-wait { margin: 0 8px 16px; padding: 12px; }
+  .trace thead { display: none; }
+  .trace, .trace tbody, .trace tr, .trace td { display: block; }
+  .trace tr { padding: 8px 0; border-bottom: 1px solid var(--grid); }
+  .trace tbody tr:last-child { border-bottom: 0; }
+  .trace td, .trace td:last-child { padding: 0; border: 0; white-space: normal; }
+  .trace td[data-label]::before { content: attr(data-label) ": "; color: var(--muted); }
+  .trace td:last-child { margin-top: 4px; }
 }

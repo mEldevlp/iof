@@ -3,10 +3,11 @@
 # Проверка iof на поднятом стенде, её же запускает CI на каждый push. Управляющий сервер видит
 # узлы и выполняет на них команды, ссылки Hysteria2 из iof работают с другого сервера, ретранслятор
 # пересылает трафик, аудит безопасности видит изменения на узле (в том числе расхождение конфига
-# Hysteria2 с шаблоном в блоке dpi), панель отвечает, отбивает чужие
-# запросы, выполняет задачи и открывает терминал на каждый узел (stand.sh setup включает его
-# в web.env). Созданные группы ссылок и ретранслятор удаляются, изменения на узле для аудита
-# откатываются, стенд остаётся как был.
+# Hysteria2 с шаблоном в блоке dpi), мишени проверки с ПК отвечают только с токеном, готовый отчёт
+# даёт ожидаемые оценки, мишени исчезают по сроку; панель отвечает, отбивает чужие
+# запросы, выполняет задачи, выдаёт скрипт для ПК по билету и открывает терминал на каждый узел
+# (stand.sh setup включает его в web.env). Созданные группы ссылок и ретранслятор удаляются,
+# изменения на узле для аудита и проверки с ПК откатываются, стенд остаётся как был.
 #   bash stand/stand.sh test [сервер]   сервер — управляющий, по умолчанию old (после переноса: new)
 # Имена узлов в nodes.conf совпадают с именами контейнеров, как после stand.sh setup. Узлов нужно
 # хотя бы два, а стенду — интернет: трафик через туннель идёт на PROBE_URL.
@@ -25,6 +26,9 @@ FAILED=0
 GROUP_LEFT=0
 RELAY_LEFT=""
 AUDIT_LEFT=""
+PROBE_LEFT=0        # 1 — могли остаться мишени проверки с ПК
+PROBE_FW_LEFT=""    # узел, где для проверки с ПК запрещены входящие
+PROBE_PY=()         # узлы с python3: на них поднимаются мишени
 NAMES=()
 declare -A ADDR=()
 
@@ -52,6 +56,15 @@ cleanup() {
   if [[ -n "$AUDIT_LEFT" ]]; then
     echo "Возвращаю $AUDIT_LEFT как был"
     audit_restore "$AUDIT_LEFT"
+  fi
+  if (( PROBE_LEFT )); then
+    echo "Останавливаю мишени проверки с ПК"
+    iofm audit probe stop >/dev/null 2>&1 || true
+    on "$M" bash -c 'rm -f /root/iof-test-probe-*.json' || true
+  fi
+  if [[ -n "$PROBE_FW_LEFT" ]]; then
+    echo "Возвращаю файрвол $PROBE_FW_LEFT как был"
+    probe_fw "$PROBE_FW_LEFT" off
   fi
   if [[ -n "$RELAY_LEFT" ]]; then
     echo "Убираю ретранслятор $RELAY_LEFT"
@@ -419,16 +432,269 @@ check_dpi() {
   fi
 }
 
+# Что осталось от мишеней на узле $1: «юнитов папок_в_/run правил_iptables»
+probe_left() {
+  on "$1" bash -c 'printf "%s %s %s" "$(systemctl list-units --all --plain --no-legend "iof-probe-*" | wc -l)" \
+    "$(ls -d /run/iof-probe-* 2>/dev/null | wc -l)" "$(iptables -w -S INPUT 2>/dev/null | grep -c iof-probe || true)"'
+}
+
+# Входящие на узле $1 запрещены политикой DROP, открыты только SSH, Hysteria2 и ответы (on); off — как было
+probe_fw() {
+  if [[ "$2" == "on" ]]; then
+    on "$1" bash -c 'c="-m comment --comment iof-test-fw"
+      iptables -w -A INPUT -i lo $c -j ACCEPT
+      iptables -w -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED $c -j ACCEPT
+      iptables -w -A INPUT -p tcp --dport 22 $c -j ACCEPT
+      iptables -w -A INPUT -p udp --dport 443 $c -j ACCEPT
+      iptables -w -P INPUT DROP'
+  else
+    on "$1" bash -c 'iptables -w -P INPUT ACCEPT
+      iptables -w -S INPUT | grep -- "--comment iof-test-fw" | sed "s/^-A/-D/" | while read -r r; do iptables -w $r; done' >/dev/null 2>&1 || true
+  fi
+}
+
+# Последний результат проверки с ПК по узлу $1: «статус уверенность», нет — узла в результате нет
+probe_result() {
+  iofm api audit 2>/dev/null | on_in "$M" python3 -c '
+import json, sys
+r = json.load(sys.stdin)["probe"]["last"] or {}
+n = r.get("nodes", {}).get(sys.argv[1])
+print("%s %s" % (n["status"], r["confidence"]) if n else "нет")' "$1"
+}
+
+# Готовые отчёты probe.ps1 из контроля текущей сессии, в /root/iof-test-probe-<вид>.json на управляющем
+# сервере: block — у первого узла с ПК не проходит TCP, остальное как у контроля; vpn — IP источника
+# равен адресу узла; token — в отчёте токен мишеней; alien — отчёт от другой проверки
+probe_reports() {
+  on_in "$M" python3 - "$1" <<'PY'
+import copy, json, sys
+s = json.load(open("/root/iof/audit/probe/session.json"))
+token = open("/root/iof/audit/probe/token").read().strip()
+first = sys.argv[1]
+
+
+def report(kind):
+    targets = []
+    for name, n in s["nodes"].items():
+        if n["state"] != "started":
+            continue
+        t = copy.deepcopy(n["control"])
+        t["node"] = name
+        t["icmp"] = {"sent": 3, "got": 3, "ms": 40}
+        t["tunnel"] = {"tested": False, "reason": "nohysteria"}
+        if kind == "block" and name == first:
+            t["conn"] = [{"tcp": None, "tls": None, "fp": "", "bytes": 0, "ms": 0, "src": "", "err": "tcp: timeout"}] * 3
+        if kind == "vpn":
+            for c in t["conn"]:
+                c["src"] = s["nodes"][first]["ip"]
+        targets.append(t)
+    lists = [{"host": h, "list": "white", "ok": True, "err": ""} for h in s["lists"]["white"]]
+    lists += [{"host": h, "list": "black", "ok": False, "err": "tls: timeout"} for h in s["lists"]["black"]]
+    rep = {"v": 1, "session": "deadbeef" if kind == "alien" else s["id"], "remap": kind != "vpn",
+           "client": {"os": "Windows 10.0", "vpn": [], "proxy": "none"}, "lists": lists, "targets": targets}
+    if kind == "token":
+        rep["note"] = token
+    return rep
+
+
+for kind in ("block", "vpn", "token", "alien"):
+    with open(f"/root/iof-test-probe-{kind}.json", "w") as f:
+        json.dump(report(kind), f)
+PY
+}
+
+# Мишень узла $1 из текущей сессии отвечает с токеном и молчит без него, по TLS и по UDP. Строки ok/fail
+probe_answers() {
+  on_in "$M" python3 - "$1" <<'PY'
+import json, socket, ssl, sys
+s = json.load(open("/root/iof/audit/probe/session.json"))
+token = open("/root/iof/audit/probe/token").read().strip().encode()
+n = s["nodes"][sys.argv[1]]
+ip, port = n["ip"], n["port"]
+
+
+def tls(line):
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    got = b""
+    try:
+        c = ctx.wrap_socket(socket.create_connection((ip, port), timeout=10))
+        c.sendall(line)
+        while len(got) < 262144 + 64:
+            x = c.recv(65536)
+            if not x:
+                break
+            got += x
+            if got.startswith(b"OK ") and b"\n" in got and len(got.split(b"\n", 1)[1]) >= 262144:
+                break
+        c.close()
+    except OSError:
+        pass
+    return got
+
+
+def udp(data):
+    u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    u.settimeout(1.5)
+    u.sendto(data, (ip, port))
+    try:
+        return u.recv(2048)
+    except OSError:
+        return b""
+
+
+def say(good, text):
+    print(("ok" if good else "fail") + "\t" + text)
+
+
+a, b = tls(b"hello\n"), tls(b"IOF-PROBE " + token + b"\n")
+say(a == b"", f"мишень {sys.argv[1]}: TLS без токена — ничего ({len(a)} байт)")
+say(b.startswith(b"OK ") and len(b.split(b"\n", 1)[1]) == 262144, f"мишень {sys.argv[1]}: TLS с токеном — ответ и 256 КБ ({len(b)} байт)")
+c, d = udp(b"hello" * 8), udp(b"IOFP" + token + b"12345678")
+say(c == b"", f"мишень {sys.argv[1]}: UDP без токена — ничего ({len(c)} байт)")
+say(d == b"IOFP" + b"\0" * len(token) + b"12345678", f"мишень {sys.argv[1]}: UDP с токеном — пакет с затёртым токеном ({len(d)} байт)")
+PY
+}
+
+# Строки ok/fail от python на сервере в итоги проверки
+tally() {
+  local line
+  while IFS= read -r line; do
+    case "$line" in
+      ok$'\t'*)   ok "${line#ok$'\t'}" ;;
+      fail$'\t'*) fail "${line#fail$'\t'}" ;;
+      *)          echo "$line" | mask ;;
+    esac
+  done <<<"$1"
+}
+
+# Проверка с ПК (iof audit probe). Мишени поднимаются на узлах с python3, узел без него получает
+# «не проверяется». На первом узле с python3, который не управляющий сервер, входящие запрещены
+# политикой DROP: мишень открывает свой порт правилом и снимает его. Мишени отвечают с токеном
+# и молчат без него, готовый отчёт даёт ожидаемые оценки, отчёт с токеном и чужой не принимаются,
+# токена нет в выводе и результатах. После stop и по сроку (RuntimeMaxSec) на узлах ничего не остаётся
+check_probe() {
+  local out start n node="" got token nopy=() first
+  PROBE_PY=()
+  for n in "${NAMES[@]}"; do
+    if on "$n" bash -c 'command -v python3' >/dev/null 2>&1; then
+      PROBE_PY+=("$n")
+      if [[ "$n" != "$M" && -z "$node" ]]; then node="$n"; fi
+    else
+      nopy+=("$n")
+    fi
+  done
+  if (( ${#PROBE_PY[@]} == 0 )); then fail "проверка с ПК: ни на одном узле нет python3"; return 1; fi
+  first="${PROBE_PY[0]}"
+  PROBE_LEFT=1
+  iofm audit probe stop >/dev/null 2>&1 || true
+  if [[ -n "$node" ]]; then
+    PROBE_FW_LEFT="$node"
+    probe_fw "$node" on
+  fi
+
+  if start="$(iofm audit probe start --ttl 600 2>&1)"; then ok "iof audit probe start"; else fail "iof audit probe start"; details "$start"; return 1; fi
+  for n in "${PROBE_PY[@]}"; do
+    if grep -qE "^  $n +порт [0-9]+ +контроль: (ping [0-9]/[0-9] · )?TCP 3/3 · TLS 3/3 · данные 3/3 · UDP 5/5 · QUIC 5/5" <<<"$start"; then
+      ok "мишень $n: контроль с управляющего сервера прошёл все слои"
+    else
+      fail "мишень $n: контроль прошёл не все слои"
+      details "$start"
+    fi
+  done
+  for n in "${nopy[@]}"; do
+    if grep -qE "^  $n +не проверяется: нет python3.*apt install python3" <<<"$start"; then
+      ok "мишень $n: нет python3 — не проверяется, с командой"
+    else
+      fail "мишень $n без python3: нет строки «не проверяется»"
+    fi
+  done
+  if (( ${#nopy[@]} == 0 )); then echo "      узла без python3 нет: этот случай не проверялся"; fi
+  if [[ -n "$node" ]]; then
+    got="$(probe_left "$node")"
+    if [[ "$got" == "1 1 2" ]]; then ok "мишень $node: входящие запрещены, порт открыт правилами iof-probe"; else fail "мишень $node при запрете входящих: «$got», ожидалось «1 1 2»"; fi
+  fi
+  tally "$(probe_answers "$first")"
+
+  probe_reports "$first"
+  if out="$(on "$M" bash -c 'iof audit probe import < /root/iof-test-probe-block.json' 2>&1)"; then ok "iof audit probe import"; else fail "iof audit probe import"; details "$out"; fi
+  got="$(probe_result "$first")"
+  if [[ "$got" == "crit high" ]]; then ok "отчёт: у $first с ПК не проходит TCP — проблема, уверенность высокая"; else fail "отчёт: $first — «$got», ожидалось «crit high»"; fi
+  for n in "${PROBE_PY[@]:1}"; do
+    got="$(probe_result "$n")"
+    if [[ "$got" == "good high" ]]; then ok "отчёт: $n — всё проходит"; else fail "отчёт: $n — «$got», ожидалось «good high»"; fi
+  done
+  for n in "${nopy[@]}"; do
+    got="$(probe_result "$n")"
+    if [[ "$got" == none* ]]; then ok "отчёт: $n без мишени — нет данных"; else fail "отчёт: $n — «$got», ожидалось «none»"; fi
+  done
+  if out="$(on "$M" bash -c 'iof audit probe import < /root/iof-test-probe-vpn.json' 2>&1)" \
+     && [[ "$(probe_result "$first")" == "none low" ]] && grep -q "адрес узла $first" <<<"$out"; then
+    ok "отчёт через VPN (IP источника — адрес $first): уверенность низкая, оценок нет"
+  else
+    fail "отчёт через VPN: «$(probe_result "$first")»"
+    details "$out"
+  fi
+  if out="$(on "$M" bash -c 'iof audit probe import < /root/iof-test-probe-token.json' 2>&1)"; then
+    fail "отчёт с токеном мишеней принят"
+  elif grep -q 'токен' <<<"$out"; then ok "отчёт с токеном мишеней отклонён"; else fail "отчёт с токеном: «$out»"; fi
+  if out="$(on "$M" bash -c 'iof audit probe import < /root/iof-test-probe-alien.json' 2>&1)"; then
+    fail "отчёт от другой проверки принят"
+  elif grep -q 'другой проверки' <<<"$out"; then ok "отчёт от другой проверки отклонён"; else fail "отчёт от другой проверки: «$out»"; fi
+
+  token="$(on "$M" cat /root/iof/audit/probe/token)"
+  if [[ -z "$token" ]]; then
+    fail "проверка с ПК: нет токена мишеней, утечку проверить нечем"
+  elif grep -qF -- "$token" <<<"$start" \
+     || on "$M" bash -c 'grep -rqF --exclude=token -- "$0" /root/iof/audit || iof api audit | grep -qF -- "$0" || iof audit probe list | grep -qF -- "$0"' "$token"; then
+    fail "токен мишеней попал в вывод iof или результаты"
+  else
+    ok "токена мишеней нет в выводе probe start, /root/iof/audit, iof api audit и probe list"
+  fi
+
+  out="$(iofm audit probe stop 2>&1)" || true
+  for n in "${PROBE_PY[@]}"; do
+    got="$(probe_left "$n")"
+    if [[ "$got" == "0 0 0" ]]; then ok "мишень $n: после stop ничего не осталось"; else fail "мишень $n после stop: «$got» (юнитов, папок, правил)"; details "$out"; fi
+  done
+
+  # По сроку: systemd останавливает мишени сам, ExecStopPost снимает правило и файлы
+  if ! out="$(iofm audit probe start --ttl 20 2>&1)"; then fail "iof audit probe start --ttl 20"; details "$out"; fi
+  sleep 28
+  for n in "${PROBE_PY[@]}"; do
+    got="$(probe_left "$n")"
+    if [[ "$got" == "0 0 0" ]]; then ok "мишень $n: по сроку (RuntimeMaxSec) исчезла вместе с правилами"; else fail "мишень $n через 28 с при сроке 20 с: «$got»"; fi
+  done
+  iofm audit probe stop >/dev/null 2>&1 || true
+  on "$M" bash -c 'rm -f /root/iof-test-probe-*.json'
+  PROBE_LEFT=0
+  if [[ -n "$node" ]]; then
+    probe_fw "$node" off
+    PROBE_FW_LEFT=""
+  fi
+}
+
+# После проверки с ПК из панели (check_panel): задача с отчётом остановила мишени
+check_probe_after() {
+  local n got
+  for n in "${PROBE_PY[@]}"; do
+    got="$(probe_left "$n")"
+    if [[ "$got" == "0 0 0" ]]; then ok "панель: после отчёта мишени на $n остановлены"; else fail "панель: после отчёта на $n осталось «$got»"; fi
+  done
+}
+
 # Панель на управляющем сервере: страницы и API, защита от DNS rebinding и CSRF, задача iof
 # из панели (создать и удалить группу ссылок), терминал на каждый узел через WebSocket.
 # Проверяет python3 на сервере, он там есть для панели
 check_panel() {
   local out rc line
-  out="$(on_in "$M" python3 - "$PANEL_GROUP" "${NAMES[*]}" 2>&1 <<'PY'
-import base64, json, os, socket, struct, sys, time, urllib.error, urllib.request
+  out="$(on_in "$M" python3 - "$PANEL_GROUP" "${NAMES[*]}" "${PROBE_PY[*]}" 2>&1 <<'PY'
+import base64, json, os, re, socket, struct, sys, time, urllib.error, urllib.request
 
 BASE = "http://127.0.0.1:8088"
 label, nodes = sys.argv[1], set(sys.argv[2].split())
+probe_nodes = sys.argv[3].split() if len(sys.argv) > 3 else []
 POST = {"X-IOF-Request": "1", "Content-Type": "application/json", "Origin": BASE}
 
 
@@ -450,18 +716,25 @@ def job(body, title, path="/api/hy2"):
     code, resp = req(path, "POST", body, POST)
     if code != 202:
         report(False, f"{title}: ответ {code} {resp.decode('utf-8', 'replace')[:200]}")
-        return
-    jid = json.loads(resp)["job"]
+        return None
+    data = json.loads(resp)
+    wait_job(lambda j: j["id"] == data["job"], title)
+    return data
+
+
+# Ждёт первую задачу, подходящую под match, и отчитывается, как она закончилась
+def wait_job(match, title):
     deadline = time.time() + 300
     while time.time() < deadline:
-        j = next((j for j in json.loads(req("/api/jobs")[1])["jobs"] if j["id"] == jid), None)
+        j = next((j for j in json.loads(req("/api/jobs")[1])["jobs"] if match(j)), None)
         if j and j["state"] != "running":
             report(j["state"] == "ok", f"{title}: задача завершилась ({j['state']})")
             if j["state"] != "ok":
                 print("\n".join("      " + line for line in j["log"][-10:]))
-            return
+            return j
         time.sleep(1)
     report(False, f"{title}: задача не завершилась за 5 минут")
+    return None
 
 
 def group(data):
@@ -619,6 +892,61 @@ code, body = req("/api/security")
 after = json.loads(body)["blocks"]["dpi"]["nodes"].get(one, {}) if code == 200 else {}
 report(after.get("reachable") is True and after.get("at", 0) > before, f"панель: результат блока dpi на {one} обновился")
 
+# Проверка с ПК из панели: мишени задачей, скрипт по одноразовому билету с данными проверки, отчёт
+# по тому же билету, задача остановки мишеней и импорта. Чужой и повторный билет отклоняются,
+# токена мишеней нет в ответах панели и логах задач. Функция, чтобы имена не затёрли ticket() терминала
+def probe_panel(one):
+    started = job({"action": "start", "nodes": [one], "origin": BASE}, f"панель: мишень проверки с ПК на {one}", "/api/probe")
+    ticket = (started or {}).get("ticket") or ""
+    try:
+        token = open("/root/iof/audit/probe/token", encoding="utf-8").read().strip()
+    except OSError:
+        token = ""
+    code, body = req("/api/probe")
+    st = json.loads(body) if code == 200 else {}
+    panel = st.get("panel") or {}
+    report(bool(ticket) and panel.get("ticket") == ticket and (st.get("session") or {}).get("nodes", {}).get(one, {}).get("state") == "started",
+           f"панель: /api/probe — сессия с мишенью на {one}, билет для ПК")
+    leaks = [p for p in ("/api/probe", "/api/security", "/api/jobs") if token and token in req(p)[1].decode("utf-8", "replace")]
+    report(bool(token) and not leaks, "панель: токена мишеней нет в /api/probe, /api/security и логах задач" + (f" (есть в {', '.join(leaks)})" if leaks else ""))
+    code, _ = req("/api/probe/script?t=wrong")
+    report(code == 403, f"панель: скрипт по неверному билету не выдан ({code})")
+    code, _ = req(f"/api/probe/script?t={ticket}", headers={"Host": "evil.example"})
+    report(code == 403, f"панель: скрипт с чужим Host не выдан ({code})")
+    code, body = req(f"/api/probe/script?t={ticket}")
+    m = re.search(r"\$IofProbeConfig = '([A-Za-z0-9+/=]+)'", body.decode("utf-8", "replace")) if code == 200 else None
+    cfg = json.loads(base64.b64decode(m.group(1))) if m else {}
+    report(code == 200 and cfg.get("ticket") == ticket and cfg.get("token") == token
+           and [t["node"] for t in cfg.get("targets", [])] == [one],
+           f"панель: скрипт для ПК выдан с мишенью {one} и билетом ({code})")
+    code, _ = req(f"/api/probe/script?t={ticket}")
+    report(code == 403, f"панель: второй раз скрипт по тому же билету не выдан ({code})")
+    ok_conn = {"tcp": 2, "tls": 3, "fp": "match", "bytes": 262144, "ms": 50, "src": "172.30.0.99", "err": ""}
+    rep = {"v": 1, "session": cfg.get("session", ""), "remap": True, "client": {"os": "Windows 10.0", "vpn": [], "proxy": "none"},
+           "lists": [], "targets": [{"node": t["node"], "icmp": {"sent": 3, "got": 3, "ms": 40}, "conn": [ok_conn] * 3,
+                                     "udp": {"sent": 5, "got": 5, "closed": False}, "quic": {"sent": 5, "got": 5, "closed": False},
+                                     "hy2": "vn" if t.get("hy2") else "", "tunnel": {"tested": False, "reason": "nohysteria"}}
+                                    for t in cfg.get("targets", [])]}
+    code, _ = req("/api/probe/result?t=wrong", "POST", rep, POST)
+    report(code == 403, f"панель: отчёт по неверному билету отклонён ({code})")
+    code, _ = req(f"/api/probe/result?t={ticket}", "POST", rep, {"Content-Type": "application/json"})
+    report(code == 403, f"панель: отчёт без X-IOF-Request отклонён ({code})")
+    # Как PowerShell: без Origin и без пароля панели
+    code, _ = req(f"/api/probe/result?t={ticket}", "POST", rep, {"Content-Type": "application/json", "X-IOF-Request": "1"})
+    report(code == 202, f"панель: отчёт с ПК принят ({code})")
+    wait_job(lambda j: j["kind"] == "probe" and "результат" in j["title"] and j["started"] > time.time() - 120,
+             "панель: остановка мишеней и приём отчёта")
+    code, body = req("/api/security")
+    last = (json.loads(body).get("probe") or {}).get("last") or {} if code == 200 else {}
+    report(last.get("session") == cfg.get("session") and last.get("nodes", {}).get(one, {}).get("status") == "good",
+           f"панель: результат проверки с ПК — {one} доступен")
+    code, _ = req(f"/api/probe/result?t={ticket}", "POST", rep, {"Content-Type": "application/json", "X-IOF-Request": "1"})
+    report(code == 403, f"панель: второй отчёт по тому же билету отклонён ({code})")
+
+
+if probe_nodes:
+    probe_panel(probe_nodes[0])
+
 # Терминал: stand.sh setup включает его в web.env (IOF_WEB_TERMINAL=1)
 for node in sorted(nodes):
     terminal(node)
@@ -635,13 +963,7 @@ if t:
 PY
 )"
   rc=$?
-  while IFS= read -r line; do
-    case "$line" in
-      ok$'\t'*)   ok "${line#ok$'\t'}" ;;
-      fail$'\t'*) fail "${line#fail$'\t'}" ;;
-      *)          echo "$line" | mask ;;
-    esac
-  done <<<"$out"
+  tally "$out"
   if (( rc != 0 )); then fail "проверка панели завершилась с кодом $rc"; fi
 }
 
@@ -669,8 +991,11 @@ step "Аудит безопасности"
 check_audit
 step "Защита от РКН"
 check_dpi
+step "Проверка с ПК"
+check_probe
 step "Веб-панель"
 check_panel
+check_probe_after
 step "Узлы после проверки"
 check_nodes
 

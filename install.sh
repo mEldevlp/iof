@@ -52,6 +52,8 @@ install -m 644 "$SRC/web/iof-web.py" "$WEB_DIR/iof-web.py"
 # Статику заменяем целиком, чтобы не оставались удалённые из репозитория файлы
 rm -f "$WEB_DIR"/static/*
 install -m 644 "$SRC"/web/static/* "$WEB_DIR/static/"
+# Скрипт проверки с ПК не статика: панель отдаёт его только по одноразовому билету, вписав данные проверки
+install -m 644 "$SRC/web/probe.ps1" "$WEB_DIR/probe.ps1"
 install -m 644 "$SRC/web/iof-web.service" "$UNIT"
 systemctl daemon-reload
 

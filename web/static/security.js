@@ -3,9 +3,11 @@
 // Страница «Безопасность». Блоки «Аудит сервера» (server) и «Защита от РКН» (dpi): последние проверки
 // iof audit по узлам, что проверка показала, почему это важно и как исправить. Данные: GET api/security
 // (iof api audit, узлы при этом не опрашиваются), проверка: POST api/security {block, node} — задача
-// iof audit run <блок>. Оценки и тексты приходят готовыми из iof, здесь только отрисовка
+// iof audit run <блок>. Оценки и тексты приходят готовыми из iof, здесь только отрисовка.
+// Карточка «Доступность из РФ» — проверка с ПК (iof audit probe), см. ниже «Проверка с ПК»
 
-const sec = { data: null, running: false };
+// kind — вид задачи, которую показывает карточка задачи: audit или probe
+const sec = { data: null, running: false, kind: "audit", poll: null, tick: null };
 // Блоки страницы: у каждого в html есть #<блок>-node, -run, -stamp, -health, -checks
 const BLOCKS = ["server", "dpi"];
 // Что проверял запуск из истории (поле block)
@@ -14,7 +16,7 @@ const WORDS = { good: "в порядке", warn: "внимание", crit: "пр
 const RANK = { none: 0, good: 1, warn: 2, crit: 3 };
 
 const job = watchJob({
-  kind: "audit",
+  kind: () => sec.kind,
   demoJobs,
   all: false,
   render: renderJob,
@@ -240,6 +242,9 @@ function renderSchedule() {
 function syncButtons() {
   const off = sec.running || !sec.data || !!sec.data.error;
   document.querySelectorAll("[data-run]").forEach((b) => { b.disabled = off; });
+  // Мишени меняют узлы: во время переноса управления их не запустить
+  $("#probe-start").disabled = off || !!(sec.data && sec.data.migrate && sec.data.migrate.role === "source");
+  $("#probe-cancel").disabled = sec.running;
 }
 
 function render() {
@@ -252,6 +257,7 @@ function render() {
     return;
   }
   BLOCKS.forEach(renderBlock);
+  renderProbe();
   renderSchedule();
   syncButtons();
 }
@@ -277,6 +283,7 @@ async function run(block) {
   const body = { block, node: picked(block) };
   try {
     const id = DEMO ? demoAuditJob(body) : (await postJson("api/security", body)).job;
+    sec.kind = "audit";
     job.start(id);
     $("#job").scrollIntoView({ behavior: "smooth", block: "nearest" });
   } catch (e) {
@@ -284,13 +291,35 @@ async function run(block) {
   }
 }
 
+// Итог задачи проверки с ПК: запуск мишеней, остановка или приём отчёта
+function probeJobResult(j, lvl) {
+  const reason = failReason(j.log);
+  const start = j.title.includes("запуск"), result = j.title.includes("результат");
+  if (j.state === "ok" || j.state === "warn") {
+    const text = start ? "Мишени запущены: команда для ПК — в карточке «Доступность из РФ»"
+      : result ? "Отчёт с ПК принят, результат в карточке «Доступность из РФ»" : "Мишени остановлены";
+    jobResult(lvl, `${icon(j.state === "ok" ? "good" : "warn")}<div>${text}${j.state === "warn" && reason
+      ? `. Не на всех узлах: <b>${esc(reason)}</b>` : ""}</div>`);
+  } else if (j.state === "error") {
+    jobResult(lvl, `${icon("crit")}<div>${start ? "Мишени не запустились" : result ? "Отчёт не принят" : "Мишени не остановились"}${
+      reason ? `: <b>${esc(reason)}</b>` : ", причина в логе"}</div>`);
+  } else {
+    jobResult(lvl, "");
+  }
+}
+
 function renderJob(j) {
   const lvl = renderJobCard(j);
+  const was = sec.running;
   sec.running = !!j && j.state === "running";
   syncButtons();
   if (!j) return;
   $("#job-hide").hidden = sec.running;
-  if (j.state === "ok") {
+  if (j.kind === "probe") {
+    // Этап карточки зависит от того, идёт ли задача
+    if (was !== sec.running && sec.data && !sec.data.error) renderProbe();
+    probeJobResult(j, lvl);
+  } else if (j.state === "ok") {
     jobResult(lvl, `${icon("good")}<div>Проверка завершена, результат ниже</div>`);
   } else if (j.state === "warn") {
     jobResult(lvl, `${icon("warn")}<div>Проверены не все узлы${failReason(j.log) ? `: <b>${esc(failReason(j.log))}</b>` : ""}</div>`);
@@ -302,17 +331,251 @@ function renderJob(j) {
   }
 }
 
+
+
+// Проверка с ПК (iof audit probe). Состояние: probe из iof api audit (сессия, последний результат,
+// история) и probe_state от панели (сессия и билет). Этапы карточки: idle — проверки нет, starting —
+// мишени запускаются, wait — ждём отчёт с ПК, import — отчёт принят, считается результат, expired —
+// мишени остановлены без отчёта, foreign — мишени запущены не из этой панели или до её перезапуска
+
+const PROBE_VERDICT = {
+  ok: "проходит", blocked: "не проходит", stall: "встаёт", partial: "частично", mitm: "подмена",
+  fail: "не поднялся", down: "нет контроля", unknown: "не с чем сравнить", skipped: "не проверялся",
+};
+const PROBE_CONF = { high: "высокая", medium: "средняя", low: "низкая" };
+const PROBE_STATE = {
+  nopython: "нет python3", noopenssl: "нет openssl", nosystemd: "нет systemd-run", nft: "входящие режет nftables",
+  busy: "нет свободного порта", error: "мишень не запустилась", down: "узел не ответил по SSH",
+};
+
+function nowSec() {
+  return Date.now() / 1000;
+}
+
+function probeStage() {
+  const st = sec.data.probe_state || {}, p = st.panel, s = st.session;
+  const live = s && !s.stopped && s.expires > nowSec();
+  if (!p) return live ? "foreign" : "idle";
+  if (p.result_at) {
+    const last = (sec.data.probe || {}).last;
+    return p.pending || sec.running || !last || !s || last.session !== s.id ? "import" : "idle";
+  }
+  if (!p.mine) return sec.running ? "starting" : "idle";
+  return live ? "wait" : "expired";
+}
+
+function fmtLeft(left) {
+  const s = Math.max(0, Math.floor(left));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+}
+
+// Команда для окна PowerShell на ПК: сохранить скрипт в файл и запустить его. Сразу из сети
+// (iex (iwr …)) не запускаем: так выглядит загрузчик вредоносного кода, и антивирусы это блокируют
+function probeCommand(p) {
+  return `iwr -UseBasicParsing '${p.origin}/api/probe/script?t=${p.ticket}' -OutFile iof-probe.ps1; powershell -NoProfile -ExecutionPolicy Bypass -File .\\iof-probe.ps1`;
+}
+
+// Мишени по узлам: порт и итог контроля или почему мишени нет
+function probeTargets(s) {
+  return `<dl class="check-nodes">${Object.entries(s.nodes).map(([name, n]) => `<dt>${esc(name)}</dt><dd>${
+    n.state === "started"
+      ? `<span class="check-status">${icon(n.check.includes(" 0/") ? "warn" : "good")}<span>порт ${n.port}${
+        n.fw === "opened" ? ", открыт в файрволе на время проверки" : ""}</span></span><span class="check-detail">контроль: ${esc(n.check)}</span>`
+      : `<span class="check-status">${icon("none")}<span>не проверяется: ${esc(PROBE_STATE[n.state] || n.state)}${
+        n.state === "nopython" ? " (на узле: apt install python3)" : ""}</span></span>`}</dd>`).join("")}</dl>`;
+}
+
+function renderProbeWait(stage) {
+  const el = $("#probe-wait"), st = sec.data.probe_state || {}, p = st.panel, s = st.session;
+  el.hidden = !["starting", "wait", "import", "expired", "foreign"].includes(stage);
+  if (el.hidden) return;
+  let html;
+  if (stage === "starting") {
+    html = `<p class="probe-line"><span class="spinner" aria-hidden="true"></span>Запускаю мишени на узлах и проверяю их с управляющего сервера…</p>`;
+  } else if (stage === "import") {
+    html = `<p class="probe-line"><span class="spinner" aria-hidden="true"></span>Отчёт с ПК принят${p.pending
+      ? ", ждёт, пока закончится другая задача" : ""}: останавливаю мишени и считаю результат…</p>`;
+  } else if (stage === "expired") {
+    html = `<div class="note warn">${icon("warn")}<div>Мишени проверки ${esc(s.id)} ${s.stopped ? "остановлены" : "отработали срок"}, отчёт с ПК не пришёл.
+      Если скрипт сохранил его в <code>iof-probe-report.json</code>, на управляющем сервере:
+      <code>sudo iof audit probe import &lt; iof-probe-report.json</code>. Или начни проверку заново.</div></div>`;
+  } else if (stage === "foreign") {
+    html = `<div class="note warn">${icon("warn")}<div>Идёт проверка ${esc(s.id)}, начатая из терминала или до перезапуска панели:
+      билета для ПК у панели нет. Останови её и начни заново отсюда.</div></div>${probeTargets(s)}`;
+  } else {
+    const steps = [
+      "Выключи на ПК VPN и прокси: проверка должна идти через твоего провайдера.",
+      `Необязательно, для настоящего туннеля Hysteria2: скопируй ссылки группы на странице <a href="hy2.html${DEMO ? "?demo" : ""}">Hysteria2</a>
+        и положи <code>hysteria.exe</code> в папку, где запускаешь скрипт. Он спросит согласие, пароли из ссылок с ПК не уходят.`,
+    ];
+    if (p.ticket) {
+      steps.push(`Выполни в окне PowerShell на ПК, пока открыт SSH-туннель к панели. Команда сохранит скрипт
+        в <code>iof-probe.ps1</code> в текущей папке и запустит его:
+        <div class="cmd"><pre class="code">${esc(probeCommand(p))}</pre><button class="btn small" type="button" data-copy>Копировать</button></div>
+        <span class="check-detail">Или <a href="${DEMO ? "#" : esc(`api/probe/script?t=${p.ticket}`)}" download="iof-probe.ps1" data-script>скачай скрипт</a>
+        и запусти <code>powershell -ExecutionPolicy Bypass -File .\\iof-probe.ps1</code>. Скрипт выдаётся один раз: по команде или по ссылке.
+        Его можно прочитать перед запуском, а после проверки удалить: билет и токен в нём одноразовые.</span>`);
+    } else {
+      steps.push(`Скрипт получен${p.script_at ? ` в ${fmtTime(p.script_at)}` : ""}, жду отчёт. Если отправить его не удастся,
+        скрипт сохранит <code>iof-probe-report.json</code>: на управляющем сервере <code>sudo iof audit probe import &lt; iof-probe-report.json</code>.`);
+    }
+    html = `<p class="probe-line">Проверка ${esc(s.id)}: мишени работают ещё <b class="countdown" data-until="${s.expires}">${fmtLeft(s.expires - nowSec())}</b></p>
+      <ol class="probe-steps">${steps.map((x) => `<li>${x}</li>`).join("")}</ol>${probeTargets(s)}`;
+  }
+  el.innerHTML = html;
+}
+
+function renderProbeResult(r) {
+  const el = $("#probe-health"), box = $("#probe-nodes");
+  const open = new Set([...box.querySelectorAll("details[open]")].map((d) => d.dataset.id));
+  $("#probe-stamp").textContent = r ? `проверено ${fmtWhen(r.at)}` : "";
+  if (!r) {
+    el.className = "health";
+    el.innerHTML = `${icon("none", "ico big-ico")}<div><h2>Проверки с ПК ещё не было</h2>
+      <p class="sub">«Начать проверку» поднимет мишени на узлах и даст команду для ПК. То же в терминале: <code>sudo iof audit probe start</code></p></div>`;
+    box.innerHTML = "";
+    return;
+  }
+  const nodes = Object.entries(r.nodes);
+  const pick = $("#probe-node").value;
+  const shown = nodes.filter(([name]) => !pick || name === pick);
+  const count = (st) => nodes.filter(([, n]) => n.status === st).length;
+  const level = count("crit") ? "crit" : count("warn") ? "warn" : count("good") ? "good" : "none";
+  const total = nodes.length, of = `из ${total} ${plural(total, ["узла", "узлов", "узлов"])}`;
+  const title = r.confidence === "low" ? "Результат не о провайдере"
+    : count("crit") ? `С ПК не доходит до ${count("crit")} ${of}`
+    : count("warn") ? `Есть замечания по ${count("warn")} ${of}`
+    : count("good") ? "Все проверенные узлы доступны с ПК" : "Сравнить не с чем";
+  const items = r.reasons.map((why) => `<li>${icon(r.confidence === "low" ? "warn" : "none")}<span>${esc(why)}</span></li>`);
+  el.className = `health ${r.confidence === "low" ? "warn" : level}`;
+  el.innerHTML = `${icon(r.confidence === "low" ? "warn" : level, "ico big-ico")}<div>
+    <h2>${esc(title)}</h2>
+    <p class="sub">Сеть ПК: ${esc(r.net.label)}${r.net.ip ? ` (${esc(r.net.ip)})` : ""} · уверенность: ${PROBE_CONF[r.confidence]} ·
+      проблем: ${count("crit")} · внимание: ${count("warn")} · в порядке: ${count("good")} · нет данных: ${count("none")}</p>
+    ${items.length ? `<ul class="issues">${items.join("")}</ul>` : ""}
+  </div>`;
+  box.innerHTML = `<ul class="checks">${shown.map(([name, n]) => `<li><details data-id="${esc(name)}"${open.has(name) ? " open" : ""}>
+    <summary>${badge(n.status, WORDS[n.status])}<span class="item-title">${esc(name)}</span><span class="check-value">${esc(n.value)}</span></summary>
+    <div class="check-body">
+      ${n.layers.length ? `<p class="check-why">Уверенность: ${PROBE_CONF[n.confidence]}. «С ПК» — что прошло от твоего провайдера,
+        «Контроль» — что прошло с управляющего сервера до той же мишени.</p>` : ""}
+      ${n.detail.length ? `<p class="check-facts">${n.detail.map((x) => `<span class="check-detail">${esc(x)}</span>`).join("")}</p>` : ""}
+      ${n.layers.length ? `<div class="table-wrap"><table class="trace">
+        <thead><tr><th>Слой</th><th>С ПК</th><th>Контроль</th><th>Итог</th></tr></thead>
+        <tbody>${n.layers.map((x) => `<tr><td>${esc(x.title)}</td><td data-label="С ПК">${esc(x.pc)}</td>
+          <td data-label="Контроль">${esc(x.control)}</td><td>${badge(x.status, PROBE_VERDICT[x.verdict] || x.verdict)}</td></tr>`).join("")}</tbody>
+      </table></div>` : ""}
+      ${n.hint || n.cmd ? `<div class="fix"><h4>Что делать</h4>${n.hint ? `<p>${esc(n.hint)}</p>` : ""}${n.cmd
+        ? `<div class="cmd"><pre class="code">${esc(n.cmd)}</pre><button class="btn small" type="button" data-copy>Копировать</button></div>` : ""}</div>` : ""}
+    </div>
+  </details></li>`).join("")}</ul>`;
+}
+
+function renderProbeHistory(hist) {
+  const runs = hist.slice(0, -1).slice(-5).reverse();
+  $("#probe-history").innerHTML = runs.map((h) => `<div class="item">
+    <div class="item-head"><span class="item-title">${fmtWhen(h.at)}</span>
+      <span class="item-meta">${esc(h.net)} · уверенность: ${PROBE_CONF[h.confidence]} · проблем: ${h.counts.crit} · внимание: ${h.counts.warn}</span></div>
+  </div>`).join("");
+}
+
+function renderProbe() {
+  const d = sec.data, p = d.probe || { session: null, last: null, history: [] };
+  const stage = probeStage();
+  const el = $("#probe-node"), names = d.nodes.map((n) => n.name);
+  if (el.dataset.names !== names.join(" ")) {
+    const pick = el.value;
+    el.dataset.names = names.join(" ");
+    el.innerHTML = `<option value="">Все узлы</option>` + names.map((n) => `<option>${esc(n)}</option>`).join("");
+    el.value = names.includes(pick) ? pick : "";
+  }
+  const busy = ["starting", "wait", "import", "foreign"].includes(stage);
+  $("#probe-start").hidden = busy;
+  el.hidden = busy;
+  $("#probe-cancel").hidden = !["wait", "foreign"].includes(stage);
+  renderProbeWait(stage);
+  renderProbeResult(p.last);
+  renderProbeHistory(p.history);
+  if (busy || stage === "expired") sec.kind = "probe";
+  // Пока проверка идёт: обратный отсчёт раз в секунду и состояние раз в 2 секунды
+  clearInterval(sec.tick);
+  if (stage === "wait") {
+    sec.tick = setInterval(() => document.querySelectorAll(".countdown").forEach((c) => {
+      c.textContent = fmtLeft(Number(c.dataset.until) - nowSec());
+    }), 1000);
+  }
+  clearTimeout(sec.poll);
+  if (busy) sec.poll = setTimeout(() => pollProbe(stage), stage === "import" ? 3000 : 2000);
+}
+
+// Опрос во время проверки: этап меняется — данные загружаются целиком
+async function pollProbe(was) {
+  try {
+    if (DEMO) {
+      sec.data = await demoAudit();
+    } else if (was === "import") {
+      sec.data = await getJson("api/security");
+    } else {
+      sec.data.probe_state = await getJson("api/probe");
+    }
+  } catch {
+    // нет связи: попробуем в следующий раз
+  }
+  if (probeStage() !== was) {
+    // Отчёт с ПК принят: задачу с ним запустила панель, карточка задачи её подхватит
+    job.poll();
+    if (was !== "import") return load();
+  }
+  render();
+}
+
+async function probeStart() {
+  formError("", "#action-error");
+  const node = $("#probe-node").value;
+  const body = { action: "start", nodes: node ? [node] : [], origin: location.origin };
+  try {
+    const id = DEMO ? demoProbeJob(body) : (await postJson("api/probe", body)).job;
+    sec.kind = "probe";
+    sec.data.probe_state = DEMO ? demoProbeState() : await getJson("api/probe");
+    job.start(id);
+  } catch (e) {
+    formError(e.message, "#action-error");
+  }
+}
+
+async function probeCancel() {
+  formError("", "#action-error");
+  try {
+    const id = DEMO ? demoProbeJob({ action: "cancel" }) : (await postJson("api/probe", { action: "cancel" })).job;
+    sec.kind = "probe";
+    job.start(id);
+  } catch (e) {
+    formError(e.message, "#action-error");
+  }
+}
+
 document.addEventListener("DOMContentLoaded", async () => {
   $("#refresh").addEventListener("click", load);
   $("#job-hide").addEventListener("click", () => job.hide());
   for (const block of BLOCKS) {
     $(`#${block}-run`).addEventListener("click", () => run(block));
     $(`#${block}-node`).addEventListener("change", () => sec.data && !sec.data.error && renderBlock(block));
-    $(`#${block}-checks`).addEventListener("click", async (e) => {
-      const btn = e.target.closest("[data-copy]");
-      if (btn) toast(await copyText(btn.previousElementSibling.textContent) ? "Скопировано" : "Не удалось скопировать");
-    });
   }
+  $("#probe-start").addEventListener("click", probeStart);
+  $("#probe-cancel").addEventListener("click", probeCancel);
+  $("#probe-node").addEventListener("change", () => sec.data && !sec.data.error && renderProbeResult((sec.data.probe || {}).last));
+  document.querySelector("main").addEventListener("click", async (e) => {
+    const btn = e.target.closest("[data-copy]");
+    if (btn) toast(await copyText(btn.previousElementSibling.textContent) ? "Скопировано" : "Не удалось скопировать");
+    // Скрипт по ссылке забирается один раз: дальше страница покажет, что ждёт отчёт
+    if (e.target.closest("[data-script]")) {
+      if (DEMO) {
+        e.preventDefault();
+        demoProbeScript();
+      }
+      setTimeout(() => pollProbe("wait"), 1500);
+    }
+  });
   await load();
   job.poll();
 });
@@ -642,6 +905,8 @@ function demoAudit() {
     nodes: demoNodes().map(({ name, addr, title }) => ({ name, addr, title })),
     history,
     settings: { cron: "30 5 * * * /usr/local/bin/iof audit cron >/dev/null 2>&1", tg: true },
+    probe: demoProbeData(),
+    probe_state: demoProbeState(),
     error: null,
     busy: false,
     migrate: null,
@@ -659,5 +924,177 @@ function demoAuditJob(body) {
   return demoRunJob("audit", `${title}: ${body.node || "все узлы"}`, lines, down ? "warn" : "ok", () => {
     demoAuditState.at[body.block] = Math.floor(Date.now() / 1000);
     demoAuditState.runs.push({ at: demoAuditState.at[body.block], block: body.block, nodes: names.length });
+  });
+}
+
+
+// Демо проверки с ПК. ?demo — результат со всеми вердиктами, ?demo=wait — мишени ждут отчёт,
+// ?demo=vpn — проверка шла через VPN (уверенность низкая), ?demo=open — провайдер ничего не фильтрует
+// (сайты из чёрного списка открываются, уверенность средняя). Тексты как у iof audit probe
+
+const DEMO_PROBE = new URLSearchParams(location.search).get("demo") || "";
+const demoProbe = {
+  stage: DEMO_PROBE === "wait" ? "wait" : "idle",
+  started: Math.floor(Date.now() / 1000) - 140,
+  script_at: null,
+  result_at: null,
+  extra: [],
+};
+
+const DEMO_LAYER_TITLES = { icmp: "Ping", tcp: "TCP", tls: "TLS", data: "Данные 256 КБ", udp: "UDP",
+  quic: "UDP, похожий на QUIC", hy2: "Порт Hysteria2", tunnel: "Туннель Hysteria2" };
+const DEMO_LAYERS = {
+  icmp: ["ok", "3 из 3, 41 мс", "3 из 3, 2 мс"],
+  tcp: ["ok", "3 из 3, 44 мс", "3 из 3, 1 мс"],
+  tls: ["ok", "3 из 3, 92 мс", "3 из 3, 3 мс"],
+  data: ["ok", "3 из 3, 1240 мс", "3 из 3"],
+  udp: ["ok", "5 из 5", "5 из 5"],
+  quic: ["ok", "5 из 5", "5 из 5"],
+  hy2: ["ok", "отвечает как QUIC", "отвечает как QUIC"],
+  tunnel: ["ok", "работает, 1630 мс", "—"],
+};
+
+// Как layer_status в iof: crit только при высокой уверенности, ping — только справка
+function demoLayerStatus(id, v, conf) {
+  if (conf === "low" || ["down", "unknown", "skipped"].includes(v)) return "none";
+  if (v === "ok") return "good";
+  if (id === "icmp") return "none";
+  return ["blocked", "stall"].includes(v) && conf === "high" ? "crit" : "warn";
+}
+
+function demoProbeNode(addr, conf, over, extra) {
+  const layers = Object.keys(DEMO_LAYERS).map((id) => {
+    const [verdict, pc, control, note = ""] = over[id] || DEMO_LAYERS[id];
+    return { id, title: DEMO_LAYER_TITLES[id], verdict, status: demoLayerStatus(id, verdict, conf), pc, control, note };
+  });
+  const status = layers.reduce((a, x) => (RANK[x.status] > RANK[a] ? x.status : a), "none");
+  return { addr, status, confidence: conf, value: extra.value || "с ПК проходят все проверенные слои",
+    detail: extra.detail || [], hint: ["warn", "crit"].includes(status) ? extra.hint || "" : "", cmd: "", layers };
+}
+
+function demoProbeResult(kind, at, session) {
+  const conf = kind === "vpn" ? "low" : kind === "open" ? "medium" : "high";
+  const local = "Контроль шёл с самого управляющего сервера: это не взгляд снаружи";
+  const tspu = "Похоже на ограничение ТСПУ: соединения с зарубежными хостингами встают после 15–20 КБ";
+  const stall = {
+    data: ["stall", "0 из 3; встаёт на 16 КБ (3 из 3)", "3 из 3", tspu],
+    hy2: ["down", "молчит", "молчит", "Управляющему серверу порт тоже не ответил согласованием версий. Так выглядит Salamander: тогда Hysteria2 проверяет только туннель"],
+  };
+  const stallText = { value: "данные встают на 16 КБ", detail: [tspu],
+    hint: "TLS-соединение с адресом встаёт после первых килобайт: так ТСПУ ограничивает соединения с зарубежными хостингами. Hysteria2 и AmneziaWG работают по UDP, их это не задевает: смотри строки UDP и Hysteria2." };
+  const none = (addr, value, cmd = "") => ({ addr, status: "none", confidence: conf, value, detail: [], hint: "", cmd, layers: [] });
+  const nodes = {
+    main: demoProbeNode("192.0.2.10", conf, {}, { detail: [local] }),
+    "node-1": demoProbeNode("198.51.100.20", conf, kind !== "full" ? {} : {
+      icmp: ["blocked", "0 из 3", "3 из 3, 38 мс", "ICMP по дороге режут часто, на VPN это не влияет"],
+      tcp: ["blocked", "0 из 3 (tcp: timeout)", "3 из 3, 36 мс"],
+      tls: ["skipped", "не дошло до TLS", "3 из 3, 74 мс"],
+      data: ["skipped", "не дошло до данных", "3 из 3"],
+      udp: ["blocked", "0 из 5", "5 из 5"],
+      quic: ["blocked", "0 из 5", "5 из 5"],
+      hy2: ["blocked", "молчит", "отвечает как QUIC"],
+      tunnel: ["fail", "не поднялся: client: timeout: no recent network activity", "—"],
+    }, kind !== "full" ? {} : {
+      value: "с ПК не проходят: TCP, UDP, UDP, похожий на QUIC, Порт Hysteria2; туннель Hysteria2 не поднялся",
+      hint: "Клиент Hysteria2 на ПК не поднял туннель по ссылке группы: проверь, что ссылка свежая (sudo iof hy2 show) и hysteria.exe новой версии. С ПК не доходит ничего: похоже, адрес узла заблокирован целиком. Проверь из другой сети (мобильный интернет): если так везде, помогает только новый адрес у хостера или другой узел.",
+    }),
+    "node-2": demoProbeNode("203.0.113.30", conf, kind === "vpn" ? {} : stall, kind === "vpn" ? {} : stallText),
+    "node-3": demoProbeNode("203.0.113.41", conf, kind !== "full" ? {} : {
+      udp: ["partial", "3 из 5", "5 из 5"],
+      tunnel: ["skipped", "не проверялся: в буфере обмена нет ссылки на этот узел", "—"],
+    }, kind !== "full" ? {} : { value: "с ПК проходят не все попытки: UDP",
+      hint: "Часть пакетов UDP теряется по дороге. Повтори проверку: если потери держатся, клиентам Hysteria2 на этом узле будет хуже, чем на остальных." }),
+    "node-4": none("203.0.113.42", "не проверялся: нет python3, он нужен мишени", "apt install python3"),
+    "node-5": none("203.0.113.43", "не проверялся: узел не ответил по SSH"),
+  };
+  const nets = {
+    full: { label: "AS12389 PJSC Rostelecom (RU)", ip: "95.24.17.0/24", vpn: "no", remap: false },
+    open: { label: "AS8359 MTS PJSC (RU)", ip: "37.110.4.0/24", vpn: "no", remap: false },
+    vpn: { label: "AS64500 Example Cloud LLC (US)", ip: "203.0.113.0/24", vpn: "yes", remap: false },
+  };
+  const black = "Сайты из probe-black.txt открываются: провайдер их не блокирует или трафик идёт в обход (VPN, прокси)";
+  const reasons = {
+    full: [],
+    open: [black],
+    vpn: ["IP источника — адрес узла node-2: проверка шла через VPN на этот узел. Выключи VPN на ПК и повтори",
+      "По whois сеть ПК не российская (US): провайдер другой страны или VPN",
+      "На ПК включён адаптер WireGuard Tunnel: если это VPN в режиме TUN, трафик шёл через него", black],
+  };
+  const counts = { none: 0, good: 0, warn: 0, crit: 0 };
+  Object.values(nodes).forEach((n) => { counts[n.status]++; });
+  return { at, session, started: at - 120, confidence: conf, reasons: reasons[kind], net: nets[kind],
+    internet: "ok", filtering: kind === "full" ? "yes" : "no", client: { os: "Windows 10.0.26100", proxy: "none" },
+    lists: [], nodes, counts };
+}
+
+function demoProbeData() {
+  const now = Math.floor(Date.now() / 1000);
+  const last = DEMO_PROBE === "vpn" ? "vpn" : DEMO_PROBE === "open" ? "open" : "full";
+  const results = [demoProbeResult("full", now - 6 * 86400, "a07c33d1"), demoProbeResult("open", now - 2 * 86400, "b18e2f40"),
+    demoProbeResult(last, now - 3 * 3600, "c29f4a51"), ...demoProbe.extra];
+  return {
+    session: null,
+    last: results[results.length - 1],
+    history: results.map((r) => ({ at: r.at, session: r.session, confidence: r.confidence, net: r.net.label, counts: r.counts })),
+  };
+}
+
+function demoProbeTargets() {
+  const check = (hy2) => `ping 3/3 · TCP 3/3 · TLS 3/3 · данные 3/3 · UDP 5/5 · QUIC 5/5 · Hysteria2 ${hy2 || "отвечает как QUIC"}`;
+  const t = (addr, port, fw, hy2) => ({ addr, state: "started", port, fw, error: "", local: false, check: check(hy2) });
+  return {
+    main: { ...t("192.0.2.10", 41873, "open"), local: true },
+    "node-1": t("198.51.100.20", 52210, "opened"),
+    "node-2": t("203.0.113.30", 33417, "open", "молчит"),
+    "node-3": t("203.0.113.41", 47702, "opened"),
+    "node-4": { addr: "203.0.113.42", state: "nopython", port: 0, fw: "", error: "", local: false, check: "" },
+    "node-5": { addr: "203.0.113.43", state: "down", port: 0, fw: "", error: "нет связи по SSH", local: false, check: "" },
+  };
+}
+
+function demoProbeState() {
+  const s = demoProbe, now = Date.now() / 1000;
+  if (s.stage === "idle") return { session: null, now, panel: null };
+  const panel = { mine: s.stage !== "starting", origin: location.origin, start_job: null, job: null,
+    ticket: s.script_at ? null : "demo-Rz3kq0sX9tLmN2pW7yVbC4fHq8Jd", script_at: s.script_at, result_at: s.result_at, pending: false };
+  if (s.stage === "starting") return { session: null, now, panel };
+  return { session: { id: "d3a0b5e6", started: s.started, expires: s.started + 900, stopped: 0, nodes: demoProbeTargets() }, now, panel };
+}
+
+// «Скрипт скачан»: через несколько секунд как будто приходит отчёт, ещё через несколько — результат
+function demoProbeScript() {
+  if (demoProbe.script_at) return;
+  demoProbe.script_at = Date.now() / 1000;
+  toast("Демо: скрипт не скачивается, отчёт придёт сам");
+  setTimeout(() => {
+    demoProbe.stage = "import";
+    demoProbe.result_at = Date.now() / 1000;
+    setTimeout(() => {
+      demoProbe.extra.push(demoProbeResult("full", Math.floor(Date.now() / 1000), "d3a0b5e6"));
+      demoProbe.stage = "idle";
+      demoProbe.script_at = demoProbe.result_at = null;
+    }, 4000);
+  }, 5000);
+}
+
+function demoProbeJob(body) {
+  if (body.action === "cancel") {
+    return demoRunJob("probe", "Проверка с ПК: остановка мишеней", ["$ iof audit probe stop",
+      "Останавливаю мишени проверки d3a0b5e6 на узлах: 6", "  main                 остановлено мишеней: 1",
+      "  node-1               остановлено мишеней: 1", "  node-4               мишеней не было"], "ok", () => {
+      demoProbe.stage = "idle";
+      demoProbe.script_at = null;
+    });
+  }
+  demoProbe.stage = "starting";
+  const n = body.nodes.length ? ` -n ${body.nodes[0]}` : "";
+  return demoRunJob("probe", "Проверка с ПК: запуск мишеней", [`$ iof${n} audit probe start`,
+    "Проверка с ПК d3a0b5e6: запускаю мишени на узлах (6) на 15 мин и проверяю их отсюда",
+    "  main                 порт 41873  контроль: ping 3/3 · TCP 3/3 · TLS 3/3 · данные 3/3 · UDP 5/5 · QUIC 5/5",
+    "  node-4               не проверяется: нет python3, он нужен мишени. Исправить на узле: apt install python3",
+    "Ошибки (1):", "  node-5               нет связи по SSH",
+    "Мишени работают до 15:12. Дальше страница «Безопасность» панели,"], "warn", () => {
+    demoProbe.stage = "wait";
+    demoProbe.started = Math.floor(Date.now() / 1000);
   });
 }

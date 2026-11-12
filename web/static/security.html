@@ -129,6 +129,28 @@
           <div id="dpi-checks"></div>
         </section>
 
+        <section id="probe" class="card">
+          <div class="card-head">
+            <h2>Доступность из РФ: проверка с ПК</h2>
+            <div class="actions">
+              <span id="probe-stamp" class="card-note"></span>
+              <label class="sr-only" for="probe-node">Узел</label>
+              <select id="probe-node"></select>
+              <button id="probe-start" class="btn primary" type="button">Начать проверку</button>
+              <button id="probe-cancel" class="btn" type="button" hidden>Остановить</button>
+            </div>
+          </div>
+          <p class="hint pad">Доходит ли трафик до узлов через твоего провайдера. На узлах на время проверки
+            (PROBE_TTL, по умолчанию 15 минут) поднимаются мишени, и управляющий сервер сразу проходит до них
+            все слои: это контроль. Затем скрипт PowerShell на ПК проходит те же слои и сдаёт отчёт сюда.
+            Где ПК не дошёл, а контроль дошёл, там и режут. Проверка показывает, что прошло из этой сети
+            в этот раз, и не обещает, что так будет всегда.</p>
+          <div id="probe-wait" class="probe-wait" hidden></div>
+          <div id="probe-health" class="health"></div>
+          <div id="probe-nodes"></div>
+          <div id="probe-history" class="list"></div>
+        </section>
+
         <section class="card">
           <div class="card-head">
             <h2>Проверка по расписанию</h2>
@@ -140,7 +162,7 @@
         </section>
       </main>
 
-      <footer class="foot">iof-web · проверку выполняет <code>iof audit run</code>, результат хранится в <code>/root/iof/audit</code>. Набор проверок по мотивам vps-audit</footer>
+      <footer class="foot">iof-web · проверку выполняют <code>iof audit run</code> и <code>iof audit probe</code>, результат хранится в <code>/root/iof/audit</code>. Набор проверок по мотивам vps-audit и rkn-block-checker</footer>
     </div>
   </div>
 </body>

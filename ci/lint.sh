@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # Статические проверки репозитория: синтаксис, shellcheck, pyflakes и правила проекта из CLAUDE.md,
-# которые легко забыть (NODE_FUNCS, STATIC_FILES, CSP панели, переводы строк LF).
+# которые легко забыть (NODE_FUNCS, STATIC_FILES, CSP панели, probe.ps1, переводы строк LF).
 # CI запускает её на каждый push, локально: bash ci/lint.sh (Linux, WSL или Git Bash).
 # Если shellcheck, python3 или pyflakes не установлены, их проверки пропускаются, а в CI это ошибка.
 set -uo pipefail
@@ -169,6 +169,36 @@ check_vendor() {
   fi
 }
 
+# Скрипт проверки с ПК: на месте, только ASCII (Windows PowerShell 5.1 читает файл без BOM в кодировке
+# ANSI), одна метка, куда панель вписывает данные проверки, и разбирается парсером PowerShell, если он
+# есть: pwsh на раннерах GitHub, powershell.exe в Windows. Без PowerShell разбор пропускается
+check_probe() {
+  local f="web/probe.ps1" n ps path out
+  if [[ ! -f "$f" ]]; then fail "probe.ps1: нет $f, его отдаёт панель для проверки с ПК"; return; fi
+  n="$(LC_ALL=C tr -d '\000-\177' < "$f" | wc -c)"
+  if (( n == 0 )); then ok "probe.ps1: только ASCII"; else fail "probe.ps1: не ASCII байт: $n"; fi
+  n="$(grep -c '__IOF_PROBE_CONFIG__' "$f")"
+  if [[ "$n" == "1" ]]; then ok "probe.ps1: одна метка для данных проверки"; else fail "probe.ps1: метка __IOF_PROBE_CONFIG__ должна быть одна, а их $n"; fi
+  if command -v pwsh >/dev/null 2>&1; then
+    ps=pwsh
+    path="$ROOT/$f"
+  elif command -v powershell.exe >/dev/null 2>&1 && command -v cygpath >/dev/null 2>&1; then
+    ps=powershell.exe
+    path="$(cygpath -w "$ROOT/$f")"
+  else
+    echo "skip  probe.ps1: нет PowerShell для разбора"
+    return
+  fi
+  local script="\$t = \$null; \$e = \$null; [void][Management.Automation.Language.Parser]::ParseFile('$path', [ref]\$t, [ref]\$e);"
+  script+=" \$e | ForEach-Object { [string]\$_.Extent.StartLineNumber + ': ' + \$_.Message }; exit [int](\$e.Count -gt 0)"
+  if out="$("$ps" -NoProfile -NonInteractive -Command "$script" 2>&1)"; then
+    ok "probe.ps1: разбирается ($ps)"
+  else
+    fail "probe.ps1: ошибки разбора ($ps)"
+    details "$out"
+  fi
+}
+
 # Скрипты запускаются на Linux: в репозитории только LF (.gitattributes)
 check_eol() {
   local found
@@ -186,6 +216,7 @@ check_static
 check_csp
 check_menu
 check_vendor
+check_probe
 check_eol
 
 echo

@@ -32,11 +32,12 @@ Docker Desktop там не запускается: Kaspersky Standard не да�
 | `web/iof-web.service` | systemd-юнит панели | `/etc/systemd/system/iof-web.service` |
 | `web/static/*` | страницы панели: html, js, css. Без подкаталогов: `install.sh` копирует `web/static/*` плоско | `/opt/iof-web/static/` |
 | `web/static/xterm.js`, `xterm-fit.js`, `xterm.css` | сторонний код для терминала: `@xterm/xterm` 6.0.0 и `@xterm/addon-fit` 0.11.0 из npm, см. «Терминал» | `/opt/iof-web/static/` |
+| `web/probe.ps1` | скрипт проверки с ПК (Windows PowerShell 5.1 и 7), только ASCII; не статика: панель отдаёт его по билету, вписав данные проверки вместо `__IOF_PROBE_CONFIG__` | `/opt/iof-web/probe.ps1` |
 | `web/design.md` | цвета, шрифты, размеры, брейкпоинты и классы панели | не ставится |
 | `docs/panel-*.png` | скриншоты панели для README в тёмной теме: два на виду, четыре под спойлером; сняты в демо-режиме (см. «Проверка изменений») | не ставится |
 | `README.md` | инструкция для пользователя | — |
 | `stand/` | тестовый стенд на Docker: `Dockerfile` (Ubuntu 24.04 с systemd и SSH), `compose.yml` (old, node1, node2, new), `stand.sh`, `test.sh` (проверка iof на стенде), `hy2-template.yaml` | не ставится; попадает в `/opt/iof` как часть клона |
-| `ci/lint.sh` | статические проверки: `bash -n`, shellcheck, разбор и pyflakes для `iof-web.py`, `node --check`, правила проекта (NODE_FUNCS, STATIC_FILES, CSP, одинаковое меню во всех html, LF) | не ставится |
+| `ci/lint.sh` | статические проверки: `bash -n`, shellcheck, разбор и pyflakes для `iof-web.py`, `node --check`, правила проекта (NODE_FUNCS, STATIC_FILES, CSP, одинаковое меню во всех html, `probe.ps1`: только ASCII, одна метка, разбор парсером PowerShell, если он есть, LF) | не ставится |
 | `.github/workflows/ci.yml` | CI в GitHub Actions, см. «Проверка изменений» | не ставится |
 | `.shellcheckrc` | настройки shellcheck: отключены SC2178 и SC2128, ложные срабатывания на local-переменные разных функций | не ставится |
 
@@ -60,7 +61,7 @@ Docker Desktop там не запускается: Kaspersky Standard не да�
 |---|---|
 | `nodes.conf` | `имя \| адрес для клиентов \| ssh (local или user@host[:port]) \| подпись`, `#` = комментарий |
 | `relays.conf` | `узел \| через узел \| hy2 порт ретранслятора \| hy2 порт узла \| awg порт ретранслятора \| awg порт узла`, `-` = протокол не ретранслируется |
-| `iof.env` | bash, читается через `source`: `TG_TOKEN`, `TG_CHAT`, `PARALLEL`, `IOF_SRC`, `HY2_TEMPLATE`, `HY2_CN` (CN сертификата для `hy2 install`, если сертификата из шаблона здесь нет), `AUDIT_KEEP`, `BLOCKLIST_URL` и `REGISTRY_URL` (списки для блока dpi: текст, IP или CIDR в строке, `#` — комментарий; по умолчанию пусто) |
+| `iof.env` | bash, читается через `source`: `TG_TOKEN`, `TG_CHAT`, `PARALLEL`, `IOF_SRC`, `HY2_TEMPLATE`, `HY2_CN` (CN сертификата для `hy2 install`, если сертификата из шаблона здесь нет), `AUDIT_KEEP`, `BLOCKLIST_URL` и `REGISTRY_URL` (списки для блока dpi: текст, IP или CIDR в строке, `#` — комментарий; по умолчанию пусто), `PROBE_TTL` (сколько секунд живут мишени проверки с ПК, 900, допустимо 20–3600) и `PROBE_PORTS` (порт мишеней: пусто — случайный свободный 20000–60000, `a-b` — из диапазона, `N` — этот порт; одинаково для всех узлов) |
 | `web.env` | EnvironmentFile панели: `IOF_WEB_PASSWORD`, `IOF_WEB_HOSTS`, `IOF_WEB_TTL`, `IOF_WEB_TERMINAL` (`1` включает терминал), а также `HY2_TEMPLATE`, `IOF_BIN`, `IOF_BASE`, `IOF_SSH_KEY` |
 | `state/<узел>` | последнее состояние для `iof check`: `ok` или текст проблем |
 | `hy2/index.tsv` | `логин<TAB>подпись<TAB>создан` |
@@ -73,6 +74,10 @@ Docker Desktop там не запускается: Kaspersky Standard не да�
 | `audit/server.json`, `audit/dpi.json` | последняя проверка блока `iof audit` по узлам: `{"nodes": {имя: {addr, reachable, at, checked, error, checks: [{id, status, value, detail, hint, cmd}]}}}`. Проверка одного узла заменяет только его запись |
 | `audit/history.jsonl` | строка JSON на запуск `iof audit run`: `at`, `block` (`server`, `dpi` или `all`), `nodes`, `counts`, `down`, `worse`; хранится `AUDIT_KEEP` последних (по умолчанию 30, задаётся в `iof.env`) |
 | `audit/cache/` | для блока dpi: `blocklist.txt` и `registry.txt` (списки по `BLOCKLIST_URL` и `REGISTRY_URL`, рядом `.url` — откуда скачан, `.err` — последняя загрузка не удалась) и `whois-<адрес>.txt` (`состояние\|AS\|организация\|страна`). Всё обновляется не чаще раза в сутки |
+| `audit/probe/session.json` | текущая проверка с ПК: `id`, `started`, `expires`, `ttl`, `stopped` (время `probe stop`, 0 — не останавливали), `lists` (`white`, `black`), `nodes`: {имя: {`addr`, `ip`, `local`, `state` (started или почему нет), `port`, `fp` (sha256 сертификата мишени), `hy2_port`, `fw` (opened или open), `error`, `control` (сырые слои контроля), `check` (их итог строкой)}}. Токена в нём нет. Новая `probe start` заменяет его |
+| `audit/probe/token` | токен мишеней текущей проверки (600). Его читают только панель (вписывает в скрипт для ПК) и `probe import` (отчёт с токеном не принимается) |
+| `audit/probe/<ГГГГММДД-ччммсс>.json` | результат проверки с ПК: `at`, `session`, `confidence` (high, medium, low), `reasons`, `net` (`label` — AS и организация по whois, `ip` — адрес ПК с маской /24, `vpn` no/suspect/yes, `remap`), `internet`, `filtering`, `client`, `lists`, `nodes`: {имя: {`status`, `confidence`, `value`, `detail`, `hint`, `cmd`, `layers`: [{`id`, `title`, `verdict`, `status`, `pc`, `control`, `note`}]}}, `counts`. Хранится `AUDIT_KEEP` последних |
+| `probe-white.txt`, `probe-black.txt` | контрольные сайты для ПК, по имени в строке, `#` — комментарий, не больше 10: белый открывается из России всегда (ya.ru, vk.com, gosuslugi.ru), чёрный давно заблокирован РКН (rutracker.org, linkedin.com, instagram.com). Создаются при первой `probe start` |
 | `migrate.conf` | только во время переноса: `role` (source на старом, target на новом), `id`, `peer` (адрес SSH другого сервера), `self` (на старом: как новый заходит на него), `started` |
 | `migrate-cron` | на новом сервере до `migrate finish`: задания cron старого сервера |
 | `hy2-template.yaml` | на сервере, получившем управление переносом: шаблон Hysteria2 (в `iof.env` и `web.env` на него указывает `HY2_TEMPLATE`) |
@@ -92,6 +97,10 @@ sha1-хэш. Повторный запуск с той же подписью д�
   в приложении. Бэкапы перед изменением: `/var/backups/iof-awg` на хосте.
 - Ретранслятор: `/etc/iof/relay.rules`, `/usr/local/sbin/iof-relay`, `iof-relay.service`,
   `/etc/sysctl.d/99-iof-relay.conf`. Работает на iptables DNAT+MASQUERADE в цепочках `IOF-*`.
+- Проверка с ПК, только на время проверки: юнит `iof-probe-<номер>` (systemd-run, `RuntimeMaxSec` =
+  `PROBE_TTL`, `--collect`), его файлы в `/run/iof-probe-<номер>` (сертификат, ключ, токен, `target.py`)
+  и, если входящие режутся, два правила ACCEPT в INPUT с комментарием `iof-probe-<номер>`. По сроку или
+  `probe stop` `ExecStopPost` снимает правила и удаляет папку, `n_probe_stop` добирает остатки.
 - Ночное обслуживание: юнит `iof-nightly` (systemd-run), лог `/var/log/iof-nightly.log`.
   На управляющем сервере лог запуска пишется в `/var/log/iof-nightly-run.log`.
 - Перенос управления: новый сервер принимает данные в `/root/.iof-migrate` и удаляет их, когда закончит.
@@ -130,10 +139,11 @@ sha1-хэш. Повторный запуск с той же подписью д�
   данные уходят в `.moved-`), cron ставится здесь. `cancel` на старом: `n_migrate_abort` на новом,
   блокировка снимается. Номер `id` в `migrate.conf` обоих серверов защищает от снятия не того сервера.
   Пока здесь role=source, `migrate_guard` в точке входа запрещает команды, которые что-то меняют
-  (список в `case "$cmd:${1:-}"`); `exec`, `check`, `status`, `update` и просмотр разрешены.
+  (список в `case "$cmd:${1:-}"`, для трёхсловных — в `case "$cmd:${1:-}:${2:-}"`, там `audit probe
+  start|stop|import`); `exec`, `check`, `status`, `update`, `audit run` и просмотр разрешены.
   При добавлении новой меняющей команды её нужно внести в этот список.
 
-- **Аудит безопасности** (`iof audit`, этапы 1 и 2 из плана `security-plan.md`). Блоков два:
+- **Аудит безопасности** (`iof audit`, этапы 1–3 из плана `security-plan.md`). Блоков два:
   `server` («Аудит сервера») и `dpi` («Защита от РКН (ТСПУ)»). `iof audit run [server|dpi|all]`,
   по умолчанию `all`; `audit cron` проверяет оба. Общее устройство:
   - Узел только собирает факты строками `ключ=значение`: `n_audit_server` (sshd -T, файрвол, fail2ban,
@@ -184,13 +194,48 @@ sha1-хэш. Повторный запуск с той же подписью д�
     цепочка `IOF-BLOCK` с переходом из INPUT, время списка — `/etc/iof/block.list` на узле.
     Port hopping: диапазон в `listen` или REDIRECT/DNAT диапазона на порт Hysteria2; цепочки `IOF-*`
     ретранслятора при этом не учитываются.
-- Не сделано: проверка доступности с ПК (этап 3), действия вроде включения port hopping и применения
-  блок-листа (этап 4). Не проверено: разбор конфига AWG на живом контейнере (на стенде AmneziaWG нет,
-  проверен на подставном конфиге в формате `awg0.conf` контейнера `amnezia-awg2`), GET по HTTP/3,
-  whois для адреса узла целиком (помощник проверен на публичных адресах отдельно), CrowdSec.
+- **Проверка с ПК** (`iof audit probe`, этап 3): доходит ли трафик до узлов через провайдера ПК.
+  - `probe start [--ttl с]` (с `-n`): токен (16 байт hex) пишется в `audit/probe/token`, на узлах
+    `n_probe_start <номер> <ttl> <PROBE_PORTS> <токен>` поднимает мишень, затем в том же задании pmap
+    (`probe_start_job`) управляющий сервер проходит до неё все слои: `AUDIT_NET_PY trace`, токен через stdin.
+    `AUDIT_PY probe-session` пишет `session.json`; ни одна мишень не поднялась — сессии нет, код 3.
+    Новая проверка не начинается, пока мишени прошлой живы и её не остановили (`probe_free`).
+  - Мишень: python3 из heredoc в `n_probe_start` (`/run/iof-probe-<номер>/target.py`), TCP и UDP на одном
+    порту. TLS с сертификатом от `openssl req -x509` (EC, случайный CN), первой строкой ждёт
+    `IOF-PROBE <токен>`, отвечает `OK <IP источника>` и 256 КБ; иначе закрывает соединение молча.
+    UDP отвечает только на пакет с `IOFP<токен>`, возвращая его той же длины с токеном, заменённым нулями.
+    Порт выбирается свободным по `ss` и мимо перенаправлений: правил ретранслятора, nat (port hopping),
+    диапазона в `listen` Hysteria2. Входящие режутся (ufw deny, политика DROP или запрет последним правилом
+    INPUT) — `ExecStartPre` вставляет ACCEPT с комментарием, `ExecStopPost` снимает. Своя таблица nftables
+    с политикой drop — `probe=nft`, мишень не поднимается. Нет python3 или openssl — `nopython`, `noopenssl`.
+    В командах `-p ExecStartPre=…` нет `$` и `%`: systemd-run раскрыл бы их сам.
+  - Слои (одинаковые у контроля и у `probe.ps1`): `icmp` (ping ×3), `conn` ×3 (TCP, TLS без SNI со сверкой
+    отпечатка, 256 КБ), `udp` и `quic` (5 пакетов: 68 байт, или 1200 байт за заголовком QUIC v1 Initial,
+    метка со смещения 26), `hy2` (зонд QUIC с версией `0x1a2a3a4a` на порт Hysteria2, как в блоке dpi),
+    у ПК ещё `tunnel` (hysteria.exe), контрольные сайты `lists` и `client` (адаптеры VPN, прокси).
+  - `probe import` (отчёт со stdin, до 300000 байт): `AUDIT_PY probe-src` находит IP источника,
+    `AUDIT_NET_PY whois` без кэша, `AUDIT_PY probe-import` сверяет `session` и что в отчёте нет токена
+    и считает вердикт. Слой: `ok`, `blocked`, `stall` (данные встали, у контроля пришли), `partial`,
+    `mitm` (отпечаток не совпал), `fail` (туннель), `down` (контроль тоже не прошёл), `unknown`, `skipped`.
+    Уверенность отчёта: `low` — IP источника равен адресу узла или частный без `remap`, не открылся ни один
+    белый сайт; `medium` — адаптер VPN, страна по whois не RU, открываются все чёрные сайты, часть белых;
+    иначе `high`. Меньше трёх попыток у узла — не выше `medium`. Статус (`layer_status`): при `low` всё
+    `none`; `crit` только `blocked` и `stall` при `high`; ping — справка, не хуже `none`.
+  - `probe stop` останавливает мишени сессии (`n_probe_stop <номер>`) и ставит `stopped`, сессия остаётся
+    для `import`. Без сессии убирает все `iof-probe-*` на выбранных узлах. `probe list` — последний
+    результат по слоям и прошлые. Узел `local` в контроле — взгляд не снаружи, об этом пишется в `detail`.
+  - `remap` в отчёте ставит `probe.ps1`, когда задан `IOF_PROBE_MAP` (стенд): частный IP источника тогда
+    не считается VPN, а в причинах сказано, что путь не через провайдера.
+- Не сделано: действия вроде включения port hopping и применения блок-листа (этап 4). Не проверено:
+  разбор конфига AWG на живом контейнере (на стенде AmneziaWG нет, проверен на подставном конфиге в
+  формате `awg0.conf` контейнера `amnezia-awg2`), GET по HTTP/3, whois для адреса узла целиком (помощник
+  проверен на публичных адресах отдельно), CrowdSec. Проверка с ПК из России с настоящим провайдером
+  (на стенде ПК ходит к контейнерам через WSL), мишень за `ufw` (на стенде проверена политика DROP
+  iptables), узел с одной таблицей nftables.
 
 Команды: `status`, `check` (для cron, Telegram, пишет `check.last`), `exec`, `refresh`, `init`,
-`api status|service|updates|audit` (audit — JSON), `audit run [server|dpi|all]|show|cron`, `update`, `version` (версию подставляет `install.sh` в `IOF_VERSION`),
+`api status|service|updates|audit` (audit — JSON), `audit run [server|dpi|all]|show|cron`,
+`audit probe start [--ttl с]|stop|import|list`, `update`, `version` (версию подставляет `install.sh` в `IOF_VERSION`),
 `node add|import|del|list`, `hy2 install|add|del|list|show|refresh|status|restart`,
 `awg add|keys|del|show|export|list|clients|refresh|status`, `relay add|del|list|apply`,
 `migrate start|finish|cancel|status`, `vless` (заглушка, WIP). Полный список в `usage()`.
@@ -216,11 +261,25 @@ sha1-хэш. Повторный запуск с той же подписью д�
   `iof hy2 install`), `POST /api/migrate` (`action`: start, finish или cancel), `POST /api/hy2`
   (`add|del|refresh`), `POST /api/node` (`restart_hy2|install_hy2|delete`, удаление = `node del` + `refresh`),
   `POST /api/term` (`{name, cols, rows}` → одноразовый билет терминала),
-  `GET /api/security` (вывод `iof api audit` плюс `error`, `busy`, `migrate`; узлы не опрашивает) и
+  `GET /api/security` (вывод `iof api audit` плюс `error`, `busy`, `migrate`, `probe_state`; узлы не опрашивает) и
   `POST /api/security` (`{block: "server" | "dpi", node}` → задача вида `audit`:
   `iof [-n узел] audit run <блок>`; блоки перечислены в `AUDIT_BLOCKS`. Страница «Безопасность»,
   `security.html` + `security.js`: у каждого блока из `BLOCKS` свои `#<блок>-node`, `-run`, `-stamp`,
   `-health`, `-checks`, отрисовка общая (`renderBlock`); демо-данные обоих блоков в `security.js`),
+  проверка с ПК (класс `Probes`, задачи вида `probe`): `POST /api/probe` (`{action: "start", nodes, origin}` →
+  задача `iof [-n узлы] audit probe start` и билет `secrets.token_urlsafe`; `origin` — адрес панели в браузере,
+  сверяется с `IOF_WEB_HOSTS`; `{action: "cancel"}` → `audit probe stop`), `GET /api/probe` (сессия из
+  `session.json` без токена и отпечатков, билет — пока скрипт не забран), `GET /api/probe/script?t=`
+  (без пароля панели, по билету один раз: `probe.ps1` с JSON проверки в base64 вместо метки, `no-store`,
+  `Content-Disposition`; пока сессии этого запуска нет — 409) и `POST /api/probe/result?t=` (без пароля, с
+  обычной защитой POST, но без требования `Origin`; до 256 КБ, один раз, до конца мишеней плюс 300 с).
+  Отчёт становится задачей «Проверка с ПК: результат»: сначала `audit probe stop`, потом `audit probe import`
+  со stdin, так мишени не переживут проверку при отказе import. Если `Jobs` занят, отчёт ждёт
+  и запускается из `on_done` (`Probes.kick`). Билет живёт только в памяти: после перезапуска панели
+  страница предлагает остановить проверку и начать заново. Билет в журнал не пишется (`TICKET_IN_URL`).
+  Команда для ПК на странице (`probeCommand`): `iwr … -OutFile iof-probe.ps1; powershell … -File .\iof-probe.ps1`.
+  Не `iex (iwr …)`: Kaspersky через AMSI блокирует такой запуск как загрузчик вредоносного кода
+  («ScriptContainedMaliciousContent»), а тот же скрипт из файла пропускает (проверено на этой машине).
   `POST /api/service` (`update`: `iof update` через `systemd-run --pipe --wait`, потому что install.sh
   перезапускает панель; вывод через `tee -p` ещё и в `/var/log/iof-update.log`, без этого `iof update`
   падал с кодом 1 на записи в оборванную трубу. Страница «Сервис» ждёт перезапуска, сравнивает
@@ -265,7 +324,9 @@ sha1-хэш. Повторный запуск с той же подписью д�
   с автообновлением. Там же общий код форм с задачей iof: `collectLogin`, `initLoginForm`,
   `showErrors`, `formError`, `postJson`, `pageJob`, `renderJobCard`, `jobResult`, `failReason`.
   У каждой страницы своя пара `*.html` + `*.js`. Страницы: Обзор (`index.html`, `dashboard.js`),
-  Hysteria2 (`hy2.*`), Безопасность (`security.*`, загрузка как на «Сервисе», без `startPage`), Добавить сервер (`add.*`), Перенос (`migrate.*`), Узел (`node.*`, `node.html#n=<имя>`,
+  Hysteria2 (`hy2.*`), Безопасность (`security.*`, загрузка как на «Сервисе», без `startPage`; карточка
+  `#probe` «Доступность из РФ» с этапами `probeStage`: idle, starting, wait, import, expired, foreign; пока
+  проверка идёт, страница опрашивает `api/probe` раз в 2 с), Добавить сервер (`add.*`), Перенос (`migrate.*`), Узел (`node.*`, `node.html#n=<имя>`,
   открывается кликом по строке таблицы узлов; терминал на нём — `term.js`), Сервис (`service.*`). Опрос задачи страницы — `watchJob`
   в `common.js`, оценка узла и `meter` — тоже там. Ключи и конфиги AWG
   панель не показывает.
@@ -281,7 +342,9 @@ sha1-хэш. Повторный запуск с той же подписью д�
   (`@container content`), а не под окно: часть ширины занимает меню. Таблица узлов на «Обзоре»
   переходит в карточки, когда содержимое уже 1000px (её минимальная ширина около 972px).
 - **Демо-режим** `?demo`: данные из `demo.js` или из функций `demo*` в js страницы, сервер не нужен.
-  На «Переносе» `?demo=source` и `?demo=target` показывают идущий перенос. Терминал в демо —
+  На «Переносе» `?demo=source` и `?demo=target` показывают идущий перенос. На «Безопасности»
+  `?demo=wait` — проверка с ПК ждёт отчёт (по «скачай скрипт» через несколько секунд приходит результат),
+  `?demo=vpn` — проверка шла через VPN, `?demo=open` — провайдер ничего не фильтрует. Терминал в демо —
   выдуманная оболочка (`demoShell` в `term.js`, команда `help`). Демо надо
   поддерживать при изменении страниц.
 
@@ -328,10 +391,18 @@ pipx). Задача `stand` поднимает на раннере стенд и
 Hysteria2 совпадает с шаблоном, порт отвечает на зонд QUIC, AmneziaWG — `none` «не установлен»;
 после правки конфига на узле проверка видит расхождение с шаблоном и `audit cron` сообщает о нём,
 после возврата конфига расхождения нет; пароля Hysteria2 нет в `/root/iof/audit`, `audit show`
-и `api audit`), панель (страницы, `/api/security` с обоими блоками и проверка узла задачей панели
-по каждому блоку,
+и `api audit`), проверку с ПК (мишени на узлах с python3 и «не проверяется» на узле без него; на первом
+узле с python3, который не управляющий сервер, входящие запрещены политикой DROP — мишень открывает
+порт двумя правилами; контроль проходит все слои; мишень отвечает по TLS и UDP только с токеном; готовый
+JSON: TCP не проходит — `crit` с высокой уверенностью, IP источника — адрес узла — всё `none` и низкая,
+отчёт с токеном и от другой проверки не принимаются; токена нет в выводе и результатах; после `stop`
+и по `RuntimeMaxSec` на узлах нет юнитов, папок в `/run` и правил), панель (страницы, `/api/security` с
+обоими блоками и проверка узла задачей панели по каждому блоку,
 `/api/dashboard`, отказ при чужом `Host`, без `X-IOF-Request` и с чужим `Origin`, создание и удаление
-группы задачей панели), терминал на каждый узел (WebSocket, размер окна при открытии и после resize,
+группы задачей панели; проверка с ПК: билет, скрипт по билету один раз и с данными проверки, отказ
+по неверному билету и чужому `Host`, отчёт без пароля и `Origin` принят, без `X-IOF-Request` и по
+неверному или повторному билету — нет, после отчёта результат есть, мишени остановлены, токена нет
+в ответах панели и логах задач), терминал на каждый узел (WebSocket, размер окна при открытии и после resize,
 команда, код выхода; отказ при повторном билете, неверном билете и чужом `Origin`; терминал включает
 `stand.sh setup`). Всё созданное удаляет, в том числе при обрыве. Узлы в `nodes.conf` должны
 называться как контейнеры. Интерфейс проверяется в демо-режиме (`index.html?demo` и другие страницы). Встроенный браузер не открывает `file://`,
@@ -369,12 +440,14 @@ wsl -d Ubuntu-24.04 -u root --cd /mnt/c/dev/repos/iof -- bash stand/stand.sh up
 
 ```bash
 bash stand/stand.sh up        # собрать и поднять; up old node1 — только эти серверы, как в CI
-bash stand/stand.sh setup     # iof из рабочей копии на old, поднятые узлы, Hysteria2, группа ссылок, cron, терминал
+bash stand/stand.sh setup     # iof из рабочей копии на old, поднятые узлы, Hysteria2, группа ссылок, cron, терминал, python3 на node1
 bash stand/stand.sh test      # проверка iof на стенде (stand/test.sh); после переноса: test new
 bash stand/stand.sh sync      # после правок: залить рабочую копию на серверы, где стоит iof
 bash stand/stand.sh tunnel    # панели: old http://localhost:8081/, new http://localhost:8082/
 bash stand/stand.sh probe start   # VPN-клиент на node2 через Hysteria2 на old, проверка связи раз в 2 с
 bash stand/stand.sh probe show
+bash stand/stand.sh pc on new     # проверка с ПК с Windows против стенда, печатает $env:IOF_PROBE_MAP
+bash stand/stand.sh pc off
 bash stand/stand.sh iof old status
 bash stand/stand.sh down
 ```
@@ -397,6 +470,16 @@ bash stand/stand.sh down
 - Ретранслятор `test` проверяет клиентом на самом узле: пакеты уходят на ретранслятор и через DNAT
   возвращаются на узел. С самого ретранслятора так нельзя: свои пакеты не проходят PREROUTING.
 - Ключ для туннелей хранится в `~/.iof-stand` в WSL: с `/mnt/c` ssh ключ не берёт, там права 777.
+- python3 для мишеней проверки с ПК `setup` ставит только на node1: node2 остаётся без него, и `test`
+  проверяет оба случая. В CI (old и node1) случая «нет python3» нет, `test` об этом пишет.
+  `setup` же пишет в `iof.env` управляющего сервера `PROBE_PORTS=47000`.
+- Проверка с ПК с Windows: WSL в режиме NAT пересылает на 127.0.0.1 только TCP, UDP доходит лишь до
+  адреса WSL, а сеть 172.30.0.0/24 из Windows не видна. `stand.sh pc on [управляющий]` ставит в WSL DNAT
+  (комментарий `iof-stand-pc`): порт `470NN` на мишень `172.30.0.NN:47000` по TCP и UDP, `471NN` на 443/udp
+  (Hysteria2), и ACCEPT в `DOCKER-USER`; печатает `$env:IOF_PROBE_MAP` для `probe.ps1`. Адрес WSL меняется
+  при перезапуске WSL, тогда `pc on` заново; `pc off` убирает правила. Панель для ПК — через `stand.sh tunnel`.
+- Git Bash на машине разработки может сломаться при обновлении Git for Windows (пустой `usr\bin`):
+  тогда `lint.sh` и скрипты стенда запускаются из WSL (`wsl -d Ubuntu-24.04 -u root -- bash ci/lint.sh`).
 
 ## Неочевидные места
 

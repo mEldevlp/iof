@@ -19,6 +19,9 @@ MIGRATE_FILE="$BASE/migrate.conf"
 MIGRATE_INBOX="/root/.iof-migrate"   # куда новый управляющий сервер принимает данные при переносе
 CHECK_FILE="$BASE/check.last"        # итог последнего iof check для панели
 AUDIT_DIR="$BASE/audit"              # результаты iof audit: <блок>.json и history.jsonl
+PROBE_DIR="$AUDIT_DIR/probe"         # проверка с ПК: session.json, token, результаты <время>.json
+PROBE_WHITE="$BASE/probe-white.txt"  # контрольные сайты для проверки с ПК: открываются из России всегда
+PROBE_BLACK="$BASE/probe-black.txt"  # и давно заблокированные РКН
 SSH_KEY="/root/.ssh/iof_ed25519"
 
 # Коммит и дата этой версии, install.sh подставляет их при установке
@@ -32,6 +35,8 @@ IOF_SRC="/opt/iof"   # клон репозитория для iof update
 AUDIT_KEEP=30        # сколько последних запусков iof audit хранить в истории
 BLOCKLIST_URL=""     # список адресов сканеров для iof audit: текст, по IP или CIDR в строке, # — комментарий
 REGISTRY_URL=""      # выгрузка реестра блокировок в том же формате: есть ли в ней адреса узлов
+PROBE_TTL=900        # сколько секунд живут мишени проверки с ПК (iof audit probe)
+PROBE_PORTS=""       # порт мишеней: пусто — случайный свободный 20000–60000, a-b — из диапазона, N — этот
 IOF_ONLY=""
 if [[ -f "$ENV_FILE" ]]; then
   # shellcheck source=/dev/null # файл на сервере, в репозитории его нет
@@ -1207,6 +1212,209 @@ n_audit_dpi() {
 }
 
 
+# Проверка доступности узлов с ПК (iof audit probe). На время проверки на узле работает мишень:
+# юнит iof-probe-<номер> из systemd-run с RuntimeMaxSec, по сроку systemd останавливает его сам.
+# Внутри python3: TLS с самоподписанным сертификатом на TCP-порту и эхо на UDP-порту с тем же
+# номером. Отвечает мишень только тому, кто знает токен, он лежит в файле 600 в /run/iof-probe-<номер>.
+# Если входящие режет файрвол (ufw или iptables), ExecStartPre открывает порт правилом с комментарием
+# iof-probe-<номер>, ExecStopPost снимает его и удаляет файлы. Цепочки IOF-* не трогаются
+
+# Мишень: n_probe_start <номер> <сколько секунд жить> <порты: пусто, a-b или N> <токен>.
+# Печатает now, hy2_port (порт Hysteria2, если она есть), probe — started или почему нет: nopython,
+# noopenssl, nosystemd, nft (входящие режет своя таблица nftables), busy (нет свободного порта),
+# error; для started ещё port, fp (sha256 сертификата), fw (opened — правило поставлено, open —
+# входящие и так открыты), until; при ошибке error
+n_probe_start() {
+  local id="$1" ttl="$2" spec="$3" token="$4" unit dir lo=20000 hi=60000 port="" p s ipt="" filt=0
+  local tries=0 max fp fw="open" py pre=() post=()
+  n_defaults
+  [[ $EUID -eq 0 ]] || n_err "нужны права root"
+  [[ "$id" =~ ^[0-9a-f]{8}$ && "$ttl" =~ ^[0-9]{2,4}$ && "$token" =~ ^[0-9a-f]{32}$ ]] || n_err "неверные параметры мишени"
+  unit="iof-probe-$id"
+  dir="/run/$unit"
+  echo "now=$(date +%s)"
+  if [[ -f "$CONFIG" ]]; then echo "hy2_port=$(n_hy2_port)"; fi
+  py="$(command -v python3 || true)"
+  if [[ -z "$py" ]]; then echo "probe=nopython"; return 0; fi
+  if ! command -v openssl >/dev/null 2>&1; then echo "probe=noopenssl"; return 0; fi
+  if ! command -v systemd-run >/dev/null 2>&1; then echo "probe=nosystemd"; return 0; fi
+
+  # Режут ли входящие: ufw с запретом, политика DROP или запрет последним правилом в INPUT.
+  # Своя таблица nftables с политикой drop правилом iptables не открывается, такой узел не проверяем
+  ipt="$(command -v iptables || true)"
+  if [[ -n "$ipt" ]]; then
+    s="$(timeout 10 "$ipt" -w 5 -S INPUT 2>/dev/null || true)"
+    if grep -q '^-P INPUT DROP' <<<"$s" || tail -n 1 <<<"$s" | grep -qE '^-A INPUT -j (DROP|REJECT)'; then filt=1; fi
+    if command -v ufw >/dev/null 2>&1; then
+      s="$(timeout 10 ufw status verbose 2>/dev/null || true)"
+      if grep -qE '^Default: (deny|reject) \(incoming\)' <<<"$s"; then filt=1; fi
+    fi
+  fi
+  if command -v nft >/dev/null 2>&1; then
+    s="$(timeout 10 nft list ruleset 2>/dev/null | awk '
+      /^table / { t = $2 " " $3 }
+      /hook input/ && /policy drop/ && t != "ip filter" && t != "ip6 filter" { print t; exit }' || true)"
+    if [[ -n "$s" ]]; then printf 'probe=nft\nerror=таблица %s\n' "$s"; return 0; fi
+  fi
+
+  # Порт свободен по TCP и UDP и не попадает под перенаправления: правила ретранслятора, nat
+  # (port hopping) и диапазон в listen Hysteria2. Такие пакеты до мишени не дошли бы
+  if [[ "$spec" =~ ^([0-9]{1,5})-([0-9]{1,5})$ ]]; then lo="${BASH_REMATCH[1]}"; hi="${BASH_REMATCH[2]}"
+  elif [[ "$spec" =~ ^[0-9]{1,5}$ ]]; then lo="$spec"; hi="$spec"
+  elif [[ -n "$spec" ]]; then n_err "PROBE_PORTS: нужен порт или диапазон a-b"; fi
+  lo=$((10#$lo)); hi=$((10#$hi))
+  (( lo >= 1 && lo <= hi && hi <= 65535 )) || n_err "PROBE_PORTS: порты от 1 до 65535, начало не больше конца"
+  s="$( {
+    if [[ -n "$ipt" ]]; then timeout 10 "$ipt" -w 5 -t nat -S 2>/dev/null | grep -oE -- '--dports? [0-9:,]+' | cut -d' ' -f2 | tr ',' '\n'; fi
+    if [[ -f /etc/iof/relay.rules ]]; then awk '$1 !~ /^#/ && NF >= 4 { print $2 }' /etc/iof/relay.rules; fi
+    if [[ -f "$CONFIG" ]]; then sed -n 's/^listen:[[:space:]]*//p' "$CONFIG" | grep -oE '[0-9]+-[0-9]+$' | head -n 1; fi
+  } | tr ':' '-' || true)"
+  max=$(( hi - lo + 1 ))
+  if (( max > 100 )); then max=100; fi
+  while (( tries < max )); do
+    tries=$((tries + 1))
+    p="$(shuf -i "$lo-$hi" -n 1)"
+    if [[ -n "$(ss -Htuln "sport = :$p" 2>/dev/null)" ]]; then continue; fi
+    if awk -F- -v p="$p" 'NF { b = (NF > 1 ? $2 : $1); if (p >= $1 && p <= b) f = 1 } END { exit !f }' <<<"$s"; then continue; fi
+    port="$p"
+    break
+  done
+  if [[ -z "$port" ]]; then printf 'probe=busy\nerror=свободного порта в %s-%s нет\n' "$lo" "$hi"; return 0; fi
+
+  # Сертификат на один запуск, имя в нём случайное. Отпечаток сверяют контроль и скрипт на ПК
+  rm -rf "$dir"
+  mkdir -m 700 "$dir"
+  if ! openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 2 \
+       -subj "/CN=$(head -c 6 /dev/urandom | od -An -tx1 | tr -d ' \n')" \
+       -keyout "$dir/key.pem" -out "$dir/cert.pem" >/dev/null 2>&1; then
+    rm -rf "$dir"
+    printf 'probe=error\nerror=openssl не создал сертификат\n'
+    return 0
+  fi
+  fp="$(openssl x509 -in "$dir/cert.pem" -noout -fingerprint -sha256 | sed 's/^.*=//; s/://g' | tr 'A-F' 'a-f')"
+  printf '%s\n' "$token" > "$dir/token"
+  cat > "$dir/target.py" <<'EOF'
+# Мишень проверки с ПК (iof audit probe). По TLS первой строкой ждёт «IOF-PROBE <токен>», тогда
+# отвечает «OK <IP источника>» и отдаёт 256 КБ. По UDP отвечает только на пакет с «IOFP<токен>»
+# внутри: возвращает его же с затёртым токеном, той же длины. Остальным не шлёт ничего
+import hmac, os, socket, ssl, sys, threading
+
+d, port = sys.argv[1], int(sys.argv[2])
+with open(os.path.join(d, "token"), "rb") as f:
+    token = f.read().strip()
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.load_cert_chain(os.path.join(d, "cert.pem"), os.path.join(d, "key.pem"))
+blob = os.urandom(16384) * 16
+slots = threading.BoundedSemaphore(32)
+
+
+def serve(conn, addr):
+    s = conn
+    try:
+        conn.settimeout(8)
+        s = ctx.wrap_socket(conn, server_side=True)
+        line = b""
+        while b"\n" not in line and len(line) < 128:
+            chunk = s.recv(128)
+            if not chunk:
+                return
+            line += chunk
+        if not hmac.compare_digest(line.split(b"\n", 1)[0].strip(), b"IOF-PROBE " + token):
+            return
+        s.sendall(b"OK " + addr[0].encode() + b"\n" + blob)
+        # Ждём, пока клиент закроет соединение сам: иначе хвост данных может потеряться
+        s.settimeout(5)
+        while s.recv(4096):
+            pass
+    except (OSError, ValueError):
+        pass
+    finally:
+        s.close()
+        slots.release()
+
+
+def udp():
+    u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    u.bind(("0.0.0.0", port))
+    mark = b"IOFP" + token
+    while True:
+        data, addr = u.recvfrom(2048)
+        i = data.find(mark)
+        if i >= 0:
+            u.sendto(data[:i + 4] + b"\0" * len(token) + data[i + len(mark):], addr)
+
+
+srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("0.0.0.0", port))
+srv.listen(64)
+threading.Thread(target=udp, daemon=True).start()
+while True:
+    c, a = srv.accept()
+    if slots.acquire(blocking=False):
+        threading.Thread(target=serve, args=(c, a), daemon=True).start()
+    else:
+        c.close()
+EOF
+  chmod 600 "$dir"/*
+
+  # Правила только там, где входящие режутся. Команды без $ и %: systemd-run раскрыл бы их сам
+  if (( filt )); then
+    fw="opened"
+    for p in tcp udp; do
+      pre+=(-p "ExecStartPre=$ipt -w 5 -I INPUT 1 -p $p --dport $port -m comment --comment $unit -j ACCEPT")
+      post+=(-p "ExecStopPost=-$ipt -w 5 -D INPUT -p $p --dport $port -m comment --comment $unit -j ACCEPT")
+    done
+  fi
+  if ! s="$(systemd-run --quiet --collect --unit="$unit" -p RuntimeMaxSec="$ttl" "${pre[@]}" "${post[@]}" \
+         -p "ExecStopPost=/bin/rm -rf $dir" "$py" "$dir/target.py" "$dir" "$port" 2>&1)"; then
+    rm -rf "$dir"
+    printf 'probe=error\nerror=%s\n' "$(tail -n 1 <<<"$s")"
+    return 0
+  fi
+  for (( tries = 0; tries < 40; tries++ )); do
+    if [[ -n "$(ss -Htln "sport = :$port" 2>/dev/null)" && -n "$(ss -Huln "sport = :$port" 2>/dev/null)" ]]; then
+      printf '%s\n' "probe=started" "port=$port" "fp=$fp" "fw=$fw" "until=$(( $(date +%s) + ttl ))"
+      return 0
+    fi
+    if ! systemctl is-active --quiet "$unit"; then break; fi
+    sleep 0.25
+  done
+  s="$(journalctl -q -u "$unit" -n 3 -o cat --no-pager 2>/dev/null | tail -n 1 || true)"
+  systemctl stop "$unit" >/dev/null 2>&1 || true
+  printf 'probe=error\nerror=мишень не поднялась%s\n' "${s:+: $s}"
+}
+
+# Останавливает мишени: n_probe_stop [номер], без номера — все iof-probe-* на узле. Добирает то, что
+# могло остаться без ExecStopPost: правила с комментарием iof-probe-* и папки в /run.
+# Печатает stopped (сколько юнитов остановлено) и left (сколько остатков пришлось убрать)
+n_probe_stop() {
+  local id="${1:-}" pat re u d n=0 left=0 ipt line rule=()
+  [[ $EUID -eq 0 ]] || n_err "нужны права root"
+  if [[ -n "$id" && ! "$id" =~ ^[0-9a-f]{8}$ ]]; then n_err "неверный номер проверки"; fi
+  pat="iof-probe-${id:-*}"
+  re="iof-probe-$id"
+  if [[ -z "$id" ]]; then re="iof-probe-[0-9a-f]{8}"; fi
+  for u in $(systemctl list-units --all --plain --no-legend "$pat.service" 2>/dev/null | awk '{ print $1 }'); do
+    systemctl stop "$u" >/dev/null 2>&1 || true
+    n=$((n + 1))
+  done
+  systemctl reset-failed "$pat.service" >/dev/null 2>&1 || true
+  ipt="$(command -v iptables || true)"
+  if [[ -n "$ipt" ]]; then
+    while IFS= read -r line; do
+      read -ra rule <<<"${line/#-A/-D}"
+      if "$ipt" -w 5 "${rule[@]}" 2>/dev/null; then left=$((left + 1)); fi
+    done < <("$ipt" -w 5 -S INPUT 2>/dev/null | grep -E -- "--comment \"?$re\"?( |$)" || true)
+  fi
+  # shellcheck disable=SC2231 # шаблон имени нужен без кавычек
+  for d in /run/$pat; do
+    if [[ -d "$d" ]]; then rm -rf "$d"; left=$((left + 1)); fi
+  done
+  printf 'stopped=%s\nleft=%s\n' "$n" "$left"
+}
+
+
 # Перенос управляющего сервера (iof migrate). Эти функции выполняются на новом
 # или на старом управляющем сервере, когда тот уже стал обычным узлом.
 
@@ -1364,6 +1572,7 @@ NODE_FUNCS=(
   n_status
   n_free_ports n_relay_apply n_relay_status
   n_audit_listen n_audit_expect n_audit_server n_audit_hy2_blocks n_audit_awg_params n_audit_dpi
+  n_probe_start n_probe_stop
   n_migrate_check n_migrate_receive n_migrate_uninstall n_migrate_demote n_migrate_abort
 )
 
@@ -3575,10 +3784,13 @@ declare -A AUDIT_AWG=()   # узел -> хэш параметров AmneziaWG в
 #                          версий, reply — ответил чем-то другим, silent — молчит, closed — порт закрыт
 #  banner <адрес> <порт>   open|приветствие службы, closed или filtered
 #  whois <адрес> <папка кэша>   состояние|AS|организация|страна; состояние: ok, private, fail.
-#                          Запрос идёт на whois.iana.org, оттуда к региональному реестру
+#                          Запрос идёт на whois.iana.org, оттуда к региональному реестру. Пустая
+#                          папка — без кэша (так спрашивается адрес ПК при проверке с ПК)
 #  inlist <файл> <адрес>   hit|запись, если адрес есть в списке IP и CIDR, иначе miss
+#  trace <адрес> <порт> <отпечаток> <порт Hysteria2 или 0>   токен на stdin. Контроль проверки с ПК:
+#                          те же слои до мишени, что проходит probe.ps1 на ПК, JSON в одну строку
 AUDIT_NET_PY=$(cat <<'EOF'
-import ipaddress, os, re, socket, sys, time
+import hashlib, ipaddress, json, os, re, socket, ssl, subprocess, sys, time
 
 
 def quic(host, port):
@@ -3668,9 +3880,9 @@ def field(text, names):
 def whois(ip, cache):
     if not ipaddress.ip_address(ip).is_global:
         return "private|||"
-    path = os.path.join(cache, "whois-%s.txt" % ip)
+    path = os.path.join(cache, "whois-%s.txt" % ip) if cache else ""
     try:
-        if time.time() - os.path.getmtime(path) < 86400:
+        if path and time.time() - os.path.getmtime(path) < 86400:
             with open(path, encoding="utf-8") as f:
                 return f.read().strip()
     except OSError:
@@ -3690,6 +3902,8 @@ def whois(ip, cache):
     org = field(text, ["org-name", "OrgName", "owner", "descr", "netname", "NetName"])
     out = "ok|%s|%s|%s" % (asn.group(1).upper() if asn else "", org.replace("|", " ")[:60],
                             field(text, ["country"])[:2].upper())
+    if not path:
+        return out
     try:
         tmp = path + ".%d.tmp" % os.getpid()
         with open(tmp, "w", encoding="utf-8") as f:
@@ -3721,8 +3935,132 @@ def inlist(path, ip):
     return "miss"
 
 
+# Слои до мишени проверки с ПК. Пакеты и порядок те же, что у probe.ps1, иначе контроль
+# и ПК сравнивались бы по разным проверкам
+FULL = 262144
+
+
+def ms(t0):
+    return int((time.monotonic() - t0) * 1000)
+
+
+def ping(ip):
+    try:
+        p = subprocess.run(["ping", "-n", "-c", "3", "-W", "2", ip], capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired):
+        return {"sent": 0, "got": 0, "ms": 0}
+    got = re.search(r"(\d+) (?:packets )?received", p.stdout)
+    avg = re.search(r"= [\d.]+/([\d.]+)/", p.stdout)
+    return {"sent": 3, "got": int(got.group(1)) if got else 0, "ms": int(float(avg.group(1))) if avg else 0}
+
+
+# Одна попытка: TCP, TLS со сверкой отпечатка, строка с токеном, ответ «OK <IP источника>» и 256 КБ
+def conn(ip, port, token, fp):
+    r = {"tcp": None, "tls": None, "fp": "", "bytes": 0, "ms": 0, "src": "", "err": ""}
+    stage, t0 = "tcp", time.monotonic()
+    s = None
+    try:
+        s = socket.create_connection((ip, port), timeout=5)
+        r["tcp"] = ms(t0)
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        stage, t0 = "tls", time.monotonic()
+        s = ctx.wrap_socket(s)
+        r["tls"] = ms(t0)
+        r["fp"] = "match" if hashlib.sha256(s.getpeercert(True)).hexdigest() == fp else "mismatch"
+        stage, t0 = "data", time.monotonic()
+        s.sendall(b"IOF-PROBE " + token + b"\n")
+        s.settimeout(6)
+        buf, head, n = b"", None, 0
+        while (head is None or n < FULL) and time.monotonic() - t0 < 20:
+            chunk = s.recv(65536)
+            if not chunk:
+                r["err"] = "data: closed"
+                break
+            if head is not None:
+                n += len(chunk)
+                continue
+            buf += chunk
+            if b"\n" in buf:
+                head, rest = buf.split(b"\n", 1)
+                n = len(rest)
+            elif len(buf) > 128:
+                break
+        if head is None or not head.startswith(b"OK "):
+            r["err"] = r["err"] or "data: no answer"
+        else:
+            r["src"] = head[3:].decode("ascii", "replace")[:45]
+            if n < FULL and not r["err"]:
+                r["err"] = "data: timeout"
+        r["bytes"], r["ms"] = min(n, FULL), ms(t0)
+    except socket.timeout:
+        r["err"] = stage + ": timeout"
+    except ssl.SSLError as e:
+        r["err"] = stage + ": " + (e.reason or "ssl").lower()
+    except OSError as e:
+        r["err"] = stage + ": " + (e.strerror or e.__class__.__name__).lower()
+    finally:
+        if s is not None:
+            s.close()
+    if r["err"].startswith("data") and not r["ms"]:
+        r["ms"] = ms(t0)
+    return r
+
+
+# Пакет UDP с меткой: маленький или 1200 байт с заголовком как у QUIC v1 Initial
+def packet(shaped, mark, nonce):
+    body = mark + nonce
+    if not shaped:
+        return body + os.urandom(24)
+    pkt = b"\xc3\x00\x00\x00\x01\x08" + os.urandom(8) + b"\x08" + os.urandom(8) + b"\x00\x44\xb0" + body
+    return pkt + os.urandom(1200 - len(pkt))
+
+
+def udp(ip, port, token, shaped):
+    mark, zero = b"IOFP" + token, b"IOFP" + b"\0" * len(token)
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.connect((ip, port))
+    sent, got, closed = [], set(), False
+    for _ in range(5):
+        nonce = os.urandom(8)
+        sent.append(nonce)
+        try:
+            s.send(packet(shaped, mark, nonce))
+        except OSError:
+            closed = True
+        time.sleep(0.05)
+    s.settimeout(0.3)
+    end = time.monotonic() + 2
+    while time.monotonic() < end and len(got) < len(sent):
+        try:
+            data = s.recv(2048)
+        except socket.timeout:
+            continue
+        except ConnectionRefusedError:
+            closed = True
+            continue
+        except OSError:
+            continue
+        i = data.find(zero)
+        if i >= 0:
+            got.add(data[i + len(zero):i + len(zero) + 8])
+    s.close()
+    return {"sent": len(sent), "got": len(got & set(sent)), "closed": closed}
+
+
+def trace(ip, port, fp, hy2):
+    token = sys.stdin.readline().strip().encode()
+    out = {"icmp": ping(ip), "conn": [conn(ip, port, token, fp) for _ in range(3)],
+           "udp": udp(ip, port, token, False), "quic": udp(ip, port, token, True),
+           "hy2": quic(ip, hy2) if hy2 else ""}
+    return json.dumps(out, separators=(",", ":"))
+
+
 mode = sys.argv[1]
-if mode == "quic":
+if mode == "trace":
+    print(trace(sys.argv[2], int(sys.argv[3]), sys.argv[4], int(sys.argv[5])))
+elif mode == "quic":
     print(quic(sys.argv[2], int(sys.argv[3])))
 elif mode == "banner":
     print(banner(sys.argv[2], int(sys.argv[3])))
@@ -4563,7 +4901,7 @@ audit_nodes() {
 #  show <папка> <brief|full> <блоки через запятую> <узел>...  stdin: справочник. Печатает
 #       последнюю проверку узлов
 AUDIT_PY=$(cat <<'EOF'
-import json, os, sys, time
+import ipaddress, json, os, re, sys, time
 
 RANK = {"none": 0, "good": 1, "warn": 2, "crit": 3}
 WORD = {"none": "нет данных", "good": "в порядке", "warn": "внимание", "crit": "проблема"}
@@ -4682,6 +5020,7 @@ def api(base):
     for b in blocks(d):
         saved = load(os.path.join(base, b + ".json"), {}).get("nodes", {})
         out["blocks"][b] = {"nodes": {k: saved[k] for k in known if k in saved}}
+    out["probe"] = probe_api(os.path.join(base, "probe"))
     json.dump(out, sys.stdout, ensure_ascii=False)
     print()
 
@@ -4733,11 +5072,536 @@ def show(base, mode, want, names):
                             print(f"         {line}")
 
 
+# Проверка с ПК (iof audit probe). Сессия: session.json, токен мишеней отдельно в token. Отчёт
+# probe.ps1 приходит сырым, вердикт по слоям считается здесь: ПК сравнивается с контролем,
+# который управляющий сервер прошёл до тех же мишеней сразу после запуска. crit только при
+# высокой уверенности: контроль прошёл, у ПК есть интернет, VPN не видно, попытки сходятся
+
+FULL = 262144
+LAYERS = [("icmp", "Ping"), ("tcp", "TCP"), ("tls", "TLS"), ("data", "Данные 256 КБ"), ("udp", "UDP"),
+          ("quic", "UDP, похожий на QUIC"), ("hy2", "Порт Hysteria2"), ("tunnel", "Туннель Hysteria2")]
+CONF = {"low": 0, "medium": 1, "high": 2}
+CONF_WORD = {"high": "высокая", "medium": "средняя", "low": "низкая"}
+# Почему мишень на узле не запущена: текст и команда
+NOT_STARTED = {
+    "nopython": ("нет python3, он нужен мишени", "apt install python3"),
+    "noopenssl": ("нет openssl для сертификата мишени", "apt install openssl"),
+    "nosystemd": ("нет systemd-run, мишень не запустить", ""),
+    "nft": ("входящие режет своя таблица nftables, а правило для мишени iof ставит только через iptables", ""),
+    "busy": ("нет свободного порта для мишени", ""),
+    "error": ("мишень не запустилась", ""),
+    "down": ("узел не ответил по SSH", ""),
+}
+TUNNEL_SKIP = {"nohysteria": "нет hysteria.exe", "nolinks": "в буфере обмена нет ссылок hy2://",
+               "nolink": "в буфере обмена нет ссылки на этот узел", "declined": "отказ на ПК"}
+HY2_WORD = {"vn": "отвечает как QUIC", "silent": "молчит", "closed": "порт закрыт", "reply": "ответ не как у QUIC",
+            "error": "ошибка проверки"}
+
+
+def fail(text):
+    print("Ошибка: " + text, file=sys.stderr)
+    sys.exit(2)
+
+
+def num(v, hi):
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return 0
+    return int(v) if 0 <= v <= hi else 0
+
+
+def txt(v, n):
+    return "".join(ch for ch in v if ch.isprintable())[:n] if isinstance(v, str) else ""
+
+
+def obj(v):
+    return v if isinstance(v, dict) else {}
+
+
+def mid(values):
+    values = sorted(values)
+    return values[len(values) // 2] if values else 0
+
+
+def private(ip):
+    try:
+        return not ipaddress.ip_address(ip).is_global
+    except ValueError:
+        return False
+
+
+def side(t):
+    """Сырые слои одной стороны, ПК или контроля -> счётчики по слоям."""
+    t = obj(t)
+    conn = [c for c in t.get("conn") if isinstance(c, dict)][:5] if isinstance(t.get("conn"), list) else []
+    tcp = [c for c in conn if c.get("tcp") is not None]
+    tls = [c for c in tcp if c.get("tls") is not None]
+    size = [num(c.get("bytes"), FULL) for c in tls]
+    icmp, u, q = obj(t.get("icmp")), obj(t.get("udp")), obj(t.get("quic"))
+    return {
+        "n": len(conn),
+        "icmp": (num(icmp.get("got"), 10), num(icmp.get("sent"), 10), num(icmp.get("ms"), 60000)),
+        "tcp": (len(tcp), mid([num(c.get("tcp"), 60000) for c in tcp])),
+        "tls": (len(tls), mid([num(c.get("tls"), 60000) for c in tls])),
+        "mitm": any(c.get("fp") == "mismatch" for c in tls),
+        "full": size.count(FULL),
+        "stall": [b for b in size if 0 < b < FULL],
+        "data_ms": mid([num(c.get("ms"), 120000) for c, b in zip(tls, size) if b == FULL]),
+        "errs": [txt(c.get("err"), 60) for c in conn if c.get("err")],
+        "src": [txt(c.get("src"), 45) for c in conn if c.get("src")],
+        "udp": (num(u.get("got"), 50), num(u.get("sent"), 50)),
+        "quic": (num(q.get("got"), 50), num(q.get("sent"), 50)),
+        "hy2": txt(t.get("hy2"), 10),
+        "tunnel": obj(t.get("tunnel")),
+    }
+
+
+def tries(ok, n, ms=0, errs=()):
+    if not n:
+        return "не проверялся"
+    s = f"{ok} из {n}" + (f", {ms} мс" if ok and ms else "")
+    if ok < n and errs:
+        s += f" ({errs[0]})"
+    return s
+
+
+def check_line(s):
+    """Короткий итог одной стороны для сессии и консоли."""
+    parts = []
+    if s["icmp"][1]:
+        parts.append(f"ping {s['icmp'][0]}/{s['icmp'][1]}")
+    if s["n"]:
+        parts += [f"TCP {s['tcp'][0]}/{s['n']}", f"TLS {s['tls'][0]}/{s['n']}", f"данные {s['full']}/{s['n']}"]
+    for k, title in (("udp", "UDP"), ("quic", "QUIC")):
+        if s[k][1]:
+            parts.append(f"{title} {s[k][0]}/{s[k][1]}")
+    if s["hy2"]:
+        parts.append("Hysteria2 " + HY2_WORD.get(s["hy2"], s["hy2"]))
+    return " · ".join(parts) or "нет данных"
+
+
+def verdicts(pc, ctl, hy2_port):
+    """Слои узла: [(id, вердикт, с ПК, контроль, пояснение)]. Вердикты: ok, blocked, stall, partial,
+    mitm, fail, down (контроль тоже не прошёл), unknown (не с чем сравнить), skipped."""
+    rows = []
+    got, sent, m = pc["icmp"]
+    cg, cs, cm = ctl["icmp"]
+    v = ("skipped" if not sent else "unknown" if not cs and not got else "down" if cs and not cg
+         else "ok" if got == sent else "partial" if got else "blocked")
+    rows.append(("icmp", v, tries(got, sent, m), tries(cg, cs, cm) if cs else "нет ping на управляющем сервере",
+                 "ICMP по дороге режут часто, на VPN это не влияет" if v in ("blocked", "partial") else ""))
+
+    n, cn = pc["n"], ctl["n"]
+    ok, cok = pc["tcp"][0], ctl["tcp"][0]
+    v = "skipped" if not n else "down" if not cok else "blocked" if not ok else "partial" if ok < n else "ok"
+    rows.append(("tcp", v, tries(ok, n, pc["tcp"][1], pc["errs"]), tries(cok, cn, ctl["tcp"][1], ctl["errs"]), ""))
+
+    t, ct = pc["tls"][0], ctl["tls"][0]
+    pct = tries(t, ok, pc["tls"][1], [e for e in pc["errs"] if e.startswith("tls")])
+    if pc["mitm"]:
+        pct += ", сертификат подменён"
+    v = ("skipped" if not ok else "down" if not ct else "mitm" if pc["mitm"] else "blocked" if not t
+         else "partial" if t < ok else "ok")
+    rows.append(("tls", v, pct if ok else "не дошло до TLS", tries(ct, cok, ctl["tls"][1]), ""))
+
+    full, stall = pc["full"], pc["stall"]
+    note, pct = "", f"{full} из {t}" + (f", {pc['data_ms']} мс" if full else "")
+    if stall:
+        kb = mid(stall) // 1024
+        pct += f"; встаёт на {kb} КБ ({len(stall)} из {t})"
+        if 8 <= kb <= 40 and not full:
+            note = "Похоже на ограничение ТСПУ: соединения с зарубежными хостингами встают после 15–20 КБ"
+    v = ("skipped" if not t else "down" if not ctl["full"] else "ok" if full == t
+         else "stall" if not full and stall else "blocked" if not full else "partial")
+    rows.append(("data", v, pct if t else "не дошло до данных", f"{ctl['full']} из {ct}", note))
+
+    for k in ("udp", "quic"):
+        (g, s), (cg, cs) = pc[k], ctl[k]
+        v = "skipped" if not s else "down" if not cg else "blocked" if not g else "partial" if g < s - 1 else "ok"
+        note = ""
+        if k == "quic" and v == "blocked" and rows[-1][1] == "ok":
+            note = "Обычный UDP проходит, а пакеты, похожие на QUIC, — нет"
+        rows.append((k, v, tries(g, s), tries(cg, cs), note))
+
+    p, c = pc["hy2"], ctl["hy2"]
+    if not hy2_port:
+        rows.append(("hy2", "skipped", "Hysteria2 на узле нет", "—", ""))
+    elif not p:
+        rows.append(("hy2", "skipped", "не проверялся", HY2_WORD.get(c, c or "—"), ""))
+    elif c != "vn":
+        rows.append(("hy2", "down", HY2_WORD.get(p, p), HY2_WORD.get(c, c or "—"),
+                     "Управляющему серверу порт тоже не ответил согласованием версий. Так выглядит Salamander: тогда "
+                     "Hysteria2 проверяет только туннель"))
+    else:
+        rows.append(("hy2", "ok" if p == "vn" else "blocked", HY2_WORD.get(p, p), HY2_WORD["vn"], ""))
+
+    tn = pc["tunnel"]
+    if tn.get("tested") is not True:
+        why = txt(tn.get("reason"), 20)
+        rows.append(("tunnel", "skipped", "не проверялся: " + TUNNEL_SKIP.get(why, why or "нет данных"), "—", ""))
+    elif tn.get("ok") is True:
+        rows.append(("tunnel", "ok", "работает" + (f", {num(tn.get('ms'), 120000)} мс" if tn.get("ms") else ""), "—", ""))
+    else:
+        rows.append(("tunnel", "fail", "не поднялся: " + (txt(tn.get("err"), 120) or "нет ответа"), "—", ""))
+    return rows
+
+
+def layer_status(lid, v, conf):
+    if conf == "low" or v in ("down", "unknown", "skipped"):
+        return "none"
+    if v == "ok":
+        return "good"
+    if lid == "icmp":
+        return "none"
+    return "crit" if v in ("blocked", "stall") and conf == "high" else "warn"
+
+
+def node_result(name, n, rep_t, conf):
+    """Итог узла: статус, уверенность, значение, совет и слои."""
+    state = n.get("state", "")
+    if state != "started":
+        text, cmd = NOT_STARTED.get(state, ("мишень не запустилась", ""))
+        err = txt(n.get("error"), 120)
+        return {"addr": n.get("addr", ""), "status": "none", "confidence": conf, "value": "не проверялся: " + text,
+                "detail": [err] if err and state not in ("nopython", "noopenssl") else [], "hint": "", "cmd": cmd, "layers": []}
+    if rep_t is None:
+        return {"addr": n.get("addr", ""), "status": "none", "confidence": conf, "value": "скрипт на ПК этот узел не проверил",
+                "detail": [], "hint": "", "cmd": "", "layers": []}
+    pc, ctl = side(rep_t), side(n.get("control"))
+    lc = conf if pc["n"] >= 3 or conf == "low" else "medium"
+    rows = []
+    for lid, v, pct, ctt, note in verdicts(pc, ctl, n.get("hy2_port")):
+        rows.append({"id": lid, "title": dict(LAYERS)[lid], "verdict": v, "status": layer_status(lid, v, lc),
+                     "pc": pct, "control": ctt, "note": note})
+    by = {r["id"]: r for r in rows}
+    st = max((r["status"] for r in rows), key=lambda s: RANK[s])
+    core = [r for r in rows if r["id"] not in ("icmp", "tunnel")]
+    parts, hint, detail = [], [], []
+    if n.get("local"):
+        detail.append("Контроль шёл с самого управляющего сервера: это не взгляд снаружи")
+    if all(r["verdict"] in ("down", "skipped") for r in core):
+        parts.append("мишень не ответила и управляющему серверу")
+        hint.append("Порт мишени закрыт у хостера (security group) или файрволом по пути. Задай в /root/iof/iof.env "
+                    "PROBE_PORTS диапазоном, открытым у хостера, и повтори.")
+    blocked = [r["title"] for r in rows if r["verdict"] == "blocked" and r["id"] != "icmp"]
+    if blocked:
+        parts.append("с ПК не проходят: " + ", ".join(blocked))
+    if by["data"]["verdict"] == "stall":
+        parts.append("данные встают на " + by["data"]["pc"].rsplit("встаёт на ", 1)[-1].split(" (")[0])
+        hint.append("TLS-соединение с адресом встаёт после первых килобайт: так ТСПУ ограничивает соединения с зарубежными "
+                    "хостингами. Hysteria2 и AmneziaWG работают по UDP, их это не задевает: смотри строки UDP и Hysteria2.")
+    partial = [r["title"] for r in rows if r["verdict"] == "partial" and r["id"] != "icmp"]
+    if partial:
+        parts.append("с ПК проходят не все попытки: " + ", ".join(partial))
+    if by["tls"]["verdict"] == "mitm":
+        parts.append("сертификат мишени подменён по дороге")
+        hint.append("Так делают антивирусы с проверкой защищённых соединений (например Kaspersky), корпоративные прокси или "
+                    "провайдер. Выключи проверку HTTPS в антивирусе и повтори.")
+    if by["tunnel"]["verdict"] == "fail":
+        parts.append("туннель Hysteria2 не поднялся")
+        hint.append("Клиент Hysteria2 на ПК не поднял туннель по ссылке группы: проверь, что ссылка свежая (sudo iof hy2 show) "
+                    "и hysteria.exe новой версии.")
+    if "UDP, похожий на QUIC" in blocked and "UDP" not in blocked:
+        hint.append("Похожие на QUIC пакеты режутся, обычный UDP проходит. Hysteria2 без Salamander выглядит как QUIC: "
+                    "Salamander это прячет, см. «Режим маскировки» в блоке «Защита от РКН».")
+    elif "Порт Hysteria2" in blocked:
+        hint.append("Порт Hysteria2 с ПК не отвечает, хотя отвечает управляющему серверу: его режут по дороге. "
+                    "Варианты — другой порт или смена портов (port hopping), см. блок «Защита от РКН».")
+    if "TCP" in blocked and "UDP" in blocked:
+        hint.append("С ПК не доходит ничего: похоже, адрес узла заблокирован целиком. Проверь из другой сети (мобильный "
+                    "интернет): если так везде, помогает только новый адрес у хостера или другой узел.")
+    if not parts:
+        quiet = all(r["verdict"] in ("ok", "skipped", "unknown") for r in rows)
+        parts.append("с ПК проходят все проверенные слои" if quiet else "сравнить не с чем")
+    for r in rows:
+        if r["note"] and r["status"] in ("warn", "crit"):
+            detail.append(r["note"])
+    return {"addr": n.get("addr", ""), "status": st, "confidence": lc, "value": "; ".join(parts), "detail": detail,
+            "hint": " ".join(hint) if st in ("warn", "crit") else "", "cmd": "", "layers": rows}
+
+
+def report_confidence(rep, sess, srcs, who):
+    """Уверенность во всём отчёте и почему она такая. Возвращает (уверенность, причины, сеть ПК)."""
+    conf, reasons = "high", []
+
+    def lower(to, why):
+        nonlocal conf
+        if CONF[to] < CONF[conf]:
+            conf = to
+        reasons.append(why)
+
+    ips = {}
+    for name, n in sess["nodes"].items():
+        for a in (n.get("ip"), n.get("addr")):
+            if a:
+                ips[a] = name
+    src = max(set(srcs), key=srcs.count) if srcs else ""
+    remap = rep.get("remap") is True
+    net = {"label": "не определена", "ip": "", "vpn": "no", "remap": remap}
+    if src:
+        net["ip"] = re.sub(r"\.\d+$", ".0/24", src) if re.match(r"^\d+\.\d+\.\d+\.\d+$", src) else src
+    if src in ips:
+        net["vpn"] = "yes"
+        lower("low", f"IP источника — адрес узла {ips[src]}: проверка шла через VPN на этот узел. Выключи VPN на ПК и повтори")
+    elif src and private(src) and not remap:
+        net["vpn"] = "yes"
+        lower("low", "IP источника частный: ПК ходил к узлам через VPN или из одной с ними сети")
+    elif not src:
+        reasons.append("IP источника неизвестен: ни одна попытка не дошла до данных")
+    if remap:
+        reasons.append("Адреса узлов подменены IOF_PROBE_MAP: это стенд, путь до узлов идёт не через провайдера")
+    w = who.split("|")
+    if w[0] == "ok":
+        net["label"] = " ".join(x for x in (w[1], w[2]) if x) + (f" ({w[3]})" if w[3] else "") or "не определена"
+        if w[3] and w[3] != "RU":
+            net["vpn"] = "suspect" if net["vpn"] == "no" else net["vpn"]
+            lower("medium", f"По whois сеть ПК не российская ({w[3]}): провайдер другой страны или VPN")
+    elif w[0] == "private":
+        net["label"] = "частный адрес"
+    client = obj(rep.get("client"))
+    vpn = [txt(x, 80) for x in client.get("vpn") or [] if isinstance(x, str)][:5] if isinstance(client.get("vpn"), list) else []
+    if vpn:
+        if net["vpn"] == "no":
+            net["vpn"] = "suspect"
+        lower("medium", "На ПК включён адаптер " + ", ".join(vpn) + ": если это VPN в режиме TUN, трафик шёл через него")
+    if client.get("proxy") in ("manual", "pac"):
+        reasons.append("В системе задан прокси. На проверку он не влияет: скрипт ходит напрямую")
+    lists = [x for x in rep.get("lists") or [] if isinstance(x, dict)] if isinstance(rep.get("lists"), list) else []
+    white = [x for x in lists if x.get("list") == "white"]
+    black = [x for x in lists if x.get("list") == "black"]
+    wok, bok = sum(x.get("ok") is True for x in white), sum(x.get("ok") is True for x in black)
+    internet = "unknown" if not white else "ok" if wok == len(white) else "fail" if not wok else "partial"
+    filtering = "unknown" if not black else "yes" if not bok else "no" if bok == len(black) else "partial"
+    if internet == "fail":
+        lower("low", "Не открылся ни один сайт из probe-white.txt: у ПК нет интернета или его режут")
+    elif internet == "partial":
+        lower("medium", "Открылись не все сайты из probe-white.txt")
+    if filtering == "no":
+        lower("medium", "Сайты из probe-black.txt открываются: провайдер их не блокирует или трафик идёт в обход (VPN, прокси)")
+    elif filtering == "partial":
+        reasons.append("Часть сайтов из probe-black.txt открывается")
+    return conf, reasons, net, internet, filtering, lists
+
+
+def read_session(base):
+    sess = load(os.path.join(base, "session.json"), None)
+    return sess if isinstance(sess, dict) and isinstance(sess.get("nodes"), dict) else None
+
+
+def probe_session(base):
+    sess = {"id": "", "started": 0, "expires": 0, "ttl": 0, "stopped": 0, "lists": {"white": [], "black": []}, "nodes": {}}
+    cur = None
+    for raw in sys.stdin:
+        f = raw.rstrip("\n").split("\t") + [""] * 6
+        if f[0] == "P":
+            sess.update(id=f[1], started=int(f[2]), ttl=int(f[3]), expires=int(f[2]) + int(f[3]))
+        elif f[0] in ("W", "X"):
+            sess["lists"]["white" if f[0] == "W" else "black"].append(f[1])
+        elif f[0] == "N":
+            cur = {"addr": f[2], "local": f[4] == "1", "state": "" if f[3] == "1" else "down", "error": f[5][:200],
+                   "ip": "", "port": 0, "fp": "", "hy2_port": 0, "fw": "", "control": None}
+            sess["nodes"][f[1]] = cur
+        elif f[0] == "F" and cur is not None:
+            k, _, v = f[1].partition("=")
+            if k == "probe":
+                cur["state"] = v
+            elif k in ("port", "hy2_port"):
+                cur[k] = int(v) if v.isdigit() else 0
+            elif k in ("fp", "fw", "ip", "error"):
+                cur[k] = v[:200]
+            elif k == "trace":
+                try:
+                    cur["control"] = json.loads(v)
+                except ValueError:
+                    cur["control"] = {}
+    for n in sess["nodes"].values():
+        n["state"] = n["state"] or "error"
+        n["check"] = check_line(side(n["control"])) if n["state"] == "started" else ""
+    started = any(n["state"] == "started" for n in sess["nodes"].values())
+    if started:
+        write(os.path.join(base, "session.json"), json.dumps(sess, ensure_ascii=False))
+    for name, n in sess["nodes"].items():
+        if n["state"] == "started":
+            print(f"  {name:<20} порт {n['port']:<6} контроль: {n['check']}")
+        else:
+            text, cmd = NOT_STARTED.get(n["state"], ("мишень не запустилась", ""))
+            print(f"  {name:<20} не проверяется: {text}" + (f" ({n['error']})" if n["error"] and not cmd else "")
+                  + (f". Исправить на узле: {cmd}" if cmd else ""))
+    if not started:
+        sys.exit(3)
+
+
+def probe_stop(base):
+    sess = read_session(base)
+    if sess and not sess.get("stopped"):
+        sess["stopped"] = int(time.time())
+        write(os.path.join(base, "session.json"), json.dumps(sess, ensure_ascii=False))
+
+
+def probe_nodes(base):
+    sess = read_session(base)
+    if sess:
+        print(sess["id"], sess["expires"], sess.get("stopped", 0))
+        for name in sess["nodes"]:
+            print(name)
+
+
+def report_srcs(rep):
+    out = []
+    for t in rep.get("targets") or []:
+        if isinstance(t, dict):
+            out += side(t)["src"]
+    return [s for s in out if re.match(r"^[0-9a-fA-F.:]+$", s)]
+
+
+def load_report(path, sess, token):
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError:
+        fail("отчёт не прочитать")
+    if token and token.encode() in raw:
+        fail("в отчёте есть токен мишеней, такой отчёт не принимаю")
+    try:
+        rep = json.loads(raw.decode("utf-8-sig"))
+    except (UnicodeDecodeError, ValueError):
+        fail("отчёт не JSON")
+    if not isinstance(rep, dict) or rep.get("v") != 1:
+        fail("это не отчёт probe.ps1")
+    if sess is not None and rep.get("session") != sess["id"]:
+        fail(f"отчёт от другой проверки ({txt(rep.get('session'), 20) or 'без номера'}), сейчас {sess['id']}")
+    return rep
+
+
+def probe_src(path):
+    srcs = report_srcs(load_report(path, None, ""))
+    if srcs:
+        print(max(set(srcs), key=srcs.count))
+
+
+def results(base):
+    names = sorted(f for f in os.listdir(base) if re.match(r"^\d{8}-\d{6}(-\d+)?\.json$", f)) if os.path.isdir(base) else []
+    return names
+
+
+def probe_import(base, keep, path):
+    sess = read_session(base)
+    if sess is None:
+        fail("нет сессии проверки с ПК: сначала sudo iof audit probe start")
+    try:
+        with open(os.path.join(base, "token"), encoding="utf-8") as f:
+            token = f.read().strip()
+    except OSError:
+        token = ""
+    rep = load_report(path, sess, token)
+    who = ""
+    for raw in sys.stdin:
+        f = raw.rstrip("\n").split("\t") + [""]
+        if f[0] == "W":
+            who = f[1]
+    by = {}
+    for t in rep.get("targets") or []:
+        if isinstance(t, dict) and t.get("node") in sess["nodes"] and t["node"] not in by:
+            by[t["node"]] = t
+    conf, reasons, net, internet, filtering, lists = report_confidence(rep, sess, report_srcs(rep), who)
+    client = obj(rep.get("client"))
+    out = {"at": int(time.time()), "session": sess["id"], "started": sess["started"], "confidence": conf,
+           "reasons": reasons, "net": net, "internet": internet, "filtering": filtering,
+           "client": {"os": txt(client.get("os"), 60), "proxy": txt(client.get("proxy"), 10)},
+           "lists": [{"host": txt(x.get("host"), 80), "list": x.get("list"), "ok": x.get("ok") is True,
+                      "err": txt(x.get("err"), 60)} for x in lists][:40],
+           "nodes": {}, "counts": dict.fromkeys(RANK, 0)}
+    for name, n in sess["nodes"].items():
+        r = node_result(name, n, by.get(name), conf)
+        out["nodes"][name] = r
+        out["counts"][r["status"]] += 1
+    os.makedirs(base, exist_ok=True)
+    stamp, i = time.strftime("%Y%m%d-%H%M%S", time.localtime(out["at"])), 1
+    name = stamp + ".json"
+    while os.path.exists(os.path.join(base, name)):
+        i += 1
+        name = f"{stamp}-{i}.json"
+    write(os.path.join(base, name), json.dumps(out, ensure_ascii=False))
+    for old in results(base)[:-max(keep, 1)]:
+        os.remove(os.path.join(base, old))
+    print_result(out, False)
+
+
+def print_result(r, full):
+    color = os.environ.get("IOF_COLOR") == "1"
+
+    def paint(st, text):
+        return f"\033[{COLOR[st]}m{text}\033[0m" if color and st in COLOR else text
+
+    when = time.strftime("%d.%m.%Y %H:%M", time.localtime(r["at"]))
+    print(f"Проверка с ПК {r['session']} от {when}: сеть ПК {r['net']['label']}, уверенность {CONF_WORD[r['confidence']]}")
+    for why in r["reasons"]:
+        print(f"     {why}")
+    for name, n in r["nodes"].items():
+        print(f"  {paint(n['status'], MARK[n['status']])} {name}: {n['value']}")
+        if not full:
+            continue
+        for line in n["detail"]:
+            print(f"       {line}")
+        for x in n["layers"]:
+            print(f"       {paint(x['status'], MARK[x['status']])} {x['title']}: с ПК {x['pc']}; контроль {x['control']}")
+        if n["hint"]:
+            print(f"       Что делать: {n['hint']}")
+        if n["cmd"]:
+            print(f"       Исправить на узле: {n['cmd']}")
+
+
+def probe_list(base):
+    names = results(base)
+    if not names:
+        print("Проверок с ПК ещё не было: sudo iof audit probe start, затем страница «Безопасность» панели")
+        return
+    print_result(load(os.path.join(base, names[-1]), {}), True)
+    if len(names) > 1:
+        print("\nРаньше:")
+        for name in reversed(names[:-1]):
+            r = load(os.path.join(base, name), {})
+            if r:
+                c = r["counts"]
+                print(f"  {time.strftime('%d.%m.%Y %H:%M', time.localtime(r['at']))}  {r['net']['label']}, "
+                      f"уверенность {CONF_WORD[r['confidence']]}: проблем {c['crit']}, внимание {c['warn']}, "
+                      f"в порядке {c['good']}, нет данных {c['none']}")
+
+
+def probe_api(base):
+    """Раздел probe для iof api audit: сессия без токена и контроля, последний результат, история."""
+    sess, names = read_session(base), results(base)
+    pub = None
+    if sess:
+        pub = {k: sess.get(k) for k in ("id", "started", "expires", "stopped")}
+        pub["nodes"] = {name: {k: n.get(k) for k in ("addr", "state", "port", "fw", "error", "local", "check")}
+                        for name, n in sess["nodes"].items()}
+    hist = []
+    for name in names:
+        r = load(os.path.join(base, name), {})
+        if r:
+            hist.append({"at": r["at"], "session": r["session"], "confidence": r["confidence"],
+                         "net": r["net"]["label"], "counts": r["counts"]})
+    last = load(os.path.join(base, names[-1]), None) if names else None
+    return {"session": pub, "last": last, "history": hist}
+
+
 mode = sys.argv[1]
 if mode == "save":
     save(sys.argv[2], sys.argv[3], int(sys.argv[4]))
 elif mode == "api":
     api(sys.argv[2])
+elif mode == "probe-session":
+    probe_session(sys.argv[2])
+elif mode == "probe-nodes":
+    probe_nodes(sys.argv[2])
+elif mode == "probe-stop":
+    probe_stop(sys.argv[2])
+elif mode == "probe-src":
+    probe_src(sys.argv[2])
+elif mode == "probe-import":
+    probe_import(sys.argv[2], int(sys.argv[3]), sys.argv[4])
+elif mode == "probe-list":
+    probe_list(sys.argv[2])
 else:
     show(sys.argv[2], sys.argv[3], sys.argv[4].split(","), sys.argv[5:])
 EOF
@@ -4825,14 +5689,221 @@ api_audit() {
   { audit_catalog; audit_nodes; printf 'S\tcron\t%s\nS\ttg\t%s\n' "$cron" "$tg"; } | audit_py api "$AUDIT_DIR"
 }
 
+
+# Проверка доступности узлов с ПК: iof [-n узлы] audit probe start | stop | import | list.
+# start поднимает на узлах мишени (n_probe_start) и сразу проходит до них все слои отсюда: это контроль.
+# Скрипт probe.ps1 на ПК проходит те же слои и сдаёт сырой отчёт в панель, import считает вердикт.
+# Токен мишеней лежит в $PROBE_DIR/token, в вывод iof, лог задачи и JSON он не попадает
+
+PROBE_ID=""
+PROBE_TOKEN=""
+PROBE_RUN_TTL=""
+
+# PROBE_PORTS: пусто, порт или диапазон a-b
+probe_ports_ok() {
+  local a b
+  if [[ -z "$1" ]]; then return 0; fi
+  if [[ "$1" =~ ^([0-9]{1,5})-([0-9]{1,5})$ ]]; then a="${BASH_REMATCH[1]}"; b="${BASH_REMATCH[2]}"
+  elif [[ "$1" =~ ^[0-9]{1,5}$ ]]; then a="$1"; b="$1"
+  else return 1; fi
+  (( 10#$a >= 1 && 10#$a <= 10#$b && 10#$b <= 65535 ))
+}
+
+# Контрольные списки для ПК создаются при первой проверке. Печатает строки W (белый) и X (чёрный)
+# для AUDIT_PY, не больше 10 сайтов в каждом
+probe_lists() {
+  local f h
+  if [[ ! -f "$PROBE_WHITE" ]]; then
+    printf '%s\n' "# Проверка с ПК (iof audit probe): сайты, которые из России открываются всегда." \
+      "# Если с ПК не откроется ни один, у него нет интернета и результат проверки не в счёт" \
+      ya.ru vk.com gosuslugi.ru > "$PROBE_WHITE"
+  fi
+  if [[ ! -f "$PROBE_BLACK" ]]; then
+    printf '%s\n' "# Проверка с ПК (iof audit probe): сайты, давно заблокированные РКН." \
+      "# Если они открываются, провайдер не фильтрует или ПК ходит в обход (VPN, прокси)" \
+      rutracker.org linkedin.com instagram.com > "$PROBE_BLACK"
+  fi
+  for f in "$PROBE_WHITE:W" "$PROBE_BLACK:X"; do
+    { grep -vE '^[[:space:]]*(#|$)' "${f%:*}" || true; } | awk '{ print $1 }' | head -n 10 | while IFS= read -r h; do
+      if host_ok "$h" && [[ "$h" == *.* ]]; then printf '%s\t%s\n' "${f##*:}" "$h"; fi
+    done
+  done
+}
+
+# Для pmap: мишень на узле $1 и контроль до неё. Строки n_probe_start, ip (адрес узла IPv4)
+# и trace (JSON контроля, см. AUDIT_NET_PY)
+probe_start_job() {
+  local i="$1" out ip="${N_ADDR[$1]}" port fp hy2
+  out="$(run_on "${N_SSH[$i]}" n_probe_start "$PROBE_ID" "$PROBE_RUN_TTL" "$PROBE_PORTS" "$PROBE_TOKEN")" || return $?
+  if ! grep -q '^now=' <<<"$out"; then
+    echo "узел не ответил" >&2
+    return 1
+  fi
+  printf '%s\n' "$out"
+  if [[ ! "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+    ip="$(timeout 5 getent ahostsv4 "$ip" 2>/dev/null | awk '{ print $1; exit }' || true)"
+  fi
+  echo "ip=$ip"
+  if [[ "$(kv_get "$out" probe)" != "started" || -z "$ip" ]]; then return 0; fi
+  port="$(kv_get "$out" port)"
+  fp="$(kv_get "$out" fp)"
+  hy2="$(kv_get "$out" hy2_port)"
+  if ! port_ok "$hy2"; then hy2=0; fi
+  echo "trace=$(timeout 120 python3 -c "$AUDIT_NET_PY" trace "$ip" "$port" "$fp" "$hy2" <<<"$PROBE_TOKEN" 2>/dev/null || echo '{}')"
+}
+
+probe_stop_job() { run_on "${N_SSH[$1]}" n_probe_stop "$PROBE_ID"; }
+
+# Одна проверка за раз: пока мишени прошлой живы и её не остановили, новая не начинается
+probe_free() {
+  local head id until stopped
+  [[ -f "$PROBE_DIR/session.json" ]] || return 0
+  head="$(audit_py probe-nodes "$PROBE_DIR")"
+  read -r id until stopped <<<"${head%%$'\n'*}"
+  if [[ "${stopped:-0}" == "0" && "${until:-0}" =~ ^[0-9]+$ ]] && (( until > $(date +%s) )); then
+    die "уже идёт проверка с ПК $id, мишени живут до $(date -d "@$until" +%H:%M).
+  Остановить: sudo iof audit probe stop"
+  fi
+}
+
+audit_probe_start() {
+  local ttl="$PROBE_TTL" i rc=0 msg started failed=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --ttl) ttl="${2:-}"; shift; if [[ $# -gt 0 ]]; then shift; fi ;;
+      *)     die "используй: iof [-n узлы] audit probe start [--ttl секунд]" ;;
+    esac
+  done
+  if [[ ! "$ttl" =~ ^[0-9]{1,4}$ ]] || (( 10#$ttl < 20 || 10#$ttl > 3600 )); then
+    die "срок мишеней (PROBE_TTL в $ENV_FILE или --ttl): от 20 до 3600 секунд"
+  fi
+  probe_ports_ok "$PROBE_PORTS" || die "PROBE_PORTS в $ENV_FILE: пусто, порт или диапазон a-b, например 40000-40100"
+  audit_need_python
+  read_nodes
+  select_nodes
+  mkdir -p "$PROBE_DIR"
+  chmod 700 "$AUDIT_DIR" "$PROBE_DIR"
+  probe_free
+  PROBE_ID="$(head -c 4 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  PROBE_TOKEN="$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  PROBE_RUN_TTL="$((10#$ttl))"
+  rm -f "$PROBE_DIR/session.json"
+  (umask 077; printf '%s\n' "$PROBE_TOKEN" > "$PROBE_DIR/token")
+  started="$(date +%s)"
+  echo "Проверка с ПК $PROBE_ID: запускаю мишени на узлах (${#SEL[@]}) на $((PROBE_RUN_TTL / 60)) мин и проверяю их отсюда"
+  pmap probe_start_job "${SEL[@]}"
+  {
+    printf 'P\t%s\t%s\t%s\n' "$PROBE_ID" "$started" "$PROBE_RUN_TTL"
+    probe_lists
+    for i in "${SEL[@]}"; do
+      msg=""
+      if ! pm_ok "$i"; then msg="$(pm_err "$i" | grep -v '^[[:space:]]*$' | tail -n 1 || true)"; fi
+      printf 'N\t%s\t%s\t%s\t%s\t%s\n' "${N_NAME[$i]}" "${N_ADDR[$i]}" "$(pm_ok "$i" && echo 1 || echo 0)" \
+        "$([[ "${N_SSH[$i]}" == "local" ]] && echo 1 || echo 0)" "${msg//$'\t'/ }"
+      if pm_ok "$i"; then pm_out "$i" | sed 's/^/F\t/'; fi
+    done
+  } | audit_py probe-session "$PROBE_DIR" || rc=$?
+  for i in "${SEL[@]}"; do
+    pm_ok "$i" || failed+=("$i")
+  done
+  if (( ${#failed[@]} > 0 )); then
+    echo
+    echo "Ошибки (${#failed[@]}):"
+    report_failures "${failed[@]}"
+  fi
+  if (( rc == 3 )); then
+    rm -f "$PROBE_DIR/token"
+    die "ни на одном узле мишень не запустилась, проверять с ПК нечего"
+  fi
+  (( rc == 0 )) || die "не удалось записать сессию в $PROBE_DIR"
+  echo
+  echo "Мишени работают до $(date -d "@$((started + PROBE_RUN_TTL))" +%H:%M). Дальше страница «Безопасность» панели,"
+  echo "карточка «Доступность из РФ»: там команда для ПК. Остановить раньше: sudo iof audit probe stop"
+}
+
+# Останавливает мишени текущей проверки, сессия остаётся для import. Без сессии убирает мишени
+# и их остатки со всех выбранных узлов (-n)
+audit_probe_stop() {
+  local out="" names=() n i id="" left msg failed=()
+  audit_need_python
+  read_nodes
+  if [[ -f "$PROBE_DIR/session.json" ]]; then out="$(audit_py probe-nodes "$PROBE_DIR")"; fi
+  if [[ -n "$out" ]]; then
+    id="${out%% *}"
+    mapfile -t names < <(tail -n +2 <<<"$out")
+    SEL=()
+    for n in "${names[@]}"; do
+      if i="$(node_index "$n")"; then SEL+=("$i"); fi
+    done
+  else
+    select_nodes
+  fi
+  PROBE_ID="$id"
+  if (( ${#SEL[@]} > 0 )); then
+    echo "Останавливаю мишени${id:+ проверки $id} на узлах: ${#SEL[@]}"
+    pmap probe_stop_job "${SEL[@]}"
+    for i in "${SEL[@]}"; do
+      if ! pm_ok "$i"; then failed+=("$i"); continue; fi
+      out="$(pm_out "$i")"
+      n="$(audit_num "$(kv_get "$out" stopped)")"
+      left="$(audit_num "$(kv_get "$out" left)")"
+      msg="мишеней не было"
+      if (( n > 0 )); then msg="остановлено мишеней: $n"; fi
+      if (( left > 0 )); then msg+=", убраны остатки: $left"; fi
+      printf '  %-20s %s\n' "${N_NAME[$i]}" "$msg"
+    done
+  fi
+  if [[ -n "$id" ]]; then audit_py probe-stop "$PROBE_DIR"; fi
+  if (( ${#failed[@]} > 0 )); then
+    echo
+    echo "Ошибки (${#failed[@]}):"
+    report_failures "${failed[@]}"
+    echo "Мишени на этих узлах systemd остановит сам по сроку (PROBE_TTL)."
+  fi
+}
+
+# Отчёт probe.ps1 со stdin: вердикт по слоям в $PROBE_DIR/<время>.json. Адрес ПК, с которого шла
+# проверка, уходит в whois регионального реестра: по нему видно сеть и страну. В результат он
+# попадает только с маской /24
+audit_probe_import() {
+  local tmp src who="" rc=0
+  audit_need_python
+  [[ ! -t 0 ]] || die "отчёт подаётся через stdin: sudo iof audit probe import < iof-probe-report.json"
+  [[ -f "$PROBE_DIR/session.json" ]] || die "нет сессии проверки с ПК: сначала sudo iof audit probe start"
+  tmp="$(mktemp "$PROBE_DIR/report.XXXXXX")"
+  head -c 300000 > "$tmp"
+  src="$(audit_py probe-src "$tmp" 2>/dev/null || true)"
+  if [[ "$src" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+    who="$(timeout 25 python3 -c "$AUDIT_NET_PY" whois "$src" "" 2>/dev/null || echo 'fail|||')"
+  fi
+  printf 'W\t%s\n' "$who" | audit_py probe-import "$PROBE_DIR" "$AUDIT_KEEP" "$tmp" || rc=$?
+  rm -f "$tmp"
+  if (( rc != 0 )); then exit 1; fi
+  echo
+  echo "Подробно по слоям: sudo iof audit probe list, в панели — страница «Безопасность»"
+}
+
+audit_probe() {
+  local action="${1:-}"
+  if [[ $# -gt 0 ]]; then shift; fi
+  case "$action" in
+    start)  audit_probe_start "$@" ;;
+    stop)   audit_probe_stop ;;
+    import) audit_probe_import ;;
+    list)   audit_need_python; audit_py probe-list "$PROBE_DIR" ;;
+    *)      die "используй: iof [-n узлы] audit probe start [--ttl секунд] | stop | import < отчёт | list" ;;
+  esac
+}
+
 cmd_audit() {
   local action="${1:-}"
   if [[ $# -gt 0 ]]; then shift; fi
   case "$action" in
-    run)  audit_run "$@" ;;
-    show) audit_show "$@" ;;
-    cron) audit_cron ;;
-    *)    die "используй: iof audit run [server|dpi|all] | show [узел] | cron" ;;
+    run)   audit_run "$@" ;;
+    show)  audit_show "$@" ;;
+    cron)  audit_cron ;;
+    probe) audit_probe "$@" ;;
+    *)     die "используй: iof audit run [server|dpi|all] | show [узел] | cron | probe start|stop|import|list" ;;
   esac
 }
 
@@ -5220,12 +6291,19 @@ VLESS
   iof relay list              ретрансляторы и их состояние
   iof relay apply             заново применить правила
 
-Безопасность (на узлах ничего не меняет)
+Безопасность (run, show и cron на узлах ничего не меняют)
   iof audit run [блок]        проверить узлы. Блоки: server — SSH, файрвол, подбор паролей, обновления,
                               открытые порты; dpi — чем узел заметен для фильтров и зондов: маскировка
                               Hysteria2 и AmneziaWG, что видно снаружи, репутация адреса; all — оба (по умолчанию)
   iof audit show [узел]       последняя проверка: все пункты, что не так и как исправить
   iof audit cron              для cron раз в сутки: проверка и сообщение в Telegram, если стало хуже
+
+Доступность из РФ, проверка с ПК (на узлах на время проверки работают мишени)
+  iof audit probe start       мишени на узлах на PROBE_TTL секунд (900) и проверка до них отсюда;
+                              --ttl секунд — свой срок. Скрипт для ПК даёт страница «Безопасность» панели
+  iof audit probe stop        остановить мишени раньше срока
+  iof audit probe import < отчёт.json   принять отчёт скрипта с ПК, если он не дошёл до панели
+  iof audit probe list        последняя проверка по слоям и прошлые проверки
 
 Перенос управляющего сервера (этот остаётся VPN-узлом, клиенты ничего не заметят)
   iof migrate start хост [порт]   на старом: поставить iof на новый сервер и скопировать туда данные
@@ -5260,6 +6338,10 @@ if [[ $# -gt 0 ]]; then shift; fi
 case "$cmd:${1:-}" in
   init:*|refresh:*|node:add|node:import|node:del|relay:add|relay:del|relay:apply) migrate_guard ;;
   hy2:add|hy2:del|hy2:refresh|hy2:install|awg:add|awg:del|awg:refresh) migrate_guard ;;
+esac
+# Мишени проверки с ПК меняют узлы, а import пишет результат сюда, а не на новый сервер
+case "$cmd:${1:-}:${2:-}" in
+  audit:probe:start|audit:probe:stop|audit:probe:import) migrate_guard ;;
 esac
 
 case "$cmd" in
