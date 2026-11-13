@@ -176,6 +176,16 @@ reach() {
   on "$1" bash -c "curl -sv -m 3 $3 telnet://$2:22 </dev/null 2>&1 | grep -q 'Connected to'"
 }
 
+# То же с адреса $3, который висит на сервере $1 только на время захода. Иначе, если $1 — управляющий
+# сервер (в CI другого нет), iof block взял бы и этот адрес в «не блокировать» вместе с hostname -I
+reach_from() {
+  local rc=0
+  on "$1" ip addr add "$3/32" dev eth0 >/dev/null 2>&1 || true
+  reach "$1" "$2" "--interface $3" || rc=1
+  on "$1" ip addr del "$3/32" dev eth0 >/dev/null 2>&1 || true
+  return "$rc"
+}
+
 # Задача панели: POST /api/security с телом $1 (JSON) на управляющем сервере, ждёт её конца.
 # Печатает «состояние заголовок» и хвост лога, при отказе — «refused код текст»
 panel_act() {
@@ -509,8 +519,9 @@ block_restore() {
     rm -f /root/iof/audit/cache/blocklist.txt*' >/dev/null 2>&1 || true
 }
 
-# Блок-лист сканеров на первом узле, который не управляющий сервер. У другого сервера стенда два внешних
-# адреса: 1.2.3.4 из списка и 1.2.3.5 из BLOCK_ALLOW, узел ходит к ним через этот сервер. Список
+# Блок-лист сканеров на первом узле, который не управляющий сервер. Другой сервер стенда на время каждого
+# захода получает внешний адрес: 1.2.3.4 из списка или 1.2.3.5 из BLOCK_ALLOW, узел ходит к ним через этот
+# сервер. Список
 # (с частными сетями, IPv6, слишком широкими записями и мусором, их iof пропускает) раздаёт управляющий
 # сервер python3 -m http.server на 127.0.0.1. Пакеты с 1.2.3.4 узел отбрасывает, с остальных — нет,
 # после перезапуска службы список на месте, update без изменений ничего не меняет, снятие убирает всё
@@ -533,7 +544,6 @@ printf 'BLOCKLIST_URL="http://127.0.0.1:8765/list.txt"\nBLOCK_ALLOW="1.2.3.5"\n'
 rm -f /root/iof/audit/cache/blocklist.txt*
 sleep 1
 EOF
-  on "$src" bash -c 'ip addr add 1.2.3.4/32 dev eth0; ip addr add 1.2.3.5/32 dev eth0' >/dev/null 2>&1 || true
   on "$node" ip route replace 1.2.3.0/24 via "${ADDR[$src]}"
 
   if out="$(iofm block on "$node" 2>&1)" && grep -q "^  $node: записей 1," <<<"$out"; then
@@ -557,13 +567,13 @@ EOF
   if [[ "$got" == ok ]]; then ok "$node: не блокируются узлы из nodes.conf, управляющий сервер ($me) и BLOCK_ALLOW"
   else fail "$node: в block.allow $got"; fi
 
-  if ! reach "$src" "${ADDR[$node]}" "--interface 1.2.3.4"; then ok "$node отбрасывает пакеты с 1.2.3.4 (в списке)"; else fail "$node принимает пакеты с 1.2.3.4"; fi
-  if reach "$src" "${ADDR[$node]}" "--interface 1.2.3.5"; then ok "$node принимает 1.2.3.5 (BLOCK_ALLOW)"; else fail "$node отбрасывает 1.2.3.5 из BLOCK_ALLOW"; fi
+  if ! reach_from "$src" "${ADDR[$node]}" 1.2.3.4; then ok "$node отбрасывает пакеты с 1.2.3.4 (в списке)"; else fail "$node принимает пакеты с 1.2.3.4"; fi
+  if reach_from "$src" "${ADDR[$node]}" 1.2.3.5; then ok "$node принимает 1.2.3.5 (BLOCK_ALLOW)"; else fail "$node отбрасывает 1.2.3.5 из BLOCK_ALLOW"; fi
   if reach "$src" "${ADDR[$node]}" ""; then ok "$node принимает $src с его адреса из nodes.conf"; else fail "$node отбрасывает $src"; fi
   if reach "$M" "${ADDR[$node]}" ""; then ok "$node принимает управляющий сервер $M"; else fail "$node отбрасывает управляющий сервер"; fi
 
   out="$(on "$node" bash -c 'systemctl restart iof-block && ipset list -t iof-block | sed -n "s/^Number of entries: //p"; iptables -w -t raw -C PREROUTING -j IOF-BLOCK && echo hook')"
-  if [[ "$out" == $'1\nhook' ]] && ! reach "$src" "${ADDR[$node]}" "--interface 1.2.3.4"; then
+  if [[ "$out" == $'1\nhook' ]] && ! reach_from "$src" "${ADDR[$node]}" 1.2.3.4; then
     ok "$node: после перезапуска iof-block список на месте"
   else
     fail "$node после перезапуска iof-block: $(paste -sd' ' - <<<"$out")"
@@ -585,7 +595,7 @@ EOF
     fail "панель: снятие блок-листа с $node: $(paste -sd' ' - <<<"$got")"
     details "$out"
   fi
-  if reach "$src" "${ADDR[$node]}" "--interface 1.2.3.4"; then ok "$node после снятия принимает 1.2.3.4"; else fail "$node после снятия отбрасывает 1.2.3.4"; fi
+  if reach_from "$src" "${ADDR[$node]}" 1.2.3.4; then ok "$node после снятия принимает 1.2.3.4"; else fail "$node после снятия отбрасывает 1.2.3.4"; fi
   got="$(audit_get "$node" blocklist dpi)"
   if [[ "$got" == warn*"не применён"* ]]; then ok "dpi $node после снятия: $got"; else fail "dpi $node после снятия: «$got»"; fi
   block_restore "$node" "$src"
@@ -783,6 +793,7 @@ import copy, json, sys
 s = json.load(open("/root/iof/audit/probe/session.json"))
 token = open("/root/iof/audit/probe/token").read().strip()
 first = sys.argv[1]
+PC = "172.30.0.99"  # адрес ПК: частный, но в отчёте remap, как со стенда
 
 
 def report(kind):
@@ -796,9 +807,11 @@ def report(kind):
         t["tunnel"] = {"tested": False, "reason": "nohysteria"}
         if kind == "block" and name == first:
             t["conn"] = [{"tcp": None, "tls": None, "fp": "", "bytes": 0, "ms": 0, "src": "", "err": "tcp: timeout"}] * 3
-        if kind == "vpn":
-            for c in t["conn"]:
-                c["src"] = s["nodes"][first]["ip"]
+        # IP источника, как его видит мишень. В контроле это адрес управляющего сервера, а он бывает
+        # узлом (в CI так всегда): с ним отчёт значил бы «ПК ходил через VPN на этот узел»
+        for c in t["conn"]:
+            if c.get("src"):
+                c["src"] = s["nodes"][first]["ip"] if kind == "vpn" else PC
         targets.append(t)
     lists = [{"host": h, "list": "white", "ok": True, "err": ""} for h in s["lists"]["white"]]
     lists += [{"host": h, "list": "black", "ok": False, "err": "tls: timeout"} for h in s["lists"]["black"]]
