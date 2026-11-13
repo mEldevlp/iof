@@ -10,7 +10,8 @@
 iof audit run, она узлы только читает; проверка с ПК: iof audit probe), по одной задаче за раз,
 с логом выполнения. Исключение — терминал на узел со страницы узла (ssh с ключом iof через
 WebSocket): он включается отдельно, IOF_WEB_TERMINAL=1. Скрипт проверки с ПК и его отчёт ходят
-по одноразовому билету вместо пароля панели.
+по одноразовому билету вместо пароля панели. Telegram-бот (iof_bot.py рядом) работает потоком
+внутри панели; включает его iof bot on, без модуля панель работает как раньше.
 
 Без зависимостей, нужен только python3. По умолчанию слушает 127.0.0.1:8088,
 снаружи заходить через SSH-туннель:  ssh -L 8088:127.0.0.1:8088 admin@сервер
@@ -45,6 +46,14 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
+
+# Telegram-бот: модуль рядом с панелью. Если он не загрузился, панель работает без бота
+try:
+    import iof_bot
+    BOT_IMPORT_ERROR = None
+except Exception as e:  # ошибка в модуле бота не должна ронять панель
+    iof_bot = None
+    BOT_IMPORT_ERROR = f"{type(e).__name__}: {e}"
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
@@ -1721,6 +1730,20 @@ def main():
 
     srv.jobs = Jobs(on_done=on_done)
     srv.terms = Terminals(os.environ.get("IOF_WEB_TERMINAL", "").strip() == "1", ssh_key)
+
+    # Telegram-бот: поток внутри панели с общей очередью задач и опросом узлов. Работает, когда
+    # включён (iof bot on) и есть токен; адрес Bot API меняет только IOF_TG_API (стенд, CI)
+    srv.bot = None
+    if iof_bot is None:
+        log(f"бот: модуль iof_bot не загрузился, панель работает без бота: {BOT_IMPORT_ERROR}")
+    else:
+        try:
+            srv.bot = iof_bot.Bot(srv.base, args.iof, jobs=srv.jobs, cache=srv.cache,
+                                  api=os.environ.get("IOF_TG_API"), log=log)
+            srv.bot.start()
+        except Exception as e:
+            srv.bot = None
+            log(f"бот: не запустился, панель работает без бота: {e}")
     print(f"iof-web: http://{args.listen}/" + ("  (терминал включён)" if srv.terms.enabled else ""), file=sys.stderr)
     try:
         srv.serve_forever()

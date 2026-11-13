@@ -22,6 +22,9 @@ AUDIT_DIR="$BASE/audit"              # результаты iof audit: <блок
 PROBE_DIR="$AUDIT_DIR/probe"         # проверка с ПК: session.json, token, результаты <время>.json
 PROBE_WHITE="$BASE/probe-white.txt"  # контрольные сайты для проверки с ПК: открываются из России всегда
 PROBE_BLACK="$BASE/probe-black.txt"  # и давно заблокированные РКН
+BOT_FILE="$BASE/bot.json"            # Telegram-бот: настройки, админы, хэши приглашений (iof bot)
+BOT_TOKEN="$BASE/bot.token"          # токен бота от @BotFather
+BOT_LOCK="$BASE/bot.lock"            # iof bot меняет bot.json по одному
 SSH_KEY="/root/.ssh/iof_ed25519"
 # Смене портов Hysteria2 нужна эта версия: раньше её правила заворачивали и исходящий UDP самого узла
 HY2_HOP_MIN="2.12.3"
@@ -5108,8 +5111,9 @@ audit_int() { [[ "${1:-}" =~ ^[0-9]{1,10}$ ]]; }
 # Jc = 0, S1–S4 = 0 и H1–H4 = 1, 2, 3, 4. Иначе в AWG_BAD то, что вне границ (в AWG_BADK названия
 # полей), сами значения в текст не попадают. Границы: Jc 1–128, 0 ≤ Jmin < Jmax < 1280, S1 до 1132,
 # S2 до 1188, S3 до 1216, S4 до 32, S1 + 56 ≠ S2, H1–H4 — числа или диапазоны начало-конец в
-# 5–2147483647 без пересечений. Числа взяты из документации GL.iNet, запрет пересечений H1–H4 —
-# из документации Amnezia (ссылки в security-plan.md)
+# 5–2147483647 без пересечений. Числа взяты из документации GL.iNet
+# (docs.gl-inet.com/router/en/4/faq/amneziawg_obfuscation_parameters), запрет пересечений H1–H4 —
+# из документации Amnezia
 AWG_PLAIN=0; AWG_BAD=(); AWG_BADK=()
 audit_awg_check() {
   local l n j v lo hi max std=1 hstd=1 cross=0
@@ -6804,6 +6808,382 @@ cmd_audit() {
 }
 
 
+# Telegram-бот: iof bot. Сам бот — поток внутри панели iof-web (web/iof_bot.py): он только читает
+# bot.json и bot.token, а меняет их эта команда, и из консоли, и из панели, и из бота (redeem).
+# Секреты (токен, код приглашения) идут через stdin. В bot.json от кода приглашения только sha256
+
+BOT_PY=$(cat <<'EOF'
+import hashlib, hmac, http.client, json, os, re, secrets, sys, time, urllib.error, urllib.request
+
+ROLES = {"main": "главный", "regular": "обычный"}
+INVITE_TTL = 86400   # секунд живёт приглашение
+INVITE_MAX = 20      # неиспользованных приглашений сразу
+CODE = re.compile(r"^[0-9a-f]{64}$")
+USERNAME = re.compile(r"^[A-Za-z0-9_]{1,32}$")
+CLOCK = re.compile(r"^([01]?[0-9]|2[0-3]):([0-5][0-9])$")
+
+
+def die(text):
+    print("Ошибка: " + text, file=sys.stderr)
+    sys.exit(1)
+
+
+def when(ts):
+    return time.strftime("%d.%m.%Y %H:%M", time.localtime(ts))
+
+
+def defaults():
+    # notify у админа: типы уведомлений, null — по умолчанию (этап 5)
+    return {"enabled": False, "username": "", "actions": False, "hy2_links": True, "quiet": None,
+            "admins": [], "invites": []}
+
+
+def load(path):
+    """bot.json с полями по умолчанию, без истёкших приглашений."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        data = {}
+    except (OSError, ValueError) as e:
+        die(f"{path} не читается ({e}): исправь его или удали, и настрой бота заново")
+    if not isinstance(data, dict):
+        die(f"{path}: нужен JSON-объект, исправь его или удали")
+    cfg = defaults()
+    cfg.update(data)
+    for k in ("admins", "invites"):
+        cfg[k] = [x for x in cfg[k] if isinstance(x, dict)] if isinstance(cfg[k], list) else []
+    now = time.time()
+    cfg["invites"] = [i for i in cfg["invites"] if isinstance(i.get("expires"), (int, float)) and i["expires"] > now]
+    return cfg
+
+
+def save(path, cfg):
+    # Новым файлом и переименованием: поток бота видит смену inode и не прочтёт файл наполовину
+    tmp = f"{path}.tmp{os.getpid()}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def admin_by(cfg, value):
+    if not re.fullmatch(r"[0-9]{1,16}", value or ""):
+        die(f"ID пользователя Telegram — число, а не «{value}»: sudo iof bot show")
+    a = next((a for a in cfg["admins"] if a.get("id") == int(value)), None)
+    if a is None:
+        die(f"админа с ID {value} нет: sudo iof bot show")
+    return a
+
+
+def onoff(value, usage):
+    if value not in ("on", "off"):
+        die("используй: " + usage)
+    return value == "on"
+
+
+def bot_name(cfg):
+    return "@" + cfg["username"] if cfg.get("username") else "бот"
+
+
+def getme(api):
+    """Проверка токена со stdin: getMe. Печатает имя бота. Текст ошибки без токена."""
+    token = sys.stdin.readline().strip()
+    if not re.fullmatch(r"https?://[A-Za-z0-9.:\[\]-]+(/[A-Za-z0-9._~/-]*)?", api):
+        die(f"IOF_TG_API в web.env: нужен адрес вида https://api.telegram.org, а не «{api}»")
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    req = urllib.request.Request(f"{api.rstrip('/')}/bot{token}/getMe", data=b"{}",
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with opener.open(req, timeout=15) as r:
+            data = json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            desc = json.loads(e.read().decode("utf-8", "replace")).get("description") or ""
+        except (ValueError, OSError, AttributeError, http.client.HTTPException):
+            desc = ""
+        if e.code in (401, 404):
+            die(f"Telegram не принял токен ({e.code} {desc}): проверь его у @BotFather, /mybots → API Token")
+        die(f"Bot API ответил ошибкой {e.code} {desc}".replace(token, "***"))
+    except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as e:
+        die(f"нет связи с {api}: {getattr(e, 'reason', None) or e}".replace(token, "***"))
+    me = data.get("result") if isinstance(data, dict) else None
+    if not isinstance(me, dict) or not USERNAME.match(str(me.get("username", ""))):
+        die("Bot API не вернул имя бота")
+    print(me["username"])
+
+
+def redeem(cfg):
+    """Код приглашения от бота. stdin: код, ID, имя, username по строке. Печатает result=added|already|bad
+    и role. Приглашение одноразовое: верный код удаляется вместе с хэшем."""
+    lines = sys.stdin.read().split("\n") + ["", "", "", ""]
+    code, uid, name, username = (s.strip() for s in lines[:4])
+    if not re.fullmatch(r"[0-9]{1,16}", uid):
+        die("redeem: со stdin нужны код, ID, имя и username по строке")
+    uid = int(uid)
+    old = next((a for a in cfg["admins"] if a.get("id") == uid), None)
+    if old is not None:
+        return "already", old.get("role", "")
+    digest = hashlib.sha256(code.lower().encode()).hexdigest() if CODE.match(code.lower()) else ""
+    inv = next((i for i in cfg["invites"] if digest and hmac.compare_digest(str(i.get("hash", "")), digest)), None)
+    if inv is None:
+        return "bad", ""
+    cfg["invites"].remove(inv)
+    role = inv.get("role") if inv.get("role") in ROLES else "regular"
+    cfg["admins"].append({"id": uid, "name": re.sub(r"[\x00-\x1f\x7f]", " ", name)[:64],
+                          "username": username if USERNAME.match(username) else "", "role": role,
+                          "sound": False, "notify": None, "added": int(time.time())})
+    return "added", role
+
+
+def edit(path, op, args):
+    cfg = load(path)
+    args += [""] * 3
+    if op == "token":
+        cfg["username"] = args[0]
+    elif op == "untoken":
+        cfg["enabled"], cfg["username"] = False, ""
+    elif op == "enable":
+        cfg["enabled"] = onoff(args[0], "iof bot on | off")
+        if cfg["enabled"]:
+            print(f"Бот включён: {bot_name(cfg)}, работает внутри панели iof-web")
+            if not cfg["admins"]:
+                print(f"Админов пока нет. Пригласить: sudo iof bot invite main, код отправь боту {bot_name(cfg)}")
+        else:
+            print("Бот выключен")
+    elif op == "set":
+        key = {"actions": "actions", "links": "hy2_links"}.get(args[0])
+        if key is None:
+            die("используй: iof bot set actions|links on|off | set quiet ЧЧ:ММ-ЧЧ:ММ|off")
+        cfg[key] = onoff(args[1], f"iof bot set {args[0]} on|off")
+        if key == "actions":
+            print("Действия из бота: " + ("разрешены главным админам" if cfg[key] else "выключены"))
+        else:
+            print("Ссылки Hysteria2 в боте: " + ("выдаются" if cfg[key] else "не выдаются"))
+    elif op == "quiet":
+        if args[0] == "off":
+            cfg["quiet"] = None
+            print("Тихие часы выключены")
+        else:
+            m = re.fullmatch(r"([0-9:]+)-([0-9:]+)", args[0])
+            a, b = (CLOCK.match(m.group(1)), CLOCK.match(m.group(2))) if m else (None, None)
+            if not a or not b:
+                die("тихие часы: ЧЧ:ММ-ЧЧ:ММ, например 23:00-08:00, или off")
+            frm, to = (f"{int(x.group(1)):02d}:{x.group(2)}" for x in (a, b))
+            if frm == to:
+                die("у тихих часов начало и конец совпадают")
+            cfg["quiet"] = {"from": frm, "to": to}
+            print(f"Тихие часы: {frm}–{to}, время сервера")
+    elif op == "invite":
+        if args[0] not in ROLES:
+            die("используй: iof bot invite main|regular")
+        if len(cfg["invites"]) >= INVITE_MAX:
+            die(f"неиспользованных приглашений уже {INVITE_MAX}, отзови лишние: sudo iof bot invite del <хэш>")
+        code = hashlib.sha256(secrets.token_bytes(32)).hexdigest()
+        now = int(time.time())
+        cfg["invites"].append({"hash": hashlib.sha256(code.encode()).hexdigest(), "role": args[0],
+                               "created": now, "expires": now + INVITE_TTL})
+        save(path, cfg)
+        name = bot_name(cfg)
+        print(f"Приглашение: роль {ROLES[args[0]]}, действует до {when(now + INVITE_TTL)}, один раз.")
+        print("Код показывается только сейчас, на сервере хранится его хэш:")
+        print()
+        print(code)
+        print()
+        print(f"Будущий админ отправляет код боту {name} в личном чате.")
+        if cfg.get("username"):
+            print(f"Или открывает ссылку: https://t.me/{cfg['username']}?start={code}")
+        if not cfg["enabled"]:
+            print("Бот выключен, код примет только работающий бот: sudo iof bot on")
+        return
+    elif op == "invite-del":
+        prefix = args[0].lower()
+        if not re.fullmatch(r"[0-9a-f]{6,64}", prefix):
+            die("используй: iof bot invite del <начало хэша, хотя бы 6 знаков, из iof bot show>")
+        found = [i for i in cfg["invites"] if str(i.get("hash", "")).startswith(prefix)]
+        if not found:
+            die(f"нет приглашения с хэшем {prefix}…: sudo iof bot show")
+        if len(found) > 1:
+            die(f"под {prefix}… подходит {len(found)} приглашения, дай больше знаков хэша")
+        cfg["invites"].remove(found[0])
+        print(f"Приглашение {prefix}… отозвано")
+    elif op == "redeem":
+        result, role = redeem(cfg)
+        print(f"result={result}")
+        print(f"role={role}")
+        if result != "added":
+            return
+    elif op == "admin-set":
+        a = admin_by(cfg, args[0])
+        if args[1] == "role":
+            if args[2] not in ROLES:
+                die("используй: iof bot admin set <ID> role main|regular")
+            a["role"] = args[2]
+            print(f"Админ {a['id']}: роль {ROLES[args[2]]}")
+        elif args[1] == "sound":
+            a["sound"] = onoff(args[2], "iof bot admin set <ID> sound on|off")
+            print(f"Админ {a['id']}: уведомления в тихие часы " + ("со звуком" if a["sound"] else "без звука"))
+        else:
+            die("используй: iof bot admin set <ID> role main|regular | sound on|off")
+    elif op == "admin-del":
+        a = admin_by(cfg, args[0])
+        cfg["admins"].remove(a)
+        print(f"Админ {a['id']} удалён: бот больше ему не отвечает")
+    else:
+        die(f"неизвестная операция {op}")
+    save(path, cfg)
+
+
+def cols(rows):
+    """Строки таблицы с колонками по ширине, первая — заголовок."""
+    width = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
+    return ["  ".join(c.ljust(width[i]) for i, c in enumerate(r)).rstrip() for r in rows]
+
+
+def show(path, token, api, panel, migrate):
+    cfg = load(path)
+    state = "включён" if cfg["enabled"] else "выключен"
+    print(f"Бот: {state}, {bot_name(cfg) if token == 'yes' else 'токена нет: sudo iof bot token'}")
+    quiet = cfg["quiet"]
+    quiet = f"{quiet.get('from')}–{quiet.get('to')}" if isinstance(quiet, dict) else "нет"
+    print("Действия из бота: " + ("разрешены главным" if cfg["actions"] else "выключены")
+          + ". Ссылки Hysteria2: " + ("выдаются" if cfg["hy2_links"] else "не выдаются")
+          + f". Тихие часы: {quiet}")
+    panels = {"active": "работает", "none": "не установлена, бота без неё нет: sudo bash /opt/iof/install.sh"}
+    print("Панель iof-web, в ней работает бот: " + panels.get(panel, f"не работает ({panel}): sudo systemctl start iof-web"))
+    if api.rstrip("/") != "https://api.telegram.org":
+        print(f"Bot API: {api} (IOF_TG_API в web.env)")
+    if migrate == "target":
+        print("Перенос: сервер принимает управление, бот запустится после sudo iof migrate finish")
+    elif migrate == "source":
+        print("Перенос: идёт отсюда, изменения бота заблокированы")
+    print()
+    if cfg["admins"]:
+        print(f"Админы: {len(cfg['admins'])}")
+        rows = [["ID", "Имя", "Username", "Роль", "Звук в тихие часы", "Добавлен"]]
+        for a in cfg["admins"]:
+            rows.append([str(a.get("id")), str(a.get("name") or "-"), "@" + a["username"] if a.get("username") else "-",
+                         ROLES.get(a.get("role"), str(a.get("role"))), "да" if a.get("sound") else "нет",
+                         when(a["added"]) if isinstance(a.get("added"), (int, float)) else "-"])
+        print("\n".join("  " + line for line in cols(rows)))
+    else:
+        print("Админов нет. Пригласить: sudo iof bot invite main")
+    if cfg["invites"]:
+        print()
+        print(f"Приглашения: {len(cfg['invites'])} (кодов на сервере нет, только хэши)")
+        rows = [["Хэш", "Роль", "Действует до"]]
+        for i in cfg["invites"]:
+            rows.append([str(i.get("hash", ""))[:12], ROLES.get(i.get("role"), "?"), when(i["expires"])])
+        print("\n".join("  " + line for line in cols(rows)))
+        print("  Отозвать: sudo iof bot invite del <хэш>")
+
+
+mode = sys.argv[1]
+if mode == "getme":
+    getme(sys.argv[2])
+elif mode == "edit":
+    edit(sys.argv[2], sys.argv[3], sys.argv[4:])
+elif mode == "show":
+    show(*sys.argv[2:7])
+EOF
+)
+
+bot_py() { python3 -c "$BOT_PY" "$@"; }
+
+# Адрес Bot API: IOF_TG_API из окружения (так его передаёт панель) или из web.env, иначе Telegram.
+# Другой адрес нужен только стенду и CI с поддельным API
+bot_api() {
+  local api="${IOF_TG_API:-}"
+  if [[ -z "$api" && -f "$BASE/web.env" ]]; then
+    api="$(sed -n 's/^[[:space:]]*IOF_TG_API=//p' "$BASE/web.env" | tail -n 1 | tr -d "\"' ")"
+  fi
+  printf '%s' "${api:-https://api.telegram.org}"
+}
+
+# Изменения bot.json по одному: iof bot из консоли, из панели и из потока бота не затрут друг друга
+bot_lock() {
+  mkdir -p "$BASE"
+  (umask 077; : >> "$BOT_LOCK")
+  exec 9>>"$BOT_LOCK"
+  flock -w 15 9 || die "bot.json занят другой командой iof bot, повтори"
+}
+
+# Токен со stdin (в консоли спрашивает, не показывая): проверка getMe, затем bot.token и имя бота
+# в bot.json. Пустой ввод удаляет токен и выключает бота
+bot_token() {
+  local token="" username
+  if [[ -t 0 ]]; then
+    read -rsp "Токен бота от @BotFather (пусто — удалить токен и выключить бота): " token || true
+    echo >&2
+  else
+    IFS= read -r token || true
+  fi
+  token="${token//[[:space:]]/}"
+  if [[ -z "$token" ]]; then
+    bot_lock
+    rm -f "$BOT_TOKEN"
+    bot_py edit "$BOT_FILE" untoken
+    echo "Токен удалён, бот выключен"
+    return 0
+  fi
+  [[ "$token" =~ ^[0-9]{1,20}:[A-Za-z0-9_-]{20,100}$ ]] \
+    || die "это не токен бота: он выглядит как 123456789:AAF... (@BotFather, /mybots → API Token)"
+  # printf встроен в bash: токена нет в аргументах процессов
+  username="$(printf '%s\n' "$token" | bot_py getme "$(bot_api)")" || exit 1
+  bot_lock
+  (umask 077; printf '%s\n' "$token" > "$BOT_TOKEN.tmp")
+  mv -f "$BOT_TOKEN.tmp" "$BOT_TOKEN"
+  bot_py edit "$BOT_FILE" token "$username"
+  echo "Токен сохранён: бот @$username"
+}
+
+bot_switch() {
+  if [[ "$1" == "on" && ! -s "$BOT_TOKEN" ]]; then
+    die "сначала токен бота: sudo iof bot token (токен даёт @BotFather)"
+  fi
+  bot_py edit "$BOT_FILE" enable "$1"
+  if [[ "$1" == "on" ]] && ! systemctl is-active --quiet iof-web 2>/dev/null; then
+    echo "Внимание: панель iof-web не работает, а бот работает внутри неё: sudo systemctl start iof-web"
+  fi
+}
+
+bot_show() {
+  local token=no panel
+  if [[ -s "$BOT_TOKEN" ]]; then token=yes; fi
+  panel="$(systemctl is-active iof-web 2>/dev/null || true)"
+  if [[ ! -f /opt/iof-web/iof-web.py ]]; then panel=none; fi
+  bot_py show "$BOT_FILE" "$token" "$(bot_api)" "${panel:-unknown}" "$(migrate_get role)"
+}
+
+cmd_bot() {
+  local action="${1:-show}"
+  if [[ $# -gt 0 ]]; then shift; fi
+  have python3 || die "боту нужен python3: apt install python3"
+  case "$action" in
+    show)   bot_show ;;
+    token)  bot_token ;;
+    on|off) bot_lock; bot_switch "$action" ;;
+    set)
+      bot_lock
+      if [[ "${1:-}" == "quiet" ]]; then bot_py edit "$BOT_FILE" quiet "${2:-}"; else bot_py edit "$BOT_FILE" set "${1:-}" "${2:-}"; fi ;;
+    invite)
+      bot_lock
+      if [[ "${1:-}" == "del" ]]; then bot_py edit "$BOT_FILE" invite-del "${2:-}"; else bot_py edit "$BOT_FILE" invite "${1:-}"; fi ;;
+    # Вызывает поток бота: со stdin код приглашения, ID, имя и username
+    redeem) bot_lock; bot_py edit "$BOT_FILE" redeem ;;
+    admin)
+      bot_lock
+      case "${1:-}" in
+        set) bot_py edit "$BOT_FILE" admin-set "${2:-}" "${3:-}" "${4:-}" ;;
+        del) bot_py edit "$BOT_FILE" admin-del "${2:-}" ;;
+        *)   die "используй: iof bot admin set <ID> role main|regular | admin set <ID> sound on|off | admin del <ID>" ;;
+      esac ;;
+    *) die "используй: iof bot show | token | on | off | set ... | invite main|regular | invite del <хэш> | admin ..." ;;
+  esac
+}
+
+
 # Перенос управляющего сервера: iof migrate start | finish | cancel | status
 # start на старом сервере ставит iof на новый и копирует туда данные, а у себя запрещает изменения.
 # finish на новом снимает роль управляющего со старого (тот остаётся узлом) и ставит задания cron.
@@ -7212,6 +7592,20 @@ VLESS
   iof audit probe import < отчёт.json   принять отчёт скрипта с ПК, если он не дошёл до панели
   iof audit probe list        последняя проверка по слоям и прошлые проверки
 
+Телеграм-бот (работает внутри веб-панели iof-web, отвечает только админам в личном чате)
+  iof bot show                включён ли, бот, админы, неиспользованные приглашения
+  iof bot token               токен от @BotFather: спросит или возьмёт со stdin; пустой — удалить и выключить
+  iof bot on | off            включить или выключить бота
+  iof bot set actions on|off  разрешить действия из бота (только главным админам)
+  iof bot set links on|off    выдавать в боте ссылки Hysteria2
+  iof bot set quiet 23:00-08:00|off   тихие часы уведомлений
+  iof bot invite main|regular код приглашения админа (главный или обычный): один раз, 24 часа;
+                              будущий админ отправляет его боту
+  iof bot invite del хэш      отозвать приглашение
+  iof bot admin set ID role main|regular   сменить роль админа
+  iof bot admin set ID sound on|off        уведомления со звуком в тихие часы
+  iof bot admin del ID        удалить админа
+
 Перенос управляющего сервера (этот остаётся VPN-узлом, клиенты ничего не заметят)
   iof migrate start хост [порт]   на старом: поставить iof на новый сервер и скопировать туда данные
       --user, --key, --key-installed  вход как у node add
@@ -7246,6 +7640,7 @@ case "$cmd:${1:-}" in
   init:*|refresh:*|node:add|node:import|node:del|relay:add|relay:del|relay:apply) migrate_guard ;;
   hy2:add|hy2:del|hy2:refresh|hy2:install|hy2:hop|hy2:upgrade|awg:add|awg:del|awg:refresh) migrate_guard ;;
   block:on|block:update|block:off) migrate_guard ;;
+  bot:token|bot:on|bot:off|bot:set|bot:invite|bot:redeem|bot:admin) migrate_guard ;;
 esac
 # Мишени проверки с ПК меняют узлы, а import пишет результат сюда, а не на новый сервер
 case "$cmd:${1:-}:${2:-}" in
@@ -7261,6 +7656,7 @@ case "$cmd" in
   block)   cmd_block "$@" ;;
   migrate) cmd_migrate "$@" ;;
   audit)   cmd_audit "$@" ;;
+  bot)     cmd_bot "$@" ;;
   status)  cmd_status ;;
   check)   cmd_check ;;
   exec)    cmd_exec "$@" ;;

@@ -29,6 +29,7 @@ Docker Desktop там не запускается: Kaspersky Standard не да�
 | `iof-nightly` | ночное обновление пакетов и перезагрузка всех узлов | `/usr/local/sbin/iof-nightly` |
 | `install.sh` | установка и обновление из клона; `--no-web` ставит без панели | — |
 | `web/iof-web.py` | сервер панели, только stdlib python3 | `/opt/iof-web/iof-web.py` |
+| `web/iof_bot.py` | Telegram-бот, только stdlib: класс `Bot`, поток внутри панели, см. «Телеграм-бот» | `/opt/iof-web/iof_bot.py` |
 | `web/iof-web.service` | systemd-юнит панели | `/etc/systemd/system/iof-web.service` |
 | `web/static/*` | страницы панели: html, js, css. Без подкаталогов: `install.sh` копирует `web/static/*` плоско | `/opt/iof-web/static/` |
 | `web/static/xterm.js`, `xterm-fit.js`, `xterm.css` | сторонний код для терминала: `@xterm/xterm` 6.0.0 и `@xterm/addon-fit` 0.11.0 из npm, см. «Терминал» | `/opt/iof-web/static/` |
@@ -36,8 +37,8 @@ Docker Desktop там не запускается: Kaspersky Standard не да�
 | `web/design.md` | цвета, шрифты, размеры, брейкпоинты и классы панели | не ставится |
 | `docs/panel-*.png` | скриншоты панели для README в тёмной теме: два на виду, четыре под спойлером; сняты в демо-режиме (см. «Проверка изменений») | не ставится |
 | `README.md` | инструкция для пользователя | — |
-| `stand/` | тестовый стенд на Docker: `Dockerfile` (Ubuntu 24.04 с systemd и SSH), `compose.yml` (old, node1, node2, new), `stand.sh`, `test.sh` (проверка iof на стенде), `hy2-template.yaml` | не ставится; попадает в `/opt/iof` как часть клона |
-| `ci/lint.sh` | статические проверки: `bash -n`, shellcheck, разбор и pyflakes для `iof-web.py`, `node --check`, правила проекта (NODE_FUNCS, STATIC_FILES, CSP, одинаковое меню во всех html, `probe.ps1`: только ASCII, одна метка, разбор парсером PowerShell, если он есть, LF) | не ставится |
+| `stand/` | тестовый стенд на Docker: `Dockerfile` (Ubuntu 24.04 с systemd и SSH), `compose.yml` (old, node1, node2, new), `stand.sh`, `test.sh` (проверка iof на стенде), `hy2-template.yaml`, `fake-tg.py` (поддельный Bot API для бота) | не ставится; попадает в `/opt/iof` как часть клона |
+| `ci/lint.sh` | статические проверки: `bash -n`, shellcheck, разбор и pyflakes для `iof-web.py`, `iof_bot.py` и `stand/fake-tg.py`, `node --check`, правила проекта (NODE_FUNCS, STATIC_FILES, CSP, одинаковое меню во всех html, `probe.ps1`: только ASCII, одна метка, разбор парсером PowerShell, если он есть, LF) | не ставится |
 | `.github/workflows/ci.yml` | CI в GitHub Actions, см. «Проверка изменений» | не ставится |
 | `.shellcheckrc` | настройки shellcheck: отключены SC2178 и SC2128, ложные срабатывания на local-переменные разных функций | не ставится |
 
@@ -62,7 +63,9 @@ Docker Desktop там не запускается: Kaspersky Standard не да�
 | `nodes.conf` | `имя \| адрес для клиентов \| ssh (local или user@host[:port]) \| подпись`, `#` = комментарий |
 | `relays.conf` | `узел \| через узел \| hy2 порт ретранслятора \| hy2 порт узла \| awg порт ретранслятора \| awg порт узла`, `-` = протокол не ретранслируется |
 | `iof.env` | bash, читается через `source`: `TG_TOKEN`, `TG_CHAT`, `PARALLEL`, `IOF_SRC`, `HY2_TEMPLATE`, `HY2_CN` (CN сертификата для `hy2 install`, если сертификата из шаблона здесь нет), `AUDIT_KEEP`, `BLOCKLIST_URL` и `REGISTRY_URL` (списки для блока dpi и `iof block`: текст, IP или CIDR в строке, `#` — комментарий; по умолчанию пусто), `BLOCK_ALLOW` (адреса и сети через пробел, которые блок-лист не блокирует никогда), `HY2_HOP` (диапазон смены портов для `hy2 hop on`, по умолчанию `10000-19999`: ниже портов, которые iof сам выбирает для ретрансляторов и мишеней), `PROBE_TTL` (сколько секунд живут мишени проверки с ПК, 900, допустимо 20–3600) и `PROBE_PORTS` (порт мишеней: пусто — случайный свободный 20000–60000, `a-b` — из диапазона, `N` — этот порт; одинаково для всех узлов) |
-| `web.env` | EnvironmentFile панели: `IOF_WEB_PASSWORD`, `IOF_WEB_HOSTS`, `IOF_WEB_TTL`, `IOF_WEB_TERMINAL` (`1` включает терминал), а также `HY2_TEMPLATE`, `IOF_BIN`, `IOF_BASE`, `IOF_SSH_KEY` |
+| `web.env` | EnvironmentFile панели: `IOF_WEB_PASSWORD`, `IOF_WEB_HOSTS`, `IOF_WEB_TTL`, `IOF_WEB_TERMINAL` (`1` включает терминал), а также `HY2_TEMPLATE`, `IOF_BIN`, `IOF_BASE`, `IOF_SSH_KEY`, `IOF_TG_API` (адрес Bot API, только для стенда и CI; его же берёт `iof bot`) |
+| `bot.json` | Telegram-бот (600), пишет только `iof bot`: `enabled`, `username` (по `getMe`), `actions` (действия из бота, по умолчанию `false`), `hy2_links` (`true`), `quiet` (`{"from": "23:00", "to": "08:00"}` или `null`), `admins`: [{`id`, `name`, `username`, `role` (`main` или `regular`), `sound`, `notify` (`null` — по умолчанию, этап 5), `added`}], `invites`: [{`hash` (sha256 от кода), `role`, `created`, `expires`}]. Время — unix |
+| `bot.token` | токен бота (600), одной строкой; `bot.lock` — `flock` для `iof bot` |
 | `state/<узел>` | последнее состояние для `iof check`: `ok` или текст проблем |
 | `hy2/index.tsv` | `логин<TAB>подпись<TAB>создан` |
 | `hy2/<логин>.txt` | ссылки группы по строке: узлы, затем ретрансляторы; внутри пароли. У группы со списком портов порт узла со сменой портов — `443,10000-19999` |
@@ -153,12 +156,29 @@ sha1-хэш. Повторный запуск с той же подписью д�
   данные уходят в `.moved-`), cron ставится здесь. `cancel` на старом: `n_migrate_abort` на новом,
   блокировка снимается. Номер `id` в `migrate.conf` обоих серверов защищает от снятия не того сервера.
   Пока здесь role=source, `migrate_guard` в точке входа запрещает команды, которые что-то меняют
-  (список в `case "$cmd:${1:-}"`, в том числе `hy2 hop`, `hy2 upgrade`, `block on|update|off`; для
+  (список в `case "$cmd:${1:-}"`, в том числе `hy2 hop`, `hy2 upgrade`, `block on|update|off`,
+  `bot token|on|off|set|invite|redeem|admin`; для
   трёхсловных — в `case "$cmd:${1:-}:${2:-}"`, там `audit probe start|stop|import`); `exec`, `check`,
   `status`, `update`, `audit run`, `audit probe list` и просмотр разрешены.
   При добавлении новой меняющей команды её нужно внести в этот список.
 
-- **Аудит безопасности** (`iof audit`, этапы 1–4 из плана `security-plan.md`). Блоков два:
+- **Telegram-бот** (`iof bot`, план и решения в `bot-plan.md`). Сам бот — поток панели (`web/iof_bot.py`),
+  он только читает `bot.json` и `bot.token`, а меняет их `iof bot` (из консоли, из панели и из бота).
+  JSON ведёт встроенный python `BOT_PY` (режимы `getme`, `edit <операция>`, `show`), пишет новым файлом
+  через `os.replace` с правами 600. Меняющие подкоманды берут `flock` на `bot.lock` (`bot_lock`, fd 9).
+  - `bot token`: токен со stdin (в терминале `read -s`), проверка формата и `getMe` (python, токен через
+    stdin), затем `bot.token` и `username`. Пустой ввод удаляет токен и выключает бота. Адрес Bot API —
+    `bot_api`: `IOF_TG_API` из окружения (так передаёт панель) или из `web.env`, иначе Telegram. Прокси нет.
+  - `bot invite main|regular`: код — sha256 от 32 случайных байт (64 знака hex), печатается отдельной строкой
+    (по ней панель найдёт код) и ссылкой `t.me/<бот>?start=<код>`; в `bot.json` sha256 кода, роль, срок 24 ч.
+    Не больше 20 неиспользованных. `invite del <начало хэша>` (от 6 знаков) отзывает.
+  - `bot redeem` вызывает поток бота: со stdin код, ID, имя, username. Печатает `result=added|already|bad`
+    и `role`. Истёкшие приглашения выбрасываются при любой записи, поэтому истёкший код — тоже `bad`.
+    Уже админ — `already`, приглашение не тратится.
+  - `bot set actions|links on|off`, `set quiet ЧЧ:ММ-ЧЧ:ММ|off`, `admin set <ID> role|sound`, `admin del`, `show`
+    (без кодов и токена; показывает, работает ли панель, `IOF_TG_API` и перенос).
+
+- **Аудит безопасности** (`iof audit`, этапы 1–4 плана «Безопасности»; план выполнен, его файл удалён). Блоков два:
   `server` («Аудит сервера») и `dpi` («Защита от РКН (ТСПУ)»). `iof audit run [server|dpi|all]`,
   по умолчанию `all`; `audit cron` проверяет оба. Общее устройство:
   - Узел только собирает факты строками `ключ=значение`: `n_audit_server` (sshd -T, файрвол, fail2ban,
@@ -288,6 +308,7 @@ sha1-хэш. Повторный запуск с той же подписью д�
 `audit probe start [--ttl с]|stop|import|list`, `update`, `version` (версию подставляет `install.sh` в `IOF_VERSION`),
 `node add|import|del|list`, `hy2 install|add [--hop|--no-hop]|del|list|show|refresh|status|restart|hop on|off|upgrade`,
 `block on|update|off`,
+`bot show|token|on|off|set|invite|redeem|admin`,
 `awg add|keys|del|show|export|list|clients|refresh|status`, `relay add|del|list|apply`,
 `migrate start|finish|cancel|status`, `vless` (заглушка, WIP). Полный список в `usage()`.
 
@@ -297,7 +318,9 @@ sha1-хэш. Повторный запуск с той же подписью д�
   Слушать не на loopback без `IOF_WEB_PASSWORD` откажется (HTTP Basic, имя пользователя любое).
 - **Читает** файлы `/root/iof` напрямую. **Меняет** что-либо только через команды `iof`
   в классе `Jobs`: одна задача за раз, лог в памяти (10 задач, 600 строк, 900 с на шаг).
-  Единственное исключение — терминал на узел (`Terminals`, см. ниже), он выключен без `IOF_WEB_TERMINAL=1`.
+  Исключения: терминал на узел (`Terminals`, см. ниже), он выключен без `IOF_WEB_TERMINAL=1`, и
+  Telegram-бот: он вызывает `iof bot redeem` сам, а не задачей `Jobs` (команда быстрая, узлы не трогает,
+  и код приглашения не должен ждать, пока идёт `hy2 install`); так же будет страница бота (этап 2).
   У задачи есть вид `kind` (`node` — добавление, `migrate`, `hy2`, `service`, `node:<имя>` — действия
   с узлом): по нему страница находит свои задачи. Ссылки `hy2://` в логе задачи без пароля (`HY2_SECRET`).
   По завершении задачи кэш статуса сбрасывается. Если в выводе есть строка, начинающаяся
@@ -372,6 +395,24 @@ sha1-хэш. Повторный запуск с той же подписью д�
     `lib/xterm.js` → `xterm.js`, `lib/addon-fit.js` → `xterm-fit.js`, `css/xterm.css` → `xterm.css`;
     в начало — комментарий с пакетом, версией и текстом лицензии MIT, строка `sourceMappingURL` убирается.
     `ci/lint.sh` не проверяет их по правилам CSP (массив `VENDOR`), но требует первую строку с пакетом и версией.
+- **Телеграм-бот** (`iof_bot.py`, класс `Bot`, поток `iof-bot`; план — `bot-plan.md`, сейчас сделан этап 1):
+  - `iof-web.py` импортирует модуль в `try`: если он не загрузился или `Bot` упал при создании, панель
+    работает без бота и пишет причину в журнал. В `Bot` передаются `Jobs`, `StatusCache`, путь к `iof`
+    и `IOF_TG_API`. `srv.bot.state()` — `state` (off, no_token, migrate, running, error, conflict), `error`.
+  - Цикл: `load` перечитывает `bot.json` и `bot.token`, если сменились mtime, размер или inode; новый токен —
+    `offset` заново, `getMe` и `setMyCommands`. Не опрашивает, если выключен, нет токена или в `migrate.conf`
+    `role=target` (после `migrate finish` запустится сам). `getUpdates` с `timeout=50`, после ответа настройки
+    проверяются снова: выключили или сменили токен — апдейты не обрабатываются и не подтверждаются. Ошибки —
+    пауза 1, 2, 4… до 60 с (401 — сразу 60, 429 — `retry_after`); паузу прерывает смена файлов бота (`wait`).
+    409 пишется в журнал. Смена состояния — строка `бот: …` в журнале, токен вырезается (`scrub`).
+  - Отвечает только админам из `bot.json` и только в личном чате; группы и каналы не читает. Сообщения старше
+    запуска (или смены токена) на 5 минут пропускаются. Чужим молчит, в журнал ID и username не чаще раза в
+    минуту на ID. Исключение — 64 знака hex или `/start <код>` (ссылка t.me): `iof bot redeem`, ответ «ты админ,
+    роль …», «код не подошёл» или «идёт перенос»; не больше 5 кодов в минуту от одного ID, дальше молчит.
+  - Команды: `/start` (приветствие, сервер, роль), `/help` (список из `COMMANDS`, он же меню `setMyCommands`).
+    Сообщения в HTML (`esc`), длинные режутся по 4096 знаков.
+  - Клиент Bot API (`Api`) на urllib без прокси, JSON в теле. Ошибки: `ApiError` (код, текст, `retry_after`)
+    и `NetError` (нет связи); текст без токена.
 - Пароли и ключи из формы передаются в `iof` через stdin (`--password-stdin`, `--key-stdin`),
   в лог задачи пишется команда без них. Поля формы проверяются и в панели, и в `iof`.
   Поля входа на сервер разбирает `login_fields` (общая для добавления и переноса).
@@ -463,7 +504,14 @@ Hysteria2 совпадает с шаблоном, порт отвечает на
 перезапуска `iof-block` список на месте; `block update` с тем же списком ничего не меняет; `blocklist` —
 `good`; обновление и снятие задачей панели, после снятия нет наборов, правил и файлов), запрет действий
 при переносе (поддельный `migrate.conf`: `hy2 hop`, `block`, `hy2 upgrade` и действие в панели отказаны,
-`audit run` разрешён), проверку с ПК (мишени на узлах с python3 и «не проверяется» на узле без него; на первом
+`audit run` разрешён), Telegram-бота через поддельный Bot API (только если на управляющем сервере служба
+`fake-tg` и `IOF_TG_API` на неё: `bot.json` и `bot.token` сохраняются и возвращаются; `bot on` без токена,
+неверный и отозванный токен — отказ; бот опрашивает API, меню `/start`, `/help`; чужому молчит, в журнал
+ID и username; неверный, повторный, просроченный код и код из группы не приняты, верный и `/start <код>`
+приняты с ролью; старое сообщение пропущено; `/start` и `/help` админу, в группе не отвечает и ему;
+`invite del`, `admin set|del`, `set`; 409 от второго опроса в журнале, бот продолжает; при `role=source`
+изменения и коды отказаны, при `role=target` бот не опрашивает API, без переноса отвечает на ждавшее
+сообщение; `off` и пустой токен; токена нет в журналах, `bot.json` и `show`), проверку с ПК (мишени на узлах с python3 и «не проверяется» на узле без него; на первом
 узле с python3, который не управляющий сервер, входящие запрещены политикой DROP — мишень открывает
 порт двумя правилами; контроль проходит все слои; мишень отвечает по TLS и UDP только с токеном; готовый
 JSON: TCP не проходит — `crit` с высокой уверенностью, IP источника — адрес узла — всё `none` и низкая,
@@ -512,7 +560,7 @@ wsl -d Ubuntu-24.04 -u root --cd /mnt/c/dev/repos/iof -- bash stand/stand.sh up
 
 ```bash
 bash stand/stand.sh up        # собрать и поднять; up old node1 — только эти серверы, как в CI
-bash stand/stand.sh setup     # iof из рабочей копии на old, поднятые узлы, Hysteria2, группа ссылок, cron, терминал, python3 на node1, nftables на old
+bash stand/stand.sh setup     # iof из рабочей копии на old, поднятые узлы, Hysteria2, группа ссылок, cron, терминал, python3 на node1, nftables и fake-tg на old
 bash stand/stand.sh test      # проверка iof на стенде (stand/test.sh); после переноса: test new
 bash stand/stand.sh sync      # после правок: залить рабочую копию на серверы, где стоит iof
 bash stand/stand.sh tunnel    # панели: old http://localhost:8081/, new http://localhost:8082/
@@ -559,6 +607,12 @@ bash stand/stand.sh down
   (комментарий `iof-stand-pc`): порт `470NN` на мишень `172.30.0.NN:47000` по TCP и UDP, `471NN` на 443/udp
   (Hysteria2), и ACCEPT в `DOCKER-USER`; печатает `$env:IOF_PROBE_MAP` для `probe.ps1`. Адрес WSL меняется
   при перезапуске WSL, тогда `pc on` заново; `pc off` убирает правила. Панель для ПК — через `stand.sh tunnel`.
+- Бот на old ходит не в Telegram, а в поддельный Bot API: `setup` ставит службу `fake-tg`
+  (`stand/fake-tg.py` на 127.0.0.1:8089, `--max-wait 5`: `getUpdates` ждёт не дольше 5 с, и тесты быстро
+  видят, что бот выключили) и пишет `IOF_TG_API=http://127.0.0.1:8089` в `web.env`. Токен с номером бота 0
+  поддельный API считает отозванным. Служебный вход `/fake/*` — подложить сообщение, забрать отправленное,
+  состояние опроса (описан в начале `fake-tg.py`). `sync` перезапускает `fake-tg`. Живой бот на стенде:
+  убрать `IOF_TG_API` из `web.env`, `systemctl restart iof-web`, токен через `iof bot token` со stdin.
 - Git Bash на машине разработки может сломаться при обновлении Git for Windows (пустой `usr\bin`):
   тогда `lint.sh` и скрипты стенда запускаются из WSL (`wsl -d Ubuntu-24.04 -u root -- bash ci/lint.sh`).
 
@@ -594,6 +648,8 @@ bash stand/stand.sh down
 
 ## Планы и обсуждения
 
+- Telegram-бот (ветка `feat-telegram-bot`): план по этапам и согласованные решения в [`bot-plan.md`](bot-plan.md).
+  Каждый этап — отдельный чат: начни с этого файла, в конце отметь этап в нём.
 - VLESS: заглушка `cmd_vless`, команд пока нет.
 - Перенос управляющего сервера (`iof migrate`, страница «Перенос») реализован и прогнан на стенде
   через панели: перенос по паролю, повтор, отмена, повторный перенос, завершение. VPN-клиент через

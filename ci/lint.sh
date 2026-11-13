@@ -9,6 +9,8 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT" || exit 1
 SHELL_FILES=(iof.sh iof-nightly install.sh stand/stand.sh stand/test.sh ci/lint.sh)
+# Панель, модуль Telegram-бота и поддельный Bot API стенда
+PY_FILES=(web/iof-web.py web/iof_bot.py stand/fake-tg.py)
 # Сторонний код в web/static: xterm.js для терминала на странице узла. Правила CSP к нему не применяются:
 # свои <style> он создаёт скриптом, и term.js переносит их в adoptedStyleSheets. Файлы берутся из npm
 # целиком, первая строка называет пакет и версию (CLAUDE.md, «Веб-панель»)
@@ -60,21 +62,25 @@ check_shellcheck() {
 # Тот же разбор, что делает install.sh перед установкой, и pyflakes: неопределённые имена,
 # лишние импорты. На машине разработки python3 бывает заглушкой Microsoft Store, она не запустится
 check_python() {
-  local out
+  local out f
   if ! python3 -c '' >/dev/null 2>&1; then missing python3; return; fi
-  if out="$(python3 -c 'import ast, sys; ast.parse(open(sys.argv[1], encoding="utf-8").read(), sys.argv[1])' web/iof-web.py 2>&1)"; then
-    ok "python3: web/iof-web.py разбирается"
-  else
-    fail "python3: web/iof-web.py"
-    details "$out"
-  fi
+  for f in "${PY_FILES[@]}"; do
+    if out="$(python3 -c 'import ast, sys; ast.parse(open(sys.argv[1], encoding="utf-8").read(), sys.argv[1])' "$f" 2>&1)"; then
+      ok "python3: $f разбирается"
+    else
+      fail "python3: $f"
+      details "$out"
+    fi
+  done
   # В CI pyflakes ставится через pipx и есть только командой, в Ubuntu (apt install pyflakes3) — модулем
   local pf=(pyflakes)
   if ! command -v pyflakes >/dev/null 2>&1; then
     pf=(python3 -m pyflakes)
     if ! "${pf[@]}" --version >/dev/null 2>&1; then missing pyflakes; return; fi
   fi
-  if out="$("${pf[@]}" web/iof-web.py 2>&1)"; then ok "pyflakes web/iof-web.py"; else fail "pyflakes web/iof-web.py"; details "$out"; fi
+  for f in "${PY_FILES[@]}"; do
+    if out="$("${pf[@]}" "$f" 2>&1)"; then ok "pyflakes $f"; else fail "pyflakes $f"; details "$out"; fi
+  done
 }
 
 check_js() {

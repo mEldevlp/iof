@@ -5,7 +5,8 @@
 # пересылает трафик, смена портов Hysteria2 включается и выключается (клиент ходит по ссылке со списком
 # портов), аудит безопасности видит изменения на узле (в том числе расхождение конфига Hysteria2
 # с шаблоном в блоке dpi), блок-лист отбрасывает пакеты с адресов из списка и не трогает защищённые,
-# действия запрещены во время переноса, мишени проверки с ПК отвечают только с токеном, готовый отчёт
+# действия запрещены во время переноса, Telegram-бот панели через поддельный Bot API принимает коды
+# приглашений и молчит чужим, мишени проверки с ПК отвечают только с токеном, готовый отчёт
 # даёт ожидаемые оценки, мишени исчезают по сроку; панель отвечает, отбивает чужие
 # запросы, выполняет задачи, выдаёт скрипт для ПК по билету и открывает терминал на каждый узел
 # (stand.sh setup включает его в web.env). Созданные группы ссылок и ретранслятор удаляются,
@@ -35,6 +36,7 @@ PROBE_PY=()         # узлы с python3: на них поднимаются м
 HOP_LEFT=0          # 1 — могла остаться смена портов на узлах и группа со списком портов
 BLOCK_LEFT=""       # «узел|сервер с тестовыми адресами»: там мог остаться блок-лист
 GUARD_LEFT=0        # 1 — на управляющем сервере остался поддельный migrate.conf
+BOT_LEFT=0          # 1 — bot.json и bot.token заменены проверкой бота, прежние лежат в /root/.iof-test-bot
 NAMES=()
 declare -A ADDR=()
 
@@ -62,6 +64,10 @@ cleanup() {
   if (( GUARD_LEFT )); then
     echo "Убираю поддельный migrate.conf"
     on "$M" rm -f /root/iof/migrate.conf || true
+  fi
+  if (( BOT_LEFT )); then
+    echo "Возвращаю настройки бота как были"
+    bot_restore
   fi
   if (( HOP_LEFT )); then
     echo "Выключаю смену портов и убираю группу «$HOP_GROUP»"
@@ -623,6 +629,303 @@ check_guard() {
   if out="$(iofm -n "$n" audit run dpi 2>&1)"; then ok "во время переноса: iof audit run разрешена"; else fail "audit run во время переноса"; details "$out"; fi
   on "$M" rm -f /root/iof/migrate.conf
   GUARD_LEFT=0
+}
+
+# Копии bot.json и bot.token до проверки бота, после неё всё возвращается как было
+bot_save() {
+  on "$M" bash -c 'rm -rf /root/.iof-test-bot && mkdir -m 700 /root/.iof-test-bot
+    for f in bot.json bot.token; do if [[ -f /root/iof/$f ]]; then cp -p /root/iof/$f /root/.iof-test-bot/; fi; done'
+  BOT_LEFT=1
+}
+
+bot_restore() {
+  on "$M" bash -c 'for f in bot.json bot.token; do
+      rm -f /root/iof/$f
+      if [[ -f /root/.iof-test-bot/$f ]]; then cp -p /root/.iof-test-bot/$f /root/iof/$f; fi
+    done
+    rm -rf /root/.iof-test-bot' || true
+  BOT_LEFT=0
+}
+
+# Telegram-бот панели через поддельный Bot API (stand/fake-tg.py, его ставит stand.sh setup на old):
+# iof bot token (неверный и верный), on без токена, бот опрашивает API и ставит меню команд; чужому
+# не отвечает, на неверный код отвечает «не подошёл»; приглашение верное, повторное, просроченное,
+# по ссылке /start <код>, из группового чата; старое сообщение пропускается; админу отвечает на /start
+# и /help, в группе не отвечает и ему; настройки и админы меняются командой; 409 от второго опроса
+# пишется в журнал, и бот продолжает работать; при переносе изменения и коды отказаны, на сервере,
+# принимающем управление, бот не опрашивает API; выключение и удаление токена. Токен не попадает
+# в журналы, bot.json и iof bot show
+check_bot() {
+  local out rc
+  if on "$M" test -f /root/iof/migrate.conf; then echo "      идёт настоящий перенос, проверку бота пропускаю"; return 0; fi
+  if ! on "$M" bash -c 'systemctl is-active --quiet fake-tg && grep -qx "IOF_TG_API=http://127.0.0.1:8089" /root/iof/web.env'; then
+    echo "      на $M нет поддельного Bot API (его ставит stand.sh setup на old), проверку бота пропускаю"
+    return 0
+  fi
+  bot_save
+  GUARD_LEFT=1
+  out="$(on_in "$M" python3 - 2>&1 <<'PY'
+import hashlib, json, os, re, subprocess, time, urllib.request
+
+FAKE = "http://127.0.0.1:8089"
+# Токены для поддельного API: номер 0 он считает отозванным. Настоящего токена здесь нет
+TOKEN = "777000:AAEstandFakeTokenForIofBotTests_x1"
+BAD_TOKEN = "0:AAEstandFakeTokenRevokedXXXXXXXXXX"
+BOT_JSON, BOT_TOKEN, MIGRATE = "/root/iof/bot.json", "/root/iof/bot.token", "/root/iof/migrate.conf"
+T0 = time.time()
+
+
+def report(good, text):
+    print(("ok" if good else "fail") + "\t" + text, flush=True)
+
+
+def iof(*args, stdin=""):
+    p = subprocess.run(["iof", "bot", *args], input=stdin.encode(), capture_output=True, timeout=60)
+    return p.returncode, p.stdout.decode("utf-8", "replace"), p.stderr.decode("utf-8", "replace")
+
+
+def fake(path, body=None):
+    data = json.dumps(body).encode() if body is not None else None
+    r = urllib.request.Request(FAKE + path, data=data, method="POST" if data else "GET",
+                               headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(r, timeout=20) as resp:
+        return json.loads(resp.read())
+
+
+def cfg():
+    with open(BOT_JSON, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def admin(uid):
+    return next((a for a in cfg()["admins"] if a["id"] == uid), None)
+
+
+def code_of(out):
+    m = re.search(r"^([0-9a-f]{64})$", out, re.M)
+    return m.group(1) if m else ""
+
+
+def say(uid, text, wait=True, **kw):
+    """Сообщение боту от uid. Ждёт, пока бот подтвердит апдейт (обработал его) -> тексты ответов бота,
+    None — не подтвердил за 20 с. wait=False: не ждать, (номер апдейта, номер последнего вызова)."""
+    before = fake("/fake/state")["sent"]
+    upd = fake("/fake/message", {"from_id": uid, "text": text, **kw})["update_id"]
+    if not wait:
+        return upd, before
+    return replies(upd, before, 20)
+
+
+def replies(upd, before, timeout):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if fake("/fake/state")["offset"] > upd:
+            return [s["params"].get("text", "") for s in fake(f"/fake/sent?after={before}") if s["method"] == "sendMessage"]
+        time.sleep(0.3)
+    return None
+
+
+def first(r):
+    return r[0] if r else ""
+
+
+def journal():
+    p = subprocess.run(["journalctl", "-u", "iof-web", "-u", "fake-tg", "--since", f"@{int(T0) - 1}", "-o", "cat", "--no-pager"],
+                       capture_output=True, timeout=30)
+    return p.stdout.decode("utf-8", "replace")
+
+
+def in_journal(text, timeout=5):
+    """Строка появилась в журнале: journald пишет его с небольшой задержкой."""
+    deadline = time.time() + timeout
+    while True:
+        if text in journal():
+            return True
+        if time.time() > deadline:
+            return False
+        time.sleep(0.5)
+
+
+def polling(timeout=20):
+    """Бот ждёт ответа на getUpdates."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if fake("/fake/state")["waiting"] > 0:
+            return True
+        time.sleep(0.3)
+    return False
+
+
+def quiet(seconds=5):
+    """Бот не опрашивает API: никто не ждёт getUpdates и новых опросов за seconds секунд нет."""
+    deadline = time.time() + 15
+    while time.time() < deadline and fake("/fake/state")["waiting"] > 0:
+        time.sleep(0.5)
+    polls = fake("/fake/state")["polls"]
+    time.sleep(seconds)
+    st = fake("/fake/state")
+    return st["waiting"] == 0 and st["polls"] == polls
+
+
+def run():
+    for f in (BOT_JSON, BOT_TOKEN):
+        if os.path.exists(f):
+            os.remove(f)
+    fake("/fake/reset", {})
+
+    rc, out, err = iof("on")
+    report(rc != 0 and "токен" in err, "iof bot on без токена: отказ")
+    rc, out, err = iof("token", stdin="не токен\n")
+    report(rc != 0 and "не токен" in err, "iof bot token: не токен — отказ")
+    rc, out, err = iof("token", stdin=BAD_TOKEN + "\n")
+    report(rc != 0 and "не принял" in err and not os.path.exists(BOT_TOKEN), f"iof bot token: отозванный токен — отказ ({err.strip()[:80]})")
+    rc, out, err = iof("token", stdin=TOKEN + "\n")
+    report(rc == 0 and "@iof_stand_bot" in out, "iof bot token: getMe прошёл, бот @iof_stand_bot")
+    modes = {f: oct(os.stat(f).st_mode & 0o777) for f in (BOT_JSON, BOT_TOKEN)}
+    report(set(modes.values()) == {"0o600"}, f"bot.json и bot.token с правами 600 ({modes})")
+    report(cfg()["username"] == "iof_stand_bot" and not cfg()["enabled"], "в bot.json имя бота, бот ещё выключен")
+
+    rc, out, err = iof("on")
+    report(rc == 0 and polling(), "iof bot on: бот опрашивает Bot API")
+    report([c.get("command") for c in fake("/fake/state")["commands"]] == ["start", "help"], "меню команд: /start, /help")
+
+    r = say(5001, "/start")
+    report(r == [], "чужому на /start бот не отвечает")
+    r = say(5001, "a" * 64)
+    report(len(r or []) == 1 and "не подошёл" in first(r), "неверный код приглашения: «не подошёл»")
+    report(in_journal("сообщение от чужого, без ответа: id 5001 @user5001"), "сообщение чужого записано в журнал (ID, username)")
+
+    rc, out, err = iof("invite", "regular")
+    code = code_of(out)
+    raw = open(BOT_JSON, encoding="utf-8").read()
+    report(rc == 0 and code and hashlib.sha256(code.encode()).hexdigest() in raw and code not in raw,
+           "iof bot invite regular: код из 64 знаков, в bot.json только хэш")
+    report(f"t.me/iof_stand_bot?start={code}" in out, "iof bot invite: ссылка t.me с кодом")
+    r = say(5001, code)
+    a = admin(5001)
+    report("ты админ" in first(r) and "обычный" in first(r), "код приглашения принят, ответ с ролью")
+    report(bool(a) and a["role"] == "regular" and a["username"] == "user5001" and not cfg()["invites"],
+           "админ добавлен с ролью «обычный», приглашение израсходовано")
+    r = say(5002, code)
+    report("не подошёл" in first(r) and admin(5002) is None, "тот же код второй раз не принят")
+
+    rc, out, err = iof("invite", "main")
+    code2 = code_of(out)
+    data = cfg()
+    data["invites"][0]["expires"] = int(time.time()) - 10
+    with open(BOT_JSON + ".t", "w", encoding="utf-8") as f:
+        json.dump(data, f)
+    os.chmod(BOT_JSON + ".t", 0o600)
+    os.replace(BOT_JSON + ".t", BOT_JSON)
+    r = say(5002, code2)
+    report("не подошёл" in first(r) and admin(5002) is None, "просроченный код не принят")
+
+    r = say(5001, "/start")
+    report("Привет" in first(r) and "обычный" in first(r), "/start админу: приветствие и роль")
+    r = say(5001, "/help")
+    report("/start" in first(r) and "/help" in first(r), "/help админу: список команд")
+    sent = fake("/fake/sent?after=0")
+    report(sent[-1]["params"].get("parse_mode") == "HTML" and sent[-1]["params"].get("chat_id") == 5001, "ответ в личный чат, parse_mode HTML")
+    r = say(5001, "что-то непонятное")
+    report("/help" in first(r), "непонятное от админа: подсказка /help")
+    r = say(5001, "/start", chat_type="group")
+    report(r == [], "в групповом чате бот не отвечает и админу")
+
+    rc, out, err = iof("invite", "main")
+    code3 = code_of(out)
+    r = say(5003, code3, chat_type="supergroup")
+    report(r == [] and admin(5003) is None and len(cfg()["invites"]) == 1, "код из группового чата не принят, приглашение цело")
+    r = say(5003, f"/start {code3}")
+    report("главный" in first(r) and (admin(5003) or {}).get("role") == "main", "код по ссылке (/start <код>): админ с ролью «главный»")
+
+    rc, out, err = iof("invite", "main")
+    code4 = code_of(out)
+    r = say(5004, code4, date=int(time.time()) - 3600)
+    report(r == [] and admin(5004) is None, "сообщение старше запуска бота на 5 минут пропущено")
+    h4 = hashlib.sha256(code4.encode()).hexdigest()
+    rc, out, err = iof("show")
+    report(rc == 0 and h4[:12] in out and code4 not in out and TOKEN not in out and "5003" in out,
+           "iof bot show: админы, хэш приглашения, без кода и токена")
+    rc, out, err = iof("invite", "del", h4[:8])
+    r = say(5004, code4)
+    report(rc == 0 and not cfg()["invites"] and "не подошёл" in first(r), "iof bot invite del: приглашение отозвано")
+
+    rc1, _, _ = iof("admin", "set", "5003", "role", "regular")
+    rc2, _, _ = iof("admin", "set", "5003", "sound", "on")
+    a = admin(5003) or {}
+    report(rc1 == 0 and rc2 == 0 and a.get("role") == "regular" and a.get("sound") is True, "admin set: роль и звук в тихие часы")
+    rc, _, err = iof("admin", "set", "9999", "role", "main")
+    report(rc != 0 and "нет" in err, "admin set: неизвестный ID — отказ")
+    rc, _, _ = iof("admin", "del", "5003")
+    r = say(5003, "/start")
+    report(rc == 0 and admin(5003) is None and r == [], "admin del: админ удалён, бот ему больше не отвечает")
+    ok = [iof("set", "actions", "on")[0], iof("set", "links", "off")[0], iof("set", "quiet", "23:00-8:00")[0]]
+    c = cfg()
+    report(ok == [0, 0, 0] and c["actions"] is True and c["hy2_links"] is False and c["quiet"] == {"from": "23:00", "to": "08:00"},
+           "iof bot set: действия, ссылки, тихие часы")
+    rc, _, _ = iof("set", "quiet", "25:00-08:00")
+    rc2, _, _ = iof("set", "quiet", "off")
+    report(rc != 0 and rc2 == 0 and cfg()["quiet"] is None, "тихие часы: неверное время — отказ, off — выключены")
+
+    # Второй опрос с тем же токеном: поддельный API, как Telegram, обрывает ждущий опрос бота ответом 409
+    polling()
+    try:
+        urllib.request.urlopen(urllib.request.Request(f"{FAKE}/bot{TOKEN}/getUpdates", data=b'{"timeout": 0}',
+                                                      headers={"Content-Type": "application/json"}), timeout=10).read()
+    except OSError:
+        pass
+    report(in_journal("опрашивает кто-то ещё (409)"), "409 (токен опрашивает кто-то ещё) записан в журнал панели")
+    r = say(5001, "/help")
+    report("/start" in first(r), "после 409 бот снова отвечает")
+
+    rc, out, err = iof("invite", "main")
+    code5 = code_of(out)
+    with open(MIGRATE, "w") as f:
+        f.write(f"role=source\nid=iof-test\npeer=root@192.0.2.1\nstarted={int(time.time())}\n")
+    rc, out, err = iof("invite", "main")
+    report(rc != 0 and "идёт перенос" in err, "при переносе отсюда: iof bot invite отказана")
+    rc, out, err = iof("show")
+    report(rc == 0 and "Перенос" in out, "при переносе: iof bot show работает")
+    r = say(5005, code5)
+    report("перенос" in first(r) and admin(5005) is None and len(cfg()["invites"]) == 1, "при переносе: код не принят, бот отвечает, что идёт перенос")
+
+    with open(MIGRATE, "w") as f:
+        f.write(f"role=target\nid=iof-test\npeer=root@192.0.2.1\nstarted={int(time.time())}\n")
+    report(quiet(), "сервер принимает управление (role=target): бот не опрашивает API")
+    upd, before = say(5001, "/help", wait=False)
+    time.sleep(4)
+    report(fake("/fake/state")["offset"] <= upd and not fake(f"/fake/sent?after={before}"), "role=target: сообщение не обработано")
+    os.remove(MIGRATE)
+    r = replies(upd, before, 20)
+    report("/start" in first(r), "без переноса бот снова работает и отвечает на ждавшее сообщение")
+
+    rc, out, err = iof("off")
+    report(rc == 0 and quiet() and cfg()["enabled"] is False, "iof bot off: бот не опрашивает API")
+    rc, out, err = iof("on")
+    report(rc == 0 and polling(), "iof bot on: снова опрашивает")
+    rc, out, err = iof("token", stdin="\n")
+    report(rc == 0 and not os.path.exists(BOT_TOKEN) and cfg()["enabled"] is False and quiet(),
+           "пустой токен: токен удалён, бот выключен и не опрашивает API")
+
+    secret = TOKEN.split(":", 1)[1]
+    leaks = [name for name, text in (("журнал iof-web и fake-tg", journal()), ("bot.json", open(BOT_JSON).read()),
+                                     ("iof bot show", iof("show")[1])) if secret in text]
+    report(not leaks, "токена нет в журналах, bot.json и iof bot show" + (f": есть в {', '.join(leaks)}" if leaks else ""))
+
+
+try:
+    run()
+finally:
+    if os.path.exists(MIGRATE):
+        os.remove(MIGRATE)
+PY
+)"
+  rc=$?
+  tally "$out"
+  if (( rc != 0 )); then fail "проверка бота завершилась с кодом $rc"; fi
+  on "$M" rm -f /root/iof/migrate.conf
+  GUARD_LEFT=0
+  bot_restore
 }
 
 # Оценка проверки $2 на узле $1 из iof api audit: "статус значение", down — узел не ответил.
@@ -1322,6 +1625,8 @@ step "Блок-лист сканеров"
 check_block
 step "Действия во время переноса"
 check_guard
+step "Телеграм-бот"
+check_bot
 step "Проверка с ПК"
 check_probe
 step "Веб-панель"
