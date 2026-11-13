@@ -9,7 +9,8 @@ deleteWebhook. Параметры — JSON, форма или multipart, как 
 секунд, чтобы тесты не ждали по 50 с, пока бот заметит, что его выключили.
 Как Telegram, отвечает 400: callback_data кнопки пустой или длиннее 64 байт (BUTTON_DATA_INVALID),
 больше 100 кнопок, editMessageText чужого или неизвестного сообщения (message to edit not found)
-и с теми же текстом и кнопками (message is not modified).
+и с теми же текстом и кнопками (message is not modified), sendPhoto без файла и с подписью длиннее
+1024 знаков.
 
 Служебный вход для тестов, JSON:
   POST /fake/message  {from_id, text, username?, first_name?, chat_type?, chat_id?, date?} → {update_id}
@@ -251,6 +252,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reply(400, {"ok": False, "error_code": 400, "description": "Bad Request: message text is empty"})
             if len(str(params.get("text", ""))) > 4096:
                 return self.reply(400, {"ok": False, "error_code": 400, "description": "Bad Request: message is too long"})
+            if method == "sendPhoto" and not isinstance(params.get("photo"), dict):
+                return self.reply(400, {"ok": False, "error_code": 400, "description": "Bad Request: there is no photo in the request"})
+            if len(str(params.get("caption", ""))) > 1024:
+                return self.reply(400, {"ok": False, "error_code": 400, "description": "Bad Request: message caption is too long"})
             error = markup_error(params.get("reply_markup"))
             if error:
                 return self.reply(400, {"ok": False, "error_code": 400, "description": error})

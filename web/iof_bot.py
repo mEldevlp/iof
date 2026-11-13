@@ -13,7 +13,17 @@ Long polling (getUpdates), без webhook: на сервере не открыв
 Данные они берут у панели: опрос узлов — общий StatusCache (cache), остальное — объект views
 (BotViews в iof-web.py) с тем же разбором, что у страниц. Опрос узлов идёт секундами, поэтому эти
 команды выполняются в отдельных потоках (не больше WORKERS сразу), а цикл опроса Telegram не ждёт.
-Кнопки inline: callback_data не длиннее 64 байт, у слишком длинного имени узла вместо него хэш.
+Кнопки inline: callback_data не длиннее 64 байт, у слишком длинного имени узла или группы — хэш.
+Ссылки Hysteria2 (кнопка группы под /hy2, если в bot.json hy2_links) — только в сообщения админу:
+фото QR и ссылка в подписи. В журнал панели бот пишет всё через маску пароля ссылок.
+
+Действия (/check, /hy2add, /hy2refresh и кнопки перезапуска Hysteria2, проверки узла, удаления
+группы) — только главному админу и только если в bot.json actions. Шаги задачи собирает панель
+(объект actions, BotActions в iof-web.py) теми же функциями, что для своих кнопок, задача идёт
+в общую очередь Jobs. Сначала сообщение «что будет сделано» с «Подтвердить» и «Отмена»: номер
+подтверждения случайный, только в памяти, на 5 минут и одного админа. Повтор апдейта, нажатие после
+перезапуска панели и повторное нажатие ничего не запустят. Ход задачи — то же сообщение, правится
+из своего потока раз в FOLLOW секунд.
 
 Только stdlib. Адрес Bot API — IOF_TG_API из web.env (для стенда и CI с поддельным API),
 по умолчанию https://api.telegram.org. Прокси нет и не будет. Токен не пишется в журнал:
@@ -26,6 +36,7 @@ import http.client
 import json
 import os
 import re
+import secrets
 import socket
 import subprocess
 import threading
@@ -50,27 +61,55 @@ COMMANDS = [
     ("node", "Узел подробно: /node имя"),
     ("audit", "Итог последней проверки безопасности"),
     ("service", "Версия iof, обновления, проверка узлов, ночное обслуживание"),
-    ("hy2", "Группы ссылок Hysteria2"),
+    ("hy2", "Группы ссылок Hysteria2, ссылки и QR"),
+    ("check", "Проверить все узлы сейчас (iof check)"),
+    ("hy2add", "Создать группу ссылок: /hy2add Подпись [--hop]"),
+    ("hy2refresh", "Пересобрать все группы ссылок Hysteria2"),
     ("start", "Приветствие и твоя роль"),
     ("help", "Что умеет бот"),
 ]
 # Команды просмотра: метод Bot.view_<команда>, выполняются в отдельном потоке
 VIEWS = ("status", "node", "audit", "service", "hy2")
+# Команды действий: только с подтверждением, главному админу и если действия включены в панели
+ACTIONS = ("check", "hy2add", "hy2refresh")
 DEFAULTS = {"enabled": False, "username": "", "actions": False, "hy2_links": True, "quiet": None,
             "admins": [], "invites": []}
 MAX_TEXT = 4096  # знаков в одном сообщении Telegram
+MAX_CAPTION = 1024  # знаков в подписи к фото
 CALLBACK_MAX = 64  # байт в callback_data кнопки
-# Кнопки узла: n — открыть карточку новым сообщением, nr — обновить карточку. После «:» имя узла,
-# после «#» начало sha256 имени, если с именем не укладывается в CALLBACK_MAX. В имени узла iof
-# только латиница, цифры и «._-», поэтому разбор однозначный
-NODE_BUTTON = re.compile(r"^(n|nr)([:#])(.+)$")
+# Кнопки узла и группы ссылок. Узел: n — открыть карточку новым сообщением, nr — обновить карточку,
+# hr — перезапустить Hysteria2, as и ad — проверить узел (аудит сервера, защита от РКН). Группа:
+# g — ссылки, gd — удалить. После «:» имя узла или логин группы, после «#» начало sha256 имени, если
+# с ним не укладывается в CALLBACK_MAX. В именах узлов и логинах групп iof только латиница, цифры
+# и «._-», поэтому разбор однозначный
+REF_BUTTON = re.compile(r"^(n|nr|hr|as|ad|g|gd)([:#])(.+)$")
+GROUP_KINDS = ("g", "gd")
+# Без имени: au — проверить все узлы (блок после «:»), hf — пересобрать все группы.
+# ok и no — «Подтвердить» и «Отмена», после «:» номер подтверждения
+AUDIT_ALL = re.compile(r"^au:(server|dpi)$")
+CONFIRM = re.compile(r"^(ok|no):([0-9a-f]{16})$")
 MAX_BUTTONS = 90  # кнопок узлов в одном сообщении: у Telegram предел 100 на клавиатуру
+MAX_GROUPS = 45   # групп в /hy2 с кнопками (по две на группу)
 MAX_LINES = 40    # строк о проблемных узлах в /status, дальше «и ещё N»
 REFRESH = "🔄 Обновить"
 BUSY = "Я ещё выполняю прошлые команды, повтори через минуту."
+STALE_CONFIRM = "Подтверждение устарело, повтори команду"
+LINKS_OFF = "Выдача ссылок в боте выключена в панели (страница «Телеграм бот»)"
 MARK = {"good": "✅", "warn": "⚠️", "crit": "❌", "none": "⚪"}
 RANK = {"none": 0, "good": 1, "warn": 2, "crit": 3}
 SSH_KEY = "/root/.ssh/iof_ed25519"
+# Пароль в ссылке hy2://пароль@хост: в журнал панели он не попадает, даже если ссылка оказалась
+# в тексте ошибки
+LINK_SECRET = re.compile(r"(hy2://)[^@\s]+@")
+# Пояснения к подтверждению: чем действие заметно клиентам
+NOTES = {
+    ("hy2", "del"): "Ссылки этой группы перестанут работать у всех, кому их выдали.",
+    ("node", "restart_hy2"): "Подключения клиентов Hysteria2 к узлу прервутся на несколько секунд.",
+}
+JOB_MARK = {"running": "⏳", "ok": MARK["good"], "warn": MARK["warn"], "error": MARK["crit"]}
+JOB_DONE = {"ok": "готово", "warn": "готово с ошибками", "error": "ошибка"}  # как JOB_STATES в common.js
+JOB_TAIL = 10   # последних строк лога в сообщении о ходе задачи
+JOB_LINE = 120  # знаков в строке лога, дальше «…»
 
 
 def esc(text):
@@ -128,14 +167,23 @@ def stamp(ts, now=None):
     return time.strftime("%d.%m %H:%M %Z", time.localtime(ts)) + ", " + rel
 
 
+def fmt_dur(s):
+    s = max(0, int(s))
+    return f"{s} с" if s < 60 else f"{s // 60} мин {s % 60} с"
+
+
 def name_hash(name):
     return hashlib.sha256(name.encode("utf-8")).hexdigest()[:24]
 
 
-def node_button(kind, name):
-    """callback_data кнопки узла: имя, а если не укладывается в 64 байта — начало его sha256."""
+def ref_button(kind, name):
+    """callback_data кнопки узла или группы: имя, а если не укладывается в 64 байта — начало его sha256."""
     data = f"{kind}:{name}"
     return data if len(data.encode("utf-8")) <= CALLBACK_MAX else f"{kind}#{name_hash(name)}"
+
+
+def button(text, data):
+    return {"text": text, "callback_data": data}
 
 
 def keyboard(buttons, per_row=2, tail=None):
@@ -230,9 +278,8 @@ def status_text(data):
 
 def status_keyboard(data):
     nodes = (data.get("nodes") or [])[:MAX_BUTTONS]
-    buttons = [{"text": f"{MARK[node_level(n)]} {label(n['name'])}", "callback_data": node_button("n", n["name"])}
-               for n in nodes]
-    return keyboard(buttons, tail=[{"text": REFRESH, "callback_data": "st"}])
+    buttons = [button(f"{MARK[node_level(n)]} {label(n['name'])}", ref_button("n", n["name"])) for n in nodes]
+    return keyboard(buttons, tail=[button(REFRESH, "st")])
 
 
 def parse_ssh(ssh):
@@ -282,6 +329,24 @@ def node_text(d):
                     lines.append(f"{proto} <code>{esc(src)}</code> → <code>{esc(dst or '?')}</code>")
     lines += ["", f"<i>Данные на {clock(d['status_at'])}</i>"]
     return "\n".join(lines)
+
+
+def node_keyboard(name, d, act):
+    """Под карточкой узла: действия (act — админу они доступны) и «Обновить». Перезапуск — только
+    если Hysteria2 на узле стоит."""
+    rows = []
+    if act:
+        n = d.get("node") or {}
+        if n.get("reachable") and (n.get("hy2") or {}).get("installed"):
+            rows.append([button("♻️ Перезапустить Hysteria2", ref_button("hr", name))])
+        rows.append([button("🔍 Аудит сервера", ref_button("as", name)), button("🔍 Защита от РКН", ref_button("ad", name))])
+    return {"inline_keyboard": rows + [[button(REFRESH, ref_button("nr", name))]]}
+
+
+def audit_keyboard(blocks):
+    """Под /audit главному админу: проверить заново все узлы по блоку. blocks: {блок: название}."""
+    return {"inline_keyboard": [[button(f"🔍 {title}: все узлы", f"au:{block}")] for block, title in blocks.items()
+                                if AUDIT_ALL.match(f"au:{block}")]}
 
 
 def audit_text(d):
@@ -420,11 +485,14 @@ def service_text(d, pending=False, now=None):
     return "\n".join(lines)
 
 
-def hy2_text(groups):
-    """/hy2: группы ссылок без самих ссылок (в них пароль), они появятся в боте на этапе 4."""
+def hy2_text(groups, links=False, act=False):
+    """/hy2: группы ссылок без самих ссылок (в них пароль): ссылки приходят по кнопке группы, если
+    выдача включена (links). act — админу доступны действия: создать, удалить, пересобрать."""
+    create = ("Создать: <code>/hy2add Подпись</code>, со списком портов в ссылках — "
+              "<code>/hy2add Подпись --hop</code>") if act else None
     if not groups:
-        return ("Групп ссылок Hysteria2 пока нет. Создать: в панели, страница «Hysteria2», или "
-                "<code>sudo iof hy2 add \"Подпись\"</code>")
+        return "\n".join(["Групп ссылок Hysteria2 пока нет.", create or "Создать: в панели, страница «Hysteria2», "
+                          "или <code>sudo iof hy2 add \"Подпись\"</code>"])
     lines = [f"<b>Группы ссылок Hysteria2: {len(groups)}</b>", ""]
     for g in groups:
         k = len(g["links"])
@@ -435,7 +503,68 @@ def hy2_text(groups):
         if g["hop"]:
             parts.append("список портов")
         lines.append(f"• <b>{esc(g['label'])}</b> — {', '.join(parts)}")
-    lines += ["", "Сами ссылки и QR — в панели, страница «Hysteria2», или <code>sudo iof hy2 show \"Подпись\"</code>"]
+    lines.append("")
+    if links:
+        lines.append("Ссылки и QR — кнопкой 🔗 у группы.")
+    else:
+        lines += [f"{esc(LINKS_OFF)}.", "Ссылки и QR — в панели, страница «Hysteria2», или "
+                  "<code>sudo iof hy2 show \"Подпись\"</code>"]
+    if act:
+        lines += ["🗑 — удалить группу, ♻️ — пересобрать все (/hy2refresh).", create]
+    if len(groups) > MAX_GROUPS:
+        lines.append(f"Кнопки — у первых {MAX_GROUPS} групп.")
+    return "\n".join(lines)
+
+
+def hy2_keyboard(groups, links, act):
+    """Под /hy2: 🔗 ссылки группы (если выдача включена), 🗑 удалить, ♻️ пересобрать все (действия)."""
+    rows = []
+    for g in groups[:MAX_GROUPS]:
+        row = [button(f"🔗 {label(g['label'], 30)}", ref_button("g", g["name"]))] if links else []
+        if act:
+            row.append(button("🗑" if links else f"🗑 {label(g['label'], 30)}", ref_button("gd", g["name"])))
+        if row:
+            rows.append(row)
+    if act and groups:
+        rows.append([button("♻️ Пересобрать все группы", "hf")])
+    return {"inline_keyboard": rows} if rows else None
+
+
+def link_caption(group, link):
+    """Подпись к QR ссылки: узел, группа и сама ссылка в <pre> (Telegram даёт её скопировать)."""
+    return f"<b>{esc(link['node'])}</b> · {esc(group)}\n<pre>{esc(link['url'])}</pre>"
+
+
+def confirm_text(title, steps, note=None, ttl=300):
+    lines = ["<b>Подтверди действие</b>", esc(title)] + [f"<code>{esc(s[0])}</code>" for s in steps]
+    if note:
+        lines.append(note)
+    lines += ["", f"<i>Кнопка действует {ttl // 60} мин, потом команду надо повторить.</i>"]
+    return "\n".join(lines)
+
+
+def job_text(job, total, check=False, now=None):
+    """Ход задачи бота одним сообщением: заголовок, шаг, последние строки лога (Jobs пишет их уже без
+    паролей), в конце итог. Короче MAX_TEXT, чтобы <pre> на несколько строк не резался. check — задача
+    iof check: у неё warn значит «на узлах проблемы»."""
+    log, state = job["log"], job["state"]
+    steps = [line[2:] for line in log if line.startswith("$ ")]
+    head = f"{JOB_MARK.get(state, MARK['crit'])} <b>{esc(job['title'])}</b>"
+    if state == "running":
+        lines = [head, f"Выполняется, шаг {max(1, len(steps))} из {total}"
+                 + (f": <code>{esc(steps[-1][:200])}</code>" if steps else "")]
+    else:
+        done = "на узлах есть проблемы" if check and state == "warn" else JOB_DONE.get(state, "ошибка")
+        lines = [f"{head} — {done} ({fmt_dur((job.get('finished') or now or time.time()) - job['started'])})"]
+        why = next((line for line in reversed(log) if line.startswith("Ошибка")), None)
+        if state == "error" and why:
+            lines.append(f"Причина: {esc(why.split(': ', 1)[-1][:300])}")
+    tail = [line if len(line) <= JOB_LINE else line[:JOB_LINE - 1] + "…" for line in log[-JOB_TAIL:]]
+    while tail:
+        text = "\n".join(lines + ["<pre>" + esc("\n".join(tail)) + "</pre>"])
+        if len(text) <= MAX_TEXT - 200:
+            return text
+        tail = tail[1:]
     return "\n".join(lines)
 
 
@@ -453,6 +582,21 @@ class NetError(Exception):
     """Bot API недоступен: нет связи, таймаут, оборванный или не тот ответ."""
 
 
+def multipart(params, files):
+    """multipart/form-data для sendPhoto: в urllib сборки нет. params — поля (не строки идут JSON, как
+    reply_markup), files — {поле: (имя файла, байты, тип)}. -> (тело, Content-Type)."""
+    fields = [(k, v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)) for k, v in params.items()]
+    blobs = [v.encode("utf-8") for _, v in fields] + [f[1] for f in files.values()]
+    boundary = "iof-" + secrets.token_hex(16)
+    while any(boundary.encode() in b for b in blobs):
+        boundary = "iof-" + secrets.token_hex(16)
+    parts = [f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n'.encode() + v.encode("utf-8") + b"\r\n"
+             for k, v in fields]
+    parts += [f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"; filename="{name}"\r\n'
+              f"Content-Type: {ctype}\r\n\r\n".encode() + data + b"\r\n" for k, (name, data, ctype) in files.items()]
+    return b"".join(parts) + f"--{boundary}--\r\n".encode(), f"multipart/form-data; boundary={boundary}"
+
+
 class Api:
     """Клиент Bot API на urllib. Без прокси, даже если он задан в окружении."""
 
@@ -464,10 +608,13 @@ class Api:
     def scrub(self, text):
         return str(text).replace(self.token, "***") if self.token else str(text)
 
-    def call(self, method, params=None, timeout=20):
-        req = urllib.request.Request(f"{self.base}/bot{self.token}/{method}",
-                                     data=json.dumps(params or {}, ensure_ascii=False).encode("utf-8"),
-                                     headers={"Content-Type": "application/json"})
+    def call(self, method, params=None, timeout=20, files=None):
+        """Параметры — JSON, а с файлами (files, см. multipart) — multipart/form-data."""
+        if files:
+            body, ctype = multipart(params or {}, files)
+        else:
+            body, ctype = json.dumps(params or {}, ensure_ascii=False).encode("utf-8"), "application/json"
+        req = urllib.request.Request(f"{self.base}/bot{self.token}/{method}", data=body, headers={"Content-Type": ctype})
         try:
             with self.opener.open(req, timeout=timeout) as resp:
                 raw = resp.read()
@@ -500,6 +647,8 @@ def normalize(data):
     if isinstance(data, dict):
         cfg.update({k: data[k] for k in DEFAULTS if k in data})
     cfg["enabled"] = cfg["enabled"] is True
+    cfg["actions"] = cfg["actions"] is True
+    cfg["hy2_links"] = cfg["hy2_links"] is True
     admins = cfg["admins"] if isinstance(cfg["admins"], list) else []
     cfg["admins"] = [a for a in admins if isinstance(a, dict) and type(a.get("id")) is int]
     cfg["username"] = cfg["username"] if isinstance(cfg["username"], str) else ""
@@ -523,15 +672,23 @@ class Bot:
     STRANGER_LOG = 60  # сообщения одного чужого пишутся в журнал не чаще раза в столько секунд
     CODE_TRIES = 5     # кодов приглашения в минуту от одного чужого, дальше бот молчит
     WORKERS = 4        # команд просмотра одновременно, остальным «повтори через минуту»
+    CONFIRM_TTL = 300  # секунд живёт номер подтверждения действия
+    MAX_PENDING = 50   # неподтверждённых действий в памяти, старые вытесняются
+    FOLLOW = 3         # секунд между правками сообщения о ходе задачи
 
-    def __init__(self, base, iof, jobs=None, cache=None, views=None, api=None, log=None):
+    def __init__(self, base, iof, jobs=None, cache=None, views=None, actions=None, api=None, log=None):
         self.base = Path(base)
         self.iof = iof
-        # Очередь задач (этап 4), опрос узлов и данные страниц панели (BotViews в iof-web.py)
-        self.jobs, self.cache, self.views = jobs, cache, views
+        # Очередь задач, опрос узлов, данные страниц и шаги действий панели (BotViews и BotActions
+        # в iof-web.py)
+        self.jobs, self.cache, self.views, self.actions = jobs, cache, views, actions
         self.slots = threading.BoundedSemaphore(self.WORKERS)
         self.api_base = (api or DEFAULT_API).strip().rstrip("/")
-        self.log = log or (lambda text: None)
+        write = log or (lambda text: None)
+        self.log = lambda text: write(LINK_SECRET.sub(r"\1***@", str(text)))
+        # Номер подтверждения -> действие: {uid, msg, kind, body, title, total, expires}. Только в памяти
+        # и только у потока опроса Telegram: после перезапуска панели старые кнопки не сработают
+        self.pending = {}
         self.host = socket.gethostname()
         self.lock = threading.Lock()
         self.keys = {}            # путь -> (mtime, размер, inode) при последнем чтении
@@ -750,7 +907,9 @@ class Bot:
         if cmd == "start":
             self.send(api, chat["id"], self.greeting(admin, user))
         elif cmd == "help":
-            self.send(api, chat["id"], self.help_text())
+            self.send(api, chat["id"], self.help_text(admin))
+        elif cmd in ACTIONS:
+            self.command_action(api, chat["id"], admin, cmd, text[m.end():].strip())
         elif cmd in VIEWS:
             if self.views is None or self.cache is None:
                 return self.send(api, chat["id"], "Бот работает без панели, данных нет.")
@@ -771,28 +930,53 @@ class Bot:
         chat = msg.get("chat") if isinstance(msg, dict) else None
         if not isinstance(chat, dict) or chat.get("type") != "private" or type(msg.get("message_id")) is not int:
             return
-        if self.admin(user["id"]) is None:
+        admin = self.admin(user["id"])
+        if admin is None:
             return self.stranger(user, "нажатие кнопки")
         data = q.get("data") if isinstance(q.get("data"), str) else ""
-        chat_id, msg_id = chat["id"], msg["message_id"]
+        chat_id, msg_id, qid = chat["id"], msg["message_id"], q["id"]
+        m = CONFIRM.match(data)
+        if m:
+            return self.confirm(api, qid, user, admin, chat_id, msg_id, *m.groups())
         if self.views is None or self.cache is None:
-            return self.answer(api, q["id"], "Бот работает без панели, данных нет", True)
+            return self.answer(api, qid, "Бот работает без панели, данных нет", True)
         if data == "st":
-            job, toast = (self.view_status, "", msg_id, True), "" if self.cache.fresh(True) else "Опрашиваю узлы…"
-        elif NODE_BUTTON.match(data):
-            kind, name = self.button_node(data)
-            if name is None:
-                return self.answer(api, q["id"], kind, True)
-            if kind == "n":
-                job, toast = (self.view_node, name), ""
-            else:
-                job, toast = (self.view_node, name, msg_id, True), "" if self.cache.fresh(True) else "Опрашиваю узел…"
-        else:
-            return self.answer(api, q["id"], "Кнопка устарела: повтори команду", True)
+            return self.run_view(api, qid, chat_id, (self.view_status, "", msg_id, True),
+                                 "" if self.cache.fresh(True) else "Опрашиваю узлы…")
+        if data == "hf":
+            return self.propose(api, chat_id, admin, "hy2", {"action": "refresh"}, qid)
+        m = AUDIT_ALL.match(data)
+        if m:
+            return self.propose(api, chat_id, admin, "audit", {"block": m.group(1), "node": ""}, qid)
+        m = REF_BUTTON.match(data)
+        if not m:
+            return self.answer(api, qid, "Кнопка устарела: повтори команду", True)
+        kind = m.group(1)
+        name, gone = self.button_ref(*m.groups())
+        if name is None:
+            return self.answer(api, qid, gone, True)
+        if kind == "n":
+            return self.run_view(api, qid, chat_id, (self.view_node, name), "")
+        if kind == "nr":
+            return self.run_view(api, qid, chat_id, (self.view_node, name, msg_id, True),
+                                 "" if self.cache.fresh(True) else "Опрашиваю узел…")
+        if kind == "g":
+            if not self.cfg["hy2_links"]:
+                return self.answer(api, qid, LINKS_OFF, True)
+            return self.run_view(api, qid, chat_id, (self.view_links, name), "")
+        if kind == "hr":
+            return self.propose(api, chat_id, admin, "node", {"action": "restart_hy2", "name": name}, qid)
+        if kind in ("as", "ad"):
+            return self.propose(api, chat_id, admin, "audit", {"block": "server" if kind == "as" else "dpi", "node": name}, qid)
+        return self.propose(api, chat_id, admin, "hy2", {"action": "del", "name": name}, qid)
+
+    def run_view(self, api, qid, chat_id, job, toast):
+        """Нажатие кнопки просмотра: ответ на нажатие (toast — всплывающая подсказка), сама команда
+        в отдельном потоке. Нажатие старое (Telegram не принял ответ) — ничего не делается."""
         if not self.slots.acquire(blocking=False):
-            return self.answer(api, q["id"], BUSY, True)
+            return self.answer(api, qid, BUSY, True)
         try:
-            fresh = self.answer(api, q["id"], toast)
+            fresh = self.answer(api, qid, toast)
         except BaseException:
             self.slots.release()
             raise
@@ -801,16 +985,19 @@ class Bot:
             return
         self.worker(api, chat_id, *job)
 
-    def button_node(self, data):
-        """callback_data кнопки узла -> (n или nr, имя узла) или (текст для админа, None), если узла уже нет."""
-        kind, sep, ref = NODE_BUTTON.match(data).groups()
-        names = [n["name"] for n in self.views.nodes()]
+    def button_ref(self, kind, sep, ref):
+        """Кнопка узла или группы -> (имя узла или логин группы, None) или (None, текст для админа),
+        если их уже нет: узлы по nodes.conf, группы по index.tsv."""
+        if kind in GROUP_KINDS:
+            names, gone = [g["name"] for g in self.views.hy2()], "Группы больше нет"
+        else:
+            names = [n["name"] for n in self.views.nodes()]
+            gone = f"Узла {ref} больше нет в nodes.conf" if sep == ":" else "Этого узла больше нет в nodes.conf"
         if sep == ":":
-            if ref in names:
-                return kind, ref
-            return f"Узла {ref} больше нет в nodes.conf", None
-        name = next((n for n in names if name_hash(n) == ref), None)
-        return (kind, name) if name else ("Этого узла больше нет в nodes.conf", None)
+            name = ref if ref in names else None
+        else:
+            name = next((n for n in names if name_hash(n) == ref), None)
+        return (name, None) if name else (None, gone)
 
     def answer(self, api, query_id, text="", alert=False):
         """answerCallbackQuery: убирает часики с кнопки, text — всплывающая подсказка. False — нажатие
@@ -849,6 +1036,142 @@ class Bot:
             self.slots.release()
             raise
 
+    # Действия. Команды и кнопки только предлагают действие, запускает его «Подтвердить»
+
+    def may_act(self, admin):
+        """None — этому админу действия можно, иначе текст отказа."""
+        if self.actions is None or self.jobs is None:
+            return "Бот работает без панели, действий нет."
+        if not self.cfg["actions"]:
+            return "Действия из бота выключены. Включить: в панели, страница «Телеграм бот», «Разрешить действия»."
+        if (admin or {}).get("role") != "main":
+            return "Действия доступны только главному админу."
+        return None
+
+    def can_act(self, chat_id):
+        """Показывать ли кнопки действий. Бот отвечает только в личных чатах, а там chat_id — ID админа."""
+        return self.may_act(self.admin(chat_id)) is None
+
+    def command_action(self, api, chat_id, admin, cmd, arg):
+        """/check, /hy2refresh, /hy2add Подпись [--hop|--no-hop] -> сообщение с подтверждением."""
+        if cmd == "check":
+            return self.propose(api, chat_id, admin, "check", {})
+        if cmd == "hy2refresh":
+            return self.propose(api, chat_id, admin, "hy2", {"action": "refresh"})
+        body = {"action": "add"}
+        words = arg.split()
+        if words and words[-1] in ("--hop", "--no-hop"):
+            body["hop"] = words[-1] == "--hop"
+            arg = arg[:arg.rindex(words[-1])].strip()
+        if not arg or "\n" in arg:
+            return self.send(api, chat_id, "Подпись группы — одной строкой после команды: <code>/hy2add Подпись</code>, "
+                                           "со списком портов в ссылках — <code>/hy2add Подпись --hop</code>")
+        body["label"] = arg
+        self.propose(api, chat_id, admin, "hy2", body)
+
+    def propose(self, api, chat_id, admin, kind, body, query=None):
+        """Сообщение «что будет сделано» с кнопками «Подтвердить» и «Отмена». Нельзя (нет прав, идёт
+        перенос, группы уже нет) — отказ сразу, ещё до Jobs; на нажатие кнопки (query) — во всплывающем окне."""
+        deny = self.may_act(admin)
+        if deny is None:
+            try:
+                title, steps = self.actions.plan(kind, body)
+            except ValueError as e:
+                deny = f"Не получится: {e}."
+        if deny:
+            return self.answer(api, query, deny, True) if query else self.send(api, chat_id, esc(deny))
+        if query and not self.answer(api, query):
+            return
+        num = secrets.token_hex(8)
+        markup = keyboard([button("✅ Подтвердить", f"ok:{num}"), button("✖️ Отмена", f"no:{num}")])
+        msg = self.send(api, chat_id, confirm_text(title, steps, NOTES.get((kind, body.get("action"))), self.CONFIRM_TTL), markup)
+        if not isinstance(msg, dict) or type(msg.get("message_id")) is not int:
+            return
+        now = time.time()
+        self.pending = {k: p for k, p in self.pending.items() if p["expires"] > now}
+        while len(self.pending) >= self.MAX_PENDING:
+            del self.pending[min(self.pending, key=lambda k: self.pending[k]["expires"])]
+        self.pending[num] = {"uid": admin["id"], "msg": msg["message_id"], "kind": kind, "body": body,
+                             "title": title, "expires": now + self.CONFIRM_TTL}
+
+    def confirm(self, api, qid, user, admin, chat_id, msg_id, verb, num):
+        """«Подтвердить» (ok) или «Отмена» (no). Номер должен быть этого админа и этого сообщения
+        и не старше CONFIRM_TTL, иначе «устарело». Номер тратится, когда задача запущена, отменена или
+        отказана; если очередь занята — нет: «Подтвердить» можно нажать снова, когда она освободится."""
+        p = self.pending.get(num)
+        if p is not None and p["expires"] <= time.time():
+            del self.pending[num]
+            p = None
+        if p is None or p["uid"] != admin["id"] or p["msg"] != msg_id:
+            return self.answer(api, qid, STALE_CONFIRM, True)
+        if verb == "no":
+            del self.pending[num]
+            self.answer(api, qid, "Отменено")
+            return self.reply(api, chat_id, msg_id, f"✖️ Отменено: {esc(p['title'])}")
+        deny = self.may_act(admin)
+        if deny is None:
+            try:
+                title, steps = self.actions.plan(p["kind"], p["body"])
+            except ValueError as e:
+                deny = f"Не получится: {e}."
+        if deny:
+            del self.pending[num]
+            return self.answer(api, qid, deny, True)
+        job = self.jobs.start(title, steps, "bot")
+        if job is None:
+            running = next((j for j in self.jobs.list() if j["state"] == "running"), None)
+            what = f"задача «{running['title']}»" if running else "другая задача"
+            return self.answer(api, qid, f"Сейчас идёт {what}. Когда она закончится, нажми «Подтвердить» ещё раз.", True)
+        del self.pending[num]
+        self.log(f"бот: {self.who(user)} запустил задачу «{title}»")
+        try:
+            self.answer(api, qid, "Запускаю")
+        except (ApiError, NetError):
+            pass
+        self.follow(api, chat_id, msg_id, job["id"], len(steps), p)
+
+    def follow(self, api, chat_id, msg_id, job_id, total, p):
+        """Ход задачи в сообщении с подтверждением: правка раз в FOLLOW секунд, если в логе новое, в конце
+        итог. Свой поток на задачу, а не слот команд просмотра: шаг идёт до 900 с. Бота выключили или
+        сменили токен — сообщение больше не правится."""
+        def run():
+            nonlocal msg_id
+            shown, errors, tries = None, 0, 0
+            while True:
+                job = next((j for j in self.jobs.list() if j["id"] == job_id), None)
+                if job is None or self.token != api.token or self.idle():
+                    return
+                done = job["state"] != "running"
+                text = job_text(job, total, check=p["kind"] == "check")
+                if text != shown:
+                    try:
+                        r = self.reply(api, chat_id, msg_id, text, self.job_markup(job, p) if done else None)
+                        # Сообщение удалили — reply прислал новое, дальше правится оно
+                        if isinstance(r, dict) and type(r.get("message_id")) is int:
+                            msg_id = r["message_id"]
+                        shown = text
+                    except (ApiError, NetError) as e:
+                        errors += 1
+                        if errors == 1:
+                            self.log(f"бот: ход задачи «{job['title']}» не показан: {e}")
+                    except Exception:  # ошибка в коде бота не должна оставлять поток висеть
+                        self.log(self.scrub(traceback.format_exc()).rstrip())
+                        return
+                if done:
+                    tries += 1
+                    if shown == text or tries >= 5:
+                        return
+                time.sleep(self.FOLLOW)
+        threading.Thread(target=run, name="iof-bot-job", daemon=True).start()
+
+    def job_markup(self, job, p):
+        """Кнопки под итогом задачи: после создания группы — её ссылки, если выдача включена."""
+        body = p["body"]
+        if p["kind"] != "hy2" or body.get("action") != "add" or job["state"] == "error" or not self.cfg["hy2_links"]:
+            return None
+        g = next((g for g in self.views.hy2() if g["label"] == body["label"]), None)
+        return keyboard([button(f"🔗 Ссылки «{label(g['label'], 30)}»", ref_button("g", g["name"]))]) if g else None
+
     # Команды просмотра. msg_id — обновить это сообщение (кнопка «Обновить»), иначе новое
 
     def placeholder(self, api, chat_id, msg_id, force):
@@ -877,15 +1200,18 @@ class Bot:
                 return self.reply(api, chat_id, msg_id, "Узлов нет. Добавить: <code>sudo iof node add</code>")
             text = (f"Узла <b>{esc(ref[:64])}</b> нет в nodes.conf. Выбери узел:" if ref
                     else "Какой узел? Напиши <code>/node имя</code> или выбери:")
-            buttons = [{"text": label(n), "callback_data": node_button("n", n)} for n in names[:MAX_BUTTONS]]
+            buttons = [button(label(n), ref_button("n", n)) for n in names[:MAX_BUTTONS]]
             return self.reply(api, chat_id, msg_id, text, keyboard(buttons))
         msg_id = self.placeholder(api, chat_id, msg_id, force)
         d = self.views.node(name, force)
-        markup = keyboard([], tail=[{"text": REFRESH, "callback_data": node_button("nr", name)}]) if d.get("conf") else None
+        markup = node_keyboard(name, d, self.can_act(chat_id)) if d.get("conf") else None
         self.reply(api, chat_id, msg_id, node_text(d), markup)
 
     def view_audit(self, api, chat_id, arg=""):
-        self.send(api, chat_id, audit_text(self.views.audit()))
+        d = self.views.audit()
+        blocks = {b: (d.get("titles") or {}).get(b, b) for b in dict.fromkeys(g["block"] for g in d.get("groups") or [])}
+        act = self.can_act(chat_id) and bool(d.get("nodes")) and not d.get("error")
+        self.send(api, chat_id, audit_text(d), audit_keyboard(blocks) if act else None)
 
     def view_service(self, api, chat_id, arg=""):
         """Сразу — версия, проверка узлов и ночное обслуживание, потом то же сообщение с обновлениями:
@@ -898,7 +1224,35 @@ class Bot:
             self.reply(api, chat_id, msg.get("message_id") if isinstance(msg, dict) else None, service_text(d))
 
     def view_hy2(self, api, chat_id, arg=""):
-        self.send(api, chat_id, hy2_text(self.views.hy2()))
+        groups, links, act = self.views.hy2(), self.cfg["hy2_links"], self.can_act(chat_id)
+        self.send(api, chat_id, hy2_text(groups, links, act), hy2_keyboard(groups, links, act))
+
+    def view_links(self, api, chat_id, name):
+        """Кнопка 🔗 группы: по сообщению на ссылку — фото QR (PNG от qrencode) и подпись с узлом и ссылкой.
+        Без qrencode или если Telegram не принял фото — только текст. В ссылках пароль: они уходят только
+        админу, в журнал панели (маска LINK_SECRET) и лог задач не попадают."""
+        g = self.views.hy2_links(name)
+        if g is None:
+            return self.send(api, chat_id, "Группы больше нет.")
+        if not g["links"]:
+            return self.send(api, chat_id, f"В группе «{esc(g['label'])}» нет ссылок: ни один узел их не выдал. "
+                                           "Пересобрать: /hy2refresh")
+        for link in g["links"]:
+            caption = link_caption(g["label"], link)
+            png = self.views.qr_png(link["url"])
+            if png is not None:
+                # Длинная ссылка в подпись не влезает: тогда она отдельным сообщением после фото
+                short = caption if len(caption) <= MAX_CAPTION else caption.split("\n", 1)[0]
+                try:
+                    self.photo(api, chat_id, png, short)
+                except ApiError as e:
+                    if e.code != 400:
+                        raise
+                    self.log(f"бот: Telegram не принял QR ссылки группы {name}: {e}")
+                    short = None
+                if short == caption:
+                    continue
+            self.send(api, chat_id, caption)
 
     def greeting(self, admin, user):
         name = clean(user.get("first_name") or admin.get("name"), 64) or "админ"
@@ -906,10 +1260,15 @@ class Bot:
                 f"Ты админ, роль: <b>{esc(ROLES.get(admin.get('role'), admin.get('role')))}</b>.\n\n"
                 "Что я умею: /help")
 
-    def help_text(self):
+    def help_text(self, admin=None):
+        deny = self.may_act(admin)
         lines = ["<b>Команды</b>"] + [f"/{c} — {esc(d[0].lower() + d[1:])}" for c, d in COMMANDS]
-        lines += ["", "Команды только показывают состояние, ничего не меняют. Под ответом /status кнопки "
-                      "узлов, под карточкой узла — «Обновить».",
+        lines += ["", "Просмотр — всем админам. Под ответом /status кнопки узлов, под карточкой узла — "
+                      "«Обновить», под /hy2 — ссылки групп с QR, если их выдача включена в панели.",
+                  "", "Действия: /check, /hy2add, /hy2refresh и кнопки перезапуска Hysteria2, проверки узла, "
+                      "удаления группы. Каждое — после кнопки «Подтвердить». "
+                  + ("Тебе они доступны." if deny is None else esc(deny)),
+                  "Удаление узлов, перенос, обновление iof, блок-лист и смена портов — только в панели.",
                   "", "Админов добавляют приглашением, а удаляют и меняют им роль только на сервере: "
                       "в панели iof-web или командой sudo iof bot."]
         return "\n".join(lines)
@@ -975,15 +1334,20 @@ class Bot:
         return out, None
 
     @staticmethod
-    def call(api, method, params):
+    def call(api, method, params, files=None):
         """Вызов Bot API, на 429 одна повторная попытка (если ждать не дольше 30 с)."""
         try:
-            return api.call(method, params)
+            return api.call(method, params, files=files)
         except ApiError as e:
             if e.code != 429 or not e.retry_after or e.retry_after > 30:
                 raise
             time.sleep(e.retry_after)
-            return api.call(method, params)
+            return api.call(method, params, files=files)
+
+    def photo(self, api, chat_id, png, caption):
+        """Фото (PNG) с подписью в HTML, не длиннее MAX_CAPTION."""
+        return self.call(api, "sendPhoto", {"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"},
+                         files={"photo": ("qr.png", png, "image/png")})
 
     def send(self, api, chat_id, text, markup=None):
         """Сообщение в HTML, длинное — частями по строкам, не длиннее MAX_TEXT; кнопки у последней части.

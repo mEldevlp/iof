@@ -13,7 +13,8 @@ WebSocket, включается отдельно, IOF_WEB_TERMINAL=1) и стр�
 быстрые и узлы не трогают, поэтому идут сразу, а не задачей. Скрипт проверки с ПК и его отчёт ходят
 по одноразовому билету вместо пароля панели. Telegram-бот (iof_bot.py рядом) работает потоком
 внутри панели; включает его iof bot on, без модуля панель работает как раньше. Данные страниц
-бот берёт у панели (BotViews): тот же разбор, без ссылок Hysteria2.
+бот берёт у панели (BotViews): тот же разбор, ссылки Hysteria2 — отдельным методом и только админу.
+Действия бота (BotActions) — задачи в той же очереди с теми же шагами, что у кнопок панели.
 
 Без зависимостей, нужен только python3. По умолчанию слушает 127.0.0.1:8088,
 снаружи заходить через SSH-туннель:  ssh -L 8088:127.0.0.1:8088 admin@сервер
@@ -356,6 +357,20 @@ def qr_svg(text, level):
     return None
 
 
+def qr_png(text, level="M"):
+    """PNG с QR-кодом через qrencode, для Telegram-бота: SVG он в фото не принимает. None, если
+    qrencode нет или текст не помещается. Текст (ссылка с паролем) идёт через stdin."""
+    exe = shutil.which("qrencode")
+    if not exe:
+        return None
+    try:
+        p = subprocess.run([exe, "-t", "PNG", "-l", level, "-m", "2", "-s", "8", "-o", "-"],
+                           input=text.encode("utf-8"), capture_output=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return p.stdout if p.returncode == 0 and p.stdout.startswith(b"\x89PNG") else None
+
+
 def read_awg_clients(base):
     clients = read_index(base / "awg" / "index.tsv")
     for c in clients:
@@ -530,8 +545,9 @@ class Jobs:
             return [dict(j, log=list(j["log"])) for j in reversed(self.items)]
 
     def start(self, title, steps, kind):
-        """steps: [(подпись для лога, argv, stdin bytes или None)], kind: по нему страница находит
-        свои задачи (node, migrate, hy2, service, audit, node:<имя>). None, если занято."""
+        """steps: [(подпись для лога, argv, stdin bytes или None[, коды выхода «выполнено с проблемами»])],
+        kind: по нему страница находит свои задачи (node, migrate, hy2, service, audit, node:<имя>,
+        bot — задачи Telegram-бота). None, если занято."""
         with self.lock:
             if self.running:
                 return None
@@ -551,7 +567,10 @@ class Jobs:
         env = dict(os.environ, LC_ALL="C.UTF-8", LANG="C.UTF-8")
         state = "ok"
         try:
-            for label, argv, stdin in steps:
+            for label, argv, stdin, *extra in steps:
+                # iof check выходит с кодом 1, если на узлах проблемы: это итог проверки, а не ошибка.
+                # Но с «Ошибка: …» в выводе (die, n_err) тот же код — настоящая ошибка
+                warn_rc, failed = (extra[0] if extra else ()), False
                 self.say(job, f"$ {label}")
                 p = subprocess.Popen(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                      stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL)
@@ -571,10 +590,13 @@ class Jobs:
                             self.say(job, line)
                         if line.startswith(WARN_LINES):
                             state = "warn"
+                        failed = failed or line.startswith("Ошибка")
                     rc = p.wait()
                 finally:
                     timer.cancel()
-                if rc != 0:
+                if rc != 0 and rc in warn_rc and not failed:
+                    state = "warn"
+                elif rc != 0:
                     self.say(job, f"Команда завершилась с кодом {rc}")
                     state = "error"
                     break
@@ -811,6 +833,32 @@ def audit_steps(iof, body, nodes, migrate):
     if name not in nodes or name == "all":
         raise ValueError(f"узла {name} нет в nodes.conf")
     return f"{AUDIT_BLOCKS[block]}: {name}", [step(iof, "-n", name, "audit", "run", block)]
+
+
+def check_steps(iof):
+    """Проверка всех узлов, как по cron (команда /check бота, в панели кнопки нет): состояние в state/,
+    итог в check.last, изменения в Telegram. Узлы не меняет, поэтому идёт и во время переноса.
+    Код 1 — на узлах проблемы: задача тогда warn, а не error."""
+    return "Проверка всех узлов (iof check)", [(*step(iof, "check"), (1,))]
+
+
+def action_steps(srv, kind, body):
+    """Кнопки панели и действия Telegram-бота -> (вид задачи, заголовок, шаги). kind: hy2 (группы ссылок),
+    node (действия с узлом), audit (проверка и действия «Безопасности»), check. body — тело запроса
+    страницы. ValueError с текстом для страницы и бота, в том числе при переносе."""
+    migrate = read_migrate(srv.base)
+    if kind == "hy2":
+        return ("hy2", *hy2_steps(srv.iof, body, read_index(srv.base / "hy2" / "index.tsv"), migrate))
+    if kind == "node":
+        name, title, steps = node_steps(srv.iof, body, read_conf(srv.base / "nodes.conf", 4),
+                                        read_relays(srv.base), srv.hy2_template, migrate)
+        return f"node:{name}", title, steps
+    if kind == "audit":
+        names = {r[0] for r in read_conf(srv.base / "nodes.conf", 4)}
+        return ("audit", *audit_steps(srv.iof, body, names, migrate))
+    if kind == "check":
+        return ("check", *check_steps(srv.iof))
+    raise ValueError("неизвестное действие")
 
 
 # Проверка доступности узлов с ПК (iof audit probe). Страница запускает мишени задачей Jobs и
@@ -1479,7 +1527,7 @@ def security_view(srv):
 class BotViews:
     """Данные страниц для Telegram-бота (iof_bot.Bot, параметр views): модуль бота не импортирует
     iof-web.py (дефис в имени), а читает всё через этот объект. Ссылки Hysteria2 (в них пароль)
-    сюда не попадают: у групп только число ссылок и узлы."""
+    отдаёт только hy2_links: у групп из hy2() только число ссылок и узлы."""
 
     def __init__(self, srv):
         self.srv = srv
@@ -1503,8 +1551,42 @@ class BotViews:
                      links=[{k: link[k] for k in ("node", "relay", "hop")} for link in g["links"]])
                 for g in read_hy2_groups(self.srv.base)]
 
+    def hy2_links(self, name):
+        """Ссылки группы с паролями — только для сообщений админу: {label, links: [{node, relay, url}]}
+        или None, если группы нет."""
+        g = next((g for g in read_hy2_groups(self.srv.base) if g["name"] == name), None)
+        if g is None:
+            return None
+        return {"label": g["label"], "links": [{k: link[k] for k in ("node", "relay", "url")} for link in g["links"]]}
+
+    @staticmethod
+    def qr_png(text):
+        return qr_png(text)
+
     def migrate(self):
         return read_migrate(self.srv.base)
+
+
+class BotActions:
+    """Действия Telegram-бота (параметр actions): шаги задач собирает action_steps, как для кнопок
+    панели, с теми же проверками, в том числе запретом при переносе. Задачу в Jobs бот ставит сам,
+    вид bot. Удаление узлов, перенос, iof update, блок-лист и смену портов бот не делает."""
+
+    KINDS = ("hy2", "node", "audit", "check")
+
+    def __init__(self, srv):
+        self.srv = srv
+
+    def plan(self, kind, body):
+        """(kind из KINDS, тело запроса как у страницы) -> (заголовок задачи, шаги). ValueError — почему нельзя."""
+        if kind not in self.KINDS:
+            raise ValueError("неизвестное действие")
+        if kind == "node" and body.get("action") != "restart_hy2":
+            raise ValueError("из бота с узлом можно только перезапустить Hysteria2")
+        if kind == "audit" and body.get("action") is not None:
+            raise ValueError("смена портов и блок-лист — только в панели")
+        _, title, steps = action_steps(self.srv, kind, body)
+        return title, steps
 
 
 def log(text):
@@ -1614,14 +1696,9 @@ class Handler(BaseHTTPRequestHandler):
             return "node", title, steps
         if path == "/api/migrate":
             return ("migrate", *migrate_steps(srv.iof, body, migrate))
-        if path == "/api/hy2":
-            return ("hy2", *hy2_steps(srv.iof, body, read_index(srv.base / "hy2" / "index.tsv"), migrate))
-        if path == "/api/node":
-            name, title, steps = node_steps(srv.iof, body, read_conf(srv.base / "nodes.conf", 4),
-                                            read_relays(srv.base), srv.hy2_template, migrate)
-            return f"node:{name}", title, steps
-        if path == "/api/security":
-            return ("audit", *audit_steps(srv.iof, body, self.node_names(), migrate))
+        kind = {"/api/hy2": "hy2", "/api/node": "node", "/api/security": "audit"}.get(path)
+        if kind:
+            return action_steps(srv, kind, body)
         return ("service", *service_steps(srv.iof, body))
 
     # Защита от DNS rebinding: чужой домен, указывающий на 127.0.0.1, не получит ответ панели
@@ -1998,7 +2075,7 @@ def main():
     else:
         try:
             srv.bot = iof_bot.Bot(srv.base, args.iof, jobs=srv.jobs, cache=srv.cache, views=BotViews(srv),
-                                  api=os.environ.get("IOF_TG_API"), log=log)
+                                  actions=BotActions(srv), api=os.environ.get("IOF_TG_API"), log=log)
             srv.bot.start()
         except Exception as e:
             srv.bot, srv.bot_error = None, f"бот не запустился: {type(e).__name__}: {e}"

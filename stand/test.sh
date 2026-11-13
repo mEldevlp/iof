@@ -6,7 +6,8 @@
 # портов), аудит безопасности видит изменения на узле (в том числе расхождение конфига Hysteria2
 # с шаблоном в блоке dpi), блок-лист отбрасывает пакеты с адресов из списка и не трогает защищённые,
 # действия запрещены во время переноса, Telegram-бот панели через поддельный Bot API принимает коды
-# приглашений и молчит чужим, мишени проверки с ПК отвечают только с токеном, готовый отчёт
+# приглашений, молчит чужим, показывает состояние, выполняет действия после подтверждения и выдаёт
+# ссылки Hysteria2 с QR, мишени проверки с ПК отвечают только с токеном, готовый отчёт
 # даёт ожидаемые оценки, мишени исчезают по сроку; панель отвечает, отбивает чужие
 # запросы, выполняет задачи, выдаёт скрипт для ПК по билету и открывает терминал на каждый узел
 # (stand.sh setup включает его в web.env). Созданные группы ссылок и ретранслятор удаляются,
@@ -23,6 +24,7 @@ PROBE_URL="${PROBE_URL:-http://connectivitycheck.gstatic.com/generate_204}"
 GROUP="CI проверка"
 PANEL_GROUP="CI панель"
 HOP_GROUP="CI смена портов"
+BOT_GROUP="CI бот"
 export MSYS_NO_PATHCONV=1
 
 PASSED=0
@@ -645,7 +647,15 @@ bot_restore() {
     done
     rm -rf /root/.iof-test-bot
     # Узел с длинным именем из проверки кнопок бота
-    sed -i "/^ci-bot-long-/d" /root/iof/nodes.conf' || true
+    sed -i "/^ci-bot-long-/d" /root/iof/nodes.conf
+    # qrencode, убранный для проверки ссылок без QR
+    for f in /usr/bin/qrencode.iof-test /usr/local/bin/qrencode.iof-test; do
+      if [[ -e $f ]]; then mv "$f" "${f%.iof-test}"; fi
+    done' || true
+  # Группа, которую создаёт бот
+  if on "$M" cut -f2 /root/iof/hy2/index.tsv 2>/dev/null | grep -qxF "$BOT_GROUP"; then
+    iofm hy2 del "$BOT_GROUP" >/dev/null 2>&1 || true
+  fi
   BOT_LEFT=0
 }
 
@@ -660,7 +670,11 @@ bot_restore() {
 # при переносе панель изменения не принимает. Команды просмотра (/status, /node, /audit, /service, /hy2):
 # кнопки узлов и «Обновить» (editMessageText того же сообщения), answerCallbackQuery, нажатия чужого и в
 # группе без ответа, узел с длинным именем (хэш в callback_data) и кнопка удалённого узла, в ответах нет
-# паролей Hysteria2. Токен не попадает в журналы, bot.json и iof bot show
+# паролей Hysteria2. Действия: отказ при выключенных действиях и обычному админу, кнопки только главному,
+# подтверждение и отмена, повторное, чужое, истёкшее нажатие и после перезапуска панели, занятая очередь,
+# ход задачи правками одного сообщения, перенос (check разрешён), перезапуск Hysteria2 и проверка узла,
+# группа $BOT_GROUP создаётся и удаляется из бота, её ссылки с QR и без qrencode, выдача ссылок выключена;
+# паролей Hysteria2 нет в журнале и логах задач. Токен не попадает в журналы, bot.json и iof bot show
 check_bot() {
   local out rc
   if on "$M" test -f /root/iof/migrate.conf; then echo "      идёт настоящий перенос, проверку бота пропускаю"; return 0; fi
@@ -670,8 +684,8 @@ check_bot() {
   fi
   bot_save
   GUARD_LEFT=1
-  out="$(on_in "$M" python3 - 2>&1 <<'PY'
-import glob, hashlib, json, os, re, subprocess, time, urllib.error, urllib.request
+  out="$(on_in "$M" python3 - "$BOT_GROUP" 2>&1 <<'PY'
+import glob, hashlib, json, os, re, shutil, subprocess, sys, time, urllib.error, urllib.request
 from html import escape
 
 FAKE = "http://127.0.0.1:8089"
@@ -1088,6 +1102,307 @@ def remove_long():
     os.replace("/root/iof/nodes.conf.t", "/root/iof/nodes.conf")
 
 
+FINAL = re.compile(r"^(✅|⚠️|❌) <b>")
+INDEX = "/root/iof/hy2/index.tsv"
+
+
+def ref(kind, name):
+    """callback_data кнопки узла или группы, как ref_button в боте."""
+    data = f"{kind}:{name}"
+    return data if len(data.encode()) <= 64 else f"{kind}#{hashlib.sha256(name.encode()).hexdigest()[:24]}"
+
+
+def keys(c):
+    return [b.get("callback_data", "") for b in buttons(c)] if c else []
+
+
+def ok_no(c):
+    """Кнопки «Подтвердить» и «Отмена» под сообщением c."""
+    k = keys(c)
+    return (next((x for x in k if x.startswith("ok:")), "ok:" + "0" * 16),
+            next((x for x in k if x.startswith("no:")), "no:" + "0" * 16))
+
+
+def tap(uid, mid, data, done=lambda g: True, timeout=60):
+    """Нажатие кнопки data под сообщением mid -> (вызовы бота после него, ответ на нажатие), как только
+    ответ на нажатие есть и done(вызовы) истинно."""
+    upd, before, qid = press(uid, mid, data)
+    got = wait_calls(before, lambda g: answered(g, qid) is not None and done(g), timeout)
+    return got, answered(got, qid)
+
+
+def toast(a):
+    return str(((a or {}).get("params") or {}).get("text", ""))
+
+
+def bot_jobs():
+    return [j for j in panel("/api/jobs")[1].get("jobs", []) if j.get("kind") == "bot"]
+
+
+def job_ids():
+    return {j["id"] for j in bot_jobs()}
+
+
+def final_edit(got, mid):
+    """Итог задачи: правка сообщения mid, которая начинается с ✅, ⚠️ или ❌."""
+    return next((c for c in reversed(got) if c["method"] == "editMessageText" and msg_id(c) == mid
+                 and FINAL.match(text_of(c))), None)
+
+
+def confirmation(got):
+    return last_with(got, "Подтверди действие", ("sendMessage",))
+
+
+def run_action(uid, c, timeout=300):
+    """«Подтвердить» под сообщением c и ход задачи до итога -> (вызовы, ответ на нажатие, итог, задача)."""
+    mid, known = msg_id(c) if c else 0, job_ids()
+    got, a = tap(uid, mid, ok_no(c)[0], lambda g: final_edit(g, mid) is not None, timeout)
+    return got, a, final_edit(got, mid), next((j for j in bot_jobs() if j["id"] not in known), None)
+
+
+def groups():
+    """index.tsv: {подпись: логин}."""
+    out = {}
+    for line in open(INDEX, encoding="utf-8"):
+        parts = line.rstrip("\n").split("\t")
+        if len(parts) >= 2:
+            out[parts[1]] = parts[0]
+    return out
+
+
+def links_of(login):
+    try:
+        return [line.strip() for line in open(f"/root/iof/hy2/{login}.txt", encoding="utf-8") if line.startswith("hy2://")]
+    except OSError:
+        return []
+
+
+def panel_up(timeout=30):
+    """Панель снова отвечает после systemctl restart."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            if panel("/api/bot")[0] == 200:
+                return True
+        except OSError:
+            pass
+        time.sleep(0.5)
+    return False
+
+
+def wait_job(job_id, timeout=300):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        job = next((j for j in panel("/api/jobs")[1].get("jobs", []) if j["id"] == job_id), None)
+        if job and job["state"] != "running":
+            return job
+        time.sleep(1)
+    return None
+
+
+def check_expired():
+    """Истёкший номер подтверждения: 5 минут в тесте не ждать, поэтому Bot из модуля панели в этом
+    процессе и номер, которому срок уже вышел."""
+    sys.path.insert(0, "/opt/iof-web")
+    import iof_bot
+    sent = []
+
+    class Stub:
+        token = "1:stub"
+
+        def call(self, method, params=None, timeout=20, files=None):
+            sent.append((method, params or {}))
+            return True
+    bot = iof_bot.Bot("/root/iof", "/usr/local/bin/iof")
+    num = "0123456789abcdef"
+    bot.pending[num] = {"uid": 5001, "msg": 7, "kind": "check", "body": {}, "title": "t", "expires": time.time() - 1}
+    bot.confirm(Stub(), "q1", {"id": 5001}, {"id": 5001, "role": "main"}, 5001, 7, "ok", num)
+    report(sent and sent[0][0] == "answerCallbackQuery" and "устарело" in sent[0][1].get("text", "") and num not in bot.pending,
+           "истёкший номер подтверждения (старше 5 минут): «устарело», номер удалён")
+
+
+def check_actions(label):
+    """Действия (этап 4): права (действия выключены, обычный админ), кнопки только главному, подтверждение
+    и отмена, ход задачи одним сообщением, повторное, чужое, устаревшее нажатие и после перезапуска панели,
+    занятая очередь, перенос, перезапуск Hysteria2 и проверка узла, создание и удаление группы, ссылки
+    с QR и без qrencode, выдача ссылок выключена. Админ 5001 обычный, действия выключены, ссылки включены."""
+    start = fake("/fake/state")["sent"]
+    node = node_names()[0]
+
+    got, c = ask(5001, "/check", "выключены")
+    report(c is not None and "Телеграм бот" in text_of(c) and not buttons(c), "действия выключены: /check — отказ «включить в панели»")
+    iof("set", "actions", "on")
+    got, c = ask(5001, "/check", "только главному")
+    report(c is not None and not buttons(c), "обычному админу /check — отказ «только главному админу»")
+    got, card = ask(5001, f"/node {node}", "Нагрузка")
+    report(keys(card) == [f"nr:{node}"], "обычному админу под карточкой узла кнопок действий нет")
+    got, c = ask(5001, "/hy2", "Группы ссылок")
+    report(keys(c) and all(k.startswith(("g:", "g#")) for k in keys(c)), "обычному админу в /hy2 только кнопки ссылок")
+    got, c = ask(5001, "/audit", "Защита от РКН")
+    report(c is not None and not buttons(c), "обычному админу под /audit кнопок нет")
+    got, a = tap(5001, msg_id(card), f"hr:{node}")
+    report("только главному" in toast(a) and not any(x["method"] == "sendMessage" for x in got),
+           "обычный админ нажал старую кнопку «Перезапустить»: отказ во всплывающем окне")
+
+    iof("admin", "set", "5001", "role", "main")
+    got, card = ask(5001, f"/node {node}", "Нагрузка")
+    report(keys(card) == [f"hr:{node}", f"as:{node}", f"ad:{node}", f"nr:{node}"],
+           f"главному под карточкой {node}: перезапуск Hysteria2, проверки, «Обновить» ({', '.join(keys(card))})")
+    logins = list(groups().values())
+    got, c = ask(5001, "/hy2", "Группы ссылок")
+    report(all(ref(k, g) in keys(c) for g in logins for k in ("g", "gd")) and keys(c)[-1:] == ["hf"],
+           "главному в /hy2: ссылки и удаление у каждой группы, «Пересобрать все»")
+    got, c = ask(5001, "/audit", "Защита от РКН")
+    report(keys(c) == ["au:server", "au:dpi"], "главному под /audit: проверить все узлы по блокам")
+    got, c = ask(5001, "/help", "<b>Команды</b>")
+    report(c is not None and all(f"/{k}" in text_of(c) for k in ("check", "hy2add", "hy2refresh")) and "Тебе они доступны" in text_of(c),
+           "/help: команды действий и «тебе они доступны»")
+    menu = [x.get("command") for x in fake("/fake/state")["commands"]]
+    report(all(k in menu for k in ("check", "hy2add", "hy2refresh")), "меню команд с действиями")
+
+    # «Отмена», потом «Подтвердить» того же сообщения
+    got, c = ask(5001, "/check", "Подтверди действие")
+    ok, no = ok_no(c)
+    mid, known = msg_id(c) if c else 0, job_ids()
+    report(c is not None and "iof check" in text_of(c) and re.fullmatch(r"ok:[0-9a-f]{16}", ok) is not None and no == "no:" + ok[3:],
+           "/check: «что будет сделано», кнопки «Подтвердить» и «Отмена»")
+    got, a = tap(5001, mid, no, lambda g: any(x["method"] == "editMessageText" for x in g))
+    edit = next((x for x in got if x["method"] == "editMessageText"), None)
+    report(toast(a) == "Отменено" and edit is not None and msg_id(edit) == mid and "Отменено" in text_of(edit) and not buttons(edit),
+           "«Отмена»: сообщение исправлено, кнопок больше нет")
+    got, a = tap(5001, mid, ok)
+    report("устарело" in toast(a) and job_ids() == known, "«Подтвердить» после «Отмены»: «устарело», задачи нет")
+
+    # Запуск, ход задачи в том же сообщении, итог; повторное нажатие
+    got, c = ask(5001, "/check", "Подтверди действие")
+    mid = msg_id(c) if c else 0
+    got, a, fin, job = run_action(5001, c)
+    edits = [x for x in got if x["method"] == "editMessageText"]
+    report(toast(a) == "Запускаю" and job is not None and job["title"] == "Проверка всех узлов (iof check)" and job["state"] in ("ok", "warn"),
+           f"«Подтвердить»: задача бота в очереди панели, вид bot ({job and job['state']})")
+    report(fin is not None and all(msg_id(x) == mid for x in edits) and any("Выполняется" in text_of(x) for x in edits)
+           and not any(x["method"] == "sendMessage" for x in got) and not buttons(fin),
+           f"ход задачи: правки того же сообщения ({len(edits)}), «выполняется», потом итог")
+    report(fin is not None and job is not None and "<pre>" in text_of(fin) and all(f"{n}: " in text_of(fin) for n in node_names())
+           and ("готово" in text_of(fin) if job["state"] == "ok" else "проблемы" in text_of(fin)),
+           "итог /check: состояние и последние строки лога по каждому узлу")
+    count = len(bot_jobs())
+    got, a = tap(5001, mid, ok_no(c)[0])
+    report("устарело" in toast(a) and len(bot_jobs()) == count, "повторное «Подтвердить»: «устарело», второй задачи нет")
+    check_expired()
+
+    # Чужой номер, занятая очередь, потом то же «Подтвердить» срабатывает
+    rc, out, err = iof("invite", "main")
+    say(5010, code_of(out))
+    got, c3 = ask(5001, "/hy2refresh", "Подтверди действие")
+    known = job_ids()
+    got, a = tap(5010, msg_id(c3) if c3 else 0, ok_no(c3)[0])
+    report(admin(5010) is not None and "устарело" in toast(a) and job_ids() == known, "номер подтверждения другого админа: «устарело»")
+    code, data = panel("/api/security", {"block": "dpi"})
+    got, a = tap(5001, msg_id(c3) if c3 else 0, ok_no(c3)[0])
+    report(code == 202 and "«Защита от РКН: все узлы»" in toast(a) and job_ids() == known,
+           f"очередь занята задачей панели: «сейчас идёт задача «Защита от РКН: все узлы»» ({code})")
+    wait_job(data.get("job", ""))
+    got, a, fin, job = run_action(5001, c3)
+    report(job is not None and job["title"] == "Пересборка всех групп Hysteria2" and job["state"] == "ok" and fin is not None and "готово" in text_of(fin),
+           "очередь освободилась: то же «Подтвердить» запускает hy2 refresh, итог «готово»")
+
+    # Кнопки действий под карточкой узла
+    got, _ = tap(5001, msg_id(card), f"hr:{node}", lambda g: confirmation(g) is not None)
+    conf = confirmation(got)
+    report(conf is not None and f"Перезапуск Hysteria2 на {node}" in text_of(conf) and "прервутся" in text_of(conf),
+           "«Перезапустить Hysteria2»: подтверждение с предупреждением, новым сообщением")
+    got, a, fin, job = run_action(5001, conf)
+    report(job is not None and job["title"] == f"Перезапуск Hysteria2 на {node}" and job["state"] == "ok" and fin is not None,
+           f"перезапуск Hysteria2 на {node} из бота: «готово»")
+    got, _ = tap(5001, msg_id(card), f"as:{node}", lambda g: confirmation(g) is not None)
+    conf = confirmation(got)
+    got, a, fin, job = run_action(5001, conf)
+    report(job is not None and job["title"] == f"Аудит сервера: {node}" and job["state"] == "ok" and fin is not None,
+           f"проверка узла {node} (аудит сервера) из бота")
+
+    # После перезапуска панели номера подтверждений забыты
+    got, c4 = ask(5001, "/hy2refresh", "Подтверди действие")
+    subprocess.run(["systemctl", "restart", "iof-web"], timeout=60)
+    restarted = panel_up() and thread_state("running", 30) and polling()
+    known = job_ids()
+    got, a = tap(5001, msg_id(c4) if c4 else 0, ok_no(c4)[0])
+    report(restarted and "устарело" in toast(a) and job_ids() == known, "«Подтвердить» после перезапуска панели: «устарело»")
+
+    # Перенос отсюда: меняющее действие отказано сразу, check разрешён
+    got, c5 = ask(5001, "/hy2refresh", "Подтверди действие")
+    with open(MIGRATE, "w") as f:
+        f.write(f"role=source\nid=iof-test\npeer=root@192.0.2.1\nstarted={int(time.time())}\n")
+    try:
+        got, c = ask(5001, f"/hy2add {label}", "перенос")
+        report(c is not None and "идёт перенос управления" in text_of(c) and not buttons(c),
+               "при переносе /hy2add — отказ «идёт перенос управления», без подтверждения")
+        known = job_ids()
+        got, a = tap(5001, msg_id(c5) if c5 else 0, ok_no(c5)[0])
+        report("перенос" in toast(a) and job_ids() == known, "при переносе «Подтвердить», полученное до него: отказ")
+        got, c = ask(5001, "/check", "Подтверди действие")
+        got, a, fin, job = run_action(5001, c)
+        report(job is not None and job["title"] == "Проверка всех узлов (iof check)" and fin is not None,
+               "при переносе /check разрешён, как iof check")
+    finally:
+        os.remove(MIGRATE)
+
+    # Группа из бота: создание, ссылки с QR и без qrencode, выдача ссылок выключена, удаление
+    got, c = ask(5001, f"/hy2add {label}", "Подтверди действие")
+    report(c is not None and f"«{label}»" in text_of(c) and "iof hy2 add" in text_of(c), f"/hy2add {label}: подтверждение с командой")
+    got, a, fin, job = run_action(5001, c)
+    login = groups().get(label, "")
+    links = links_of(login)
+    btn = next((k for k in keys(fin) if k.startswith(("g:", "g#"))), "")
+    report(job is not None and job["title"] == f"Создание группы «{label}»" and job["state"] == "ok" and login and links,
+           f"группа «{label}» создана из бота: есть в index.tsv, ссылок {len(links)}")
+    report(btn == ref("g", login), f"под итогом — кнопка ссылок группы ({btn})")
+    secrets = {p for link in links for p in (link[6:link.rindex("@")], link[6:link.rindex("@")].split(":", 1)[-1]) if len(p) >= 8}
+    mid = msg_id(fin) if fin else 0
+    got, a = tap(5001, mid, btn, lambda g: sum(x["method"] == "sendPhoto" for x in g) >= len(links))
+    photos = [x for x in got if x["method"] == "sendPhoto"]
+    caps = [str(x["params"].get("caption", "")) for x in photos]
+    report(len(photos) == len(links) and all((x["params"].get("photo") or {}).get("filename") == "qr.png"
+                                              and (x["params"].get("photo") or {}).get("size", 0) > 100 for x in photos)
+           and all(any(escape(link, quote=False) in cap for cap in caps) for link in links) and all("<pre>hy2://" in cap for cap in caps),
+           f"ссылки группы: {len(photos)} фото QR (PNG), в подписи узел и ссылка в <pre>")
+    qr = shutil.which("qrencode")
+    if qr:
+        os.rename(qr, qr + ".iof-test")
+    try:
+        got, a = tap(5001, mid, btn, lambda g: sum(x["method"] == "sendMessage" for x in g) >= len(links))
+    finally:
+        if qr:
+            os.rename(qr + ".iof-test", qr)
+    texts = [text_of(x) for x in got if x["method"] == "sendMessage"]
+    report(qr and len(texts) == len(links) and not any(x["method"] == "sendPhoto" for x in got)
+           and all(any(escape(link, quote=False) in t for t in texts) for link in links),
+           "без qrencode: ссылки только текстом")
+    iof("set", "links", "off")
+    got, c = ask(5001, "/hy2", "Группы ссылок")
+    report(c is not None and "выключена" in text_of(c) and not any(k.startswith(("g:", "g#")) for k in keys(c)) and ref("gd", login) in keys(c),
+           "выдача ссылок выключена: в /hy2 нет кнопок ссылок, «выключена в панели»")
+    got, a = tap(5001, mid, btn)
+    report("выключена" in toast(a) and not any(x["method"] in ("sendPhoto", "sendMessage") for x in got),
+           "выдача ссылок выключена: старая кнопка ссылок — отказ")
+    iof("set", "links", "on")
+    got, _ = tap(5001, msg_id(c) if c else 0, ref("gd", login), lambda g: confirmation(g) is not None)
+    conf = confirmation(got)
+    report(conf is not None and f"Удаление группы «{label}»" in text_of(conf) and "перестанут работать" in text_of(conf),
+           "🗑 у группы: подтверждение удаления с предупреждением")
+    got, a, fin2, job = run_action(5001, conf)
+    report(job is not None and job["title"] == f"Удаление группы «{label}»" and job["state"] == "ok" and label not in groups(),
+           f"группа «{label}» удалена из бота: в index.tsv её нет")
+    got, a = tap(5001, mid, btn)
+    report("Группы больше нет" in toast(a), "кнопка ссылок удалённой группы: «группы больше нет»")
+
+    answers = json.dumps(calls(start), ensure_ascii=False)
+    logs = journal() + json.dumps(panel("/api/jobs")[1], ensure_ascii=False)
+    report(secrets and all(s in answers for s in secrets) and not [s for s in secrets | hy2_secrets() if s in logs],
+           f"паролей Hysteria2 ({len(secrets)}) нет в журнале iof-web и логах задач, они только в ответах админу")
+    iof("set", "actions", "off")
+
+
 def run():
     for f in (BOT_JSON, BOT_TOKEN):
         if os.path.exists(f):
@@ -1109,7 +1424,8 @@ def run():
     rc, out, err = iof("on")
     report(rc == 0 and polling(), "iof bot on: бот опрашивает Bot API")
     menu = [c.get("command") for c in fake("/fake/state")["commands"]]
-    report(menu == ["status", "node", "audit", "service", "hy2", "start", "help"], f"меню команд: {', '.join(menu)}")
+    report(menu == ["status", "node", "audit", "service", "hy2", "check", "hy2add", "hy2refresh", "start", "help"],
+           f"меню команд: {', '.join(menu)}")
 
     r = say(5001, "/start")
     report(r == [], "чужому на /start бот не отвечает")
@@ -1190,6 +1506,7 @@ def run():
     report(rc != 0 and rc2 == 0 and cfg()["quiet"] is None, "тихие часы: неверное время — отказ, off — выключены")
     check_page()
     check_views()
+    check_actions(sys.argv[1])
 
     # Второй опрос с тем же токеном: поддельный API, как Telegram, обрывает ждущий опрос бота ответом 409
     polling()
