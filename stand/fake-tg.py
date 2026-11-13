@@ -7,12 +7,16 @@ sendMessage, sendPhoto, editMessageText, answerCallbackQuery, setMyCommands, get
 deleteWebhook. Параметры — JSON, форма или multipart, как у Telegram. Любой токен вида <номер>:<секрет>
 верный, кроме номера 0: на него 401, как на отозванный токен. Ожидание getUpdates не дольше --max-wait
 секунд, чтобы тесты не ждали по 50 с, пока бот заметит, что его выключили.
+Как Telegram, отвечает 400: callback_data кнопки пустой или длиннее 64 байт (BUTTON_DATA_INVALID),
+больше 100 кнопок, editMessageText чужого или неизвестного сообщения (message to edit not found)
+и с теми же текстом и кнопками (message is not modified).
 
 Служебный вход для тестов, JSON:
   POST /fake/message  {from_id, text, username?, first_name?, chat_type?, chat_id?, date?} → {update_id}
                       username: null — без username; chat_type: private (по умолчанию), group, supergroup
   POST /fake/update   готовый апдейт без update_id → {update_id}
-  GET  /fake/sent?after=N   вызовы методов бота с номером больше N: [{n, method, bot, params}]
+  GET  /fake/sent?after=N   вызовы методов бота с номером больше N: [{n, method, bot, params, message_id}]
+                      (апдейт с callback_query для нажатия кнопки под сообщением message_id — через /fake/update)
   GET  /fake/state    {offset, polls, waiting, queued, commands, sent}: offset — с какого номера бот
                       подтвердил апдейты, polls — сколько было getUpdates, waiting — сколько ждут сейчас
   POST /fake/reset    очистить очередь апдейтов и журнал вызовов
@@ -50,6 +54,7 @@ class Fake:
         self.gen = 0          # номер последнего getUpdates: по нему ждущий опрос узнаёт, что его оборвали
         self.commands = []
         self.message_id = 1
+        self.messages = {}    # (бот, чат, номер сообщения) -> (текст, кнопки): для editMessageText
 
     def add(self, update):
         with self.cond:
@@ -85,11 +90,13 @@ class Fake:
         return self.add({"message": msg})
 
     def record(self, bot, method, params):
+        """Вызов метода в журнал. message_id — номер нового сообщения (у sendMessage, sendPhoto): по нему
+        тест собирает нажатие кнопки под этим сообщением."""
         with self.cond:
             n = len(self.sent) + 1
-            self.sent.append({"n": n, "method": method, "bot": bot, "params": params})
             mid = self.message_id
             self.message_id += 1
+            self.sent.append({"n": n, "method": method, "bot": bot, "params": params, "message_id": mid})
         return mid
 
     def get_updates(self, params):
@@ -130,6 +137,30 @@ class Fake:
     def reset(self):
         with self.cond:
             self.updates, self.sent = [], []
+
+
+def markup_error(markup):
+    """Ошибка в inline-кнопках, как её назвал бы Telegram, или None."""
+    if markup in (None, ""):
+        return None
+    if isinstance(markup, str):
+        try:
+            markup = json.loads(markup)
+        except ValueError:
+            return "Bad Request: can't parse reply keyboard markup JSON object"
+    rows = markup.get("inline_keyboard") if isinstance(markup, dict) else None
+    if not isinstance(rows, list) or not all(isinstance(r, list) for r in rows):
+        return "Bad Request: can't parse inline keyboard button"
+    buttons = [b for r in rows for b in r]
+    if len(buttons) > 100:
+        return "Bad Request: reply markup is too long"
+    for b in buttons:
+        if not isinstance(b, dict) or not str(b.get("text", "")).strip():
+            return "Bad Request: inline keyboard button text is empty"
+        data = b.get("callback_data")
+        if data is not None and not 1 <= len(str(data).encode("utf-8")) <= 64:
+            return "Bad Request: BUTTON_DATA_INVALID"
+    return None
 
 
 def form_params(ctype, body):
@@ -220,7 +251,24 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reply(400, {"ok": False, "error_code": 400, "description": "Bad Request: message text is empty"})
             if len(str(params.get("text", ""))) > 4096:
                 return self.reply(400, {"ok": False, "error_code": 400, "description": "Bad Request: message is too long"})
+            error = markup_error(params.get("reply_markup"))
+            if error:
+                return self.reply(400, {"ok": False, "error_code": 400, "description": error})
+            content = (str(params.get("text", "")), json.dumps(params.get("reply_markup"), sort_keys=True))
+            if method == "editMessageText":
+                key = (bot, str(chat_id), str(params.get("message_id")))
+                with fake.cond:
+                    old = fake.messages.get(key)
+                if old is None:
+                    return self.reply(400, {"ok": False, "error_code": 400, "description": "Bad Request: message to edit not found"})
+                if old == content:
+                    return self.reply(400, {"ok": False, "error_code": 400, "description": (
+                        "Bad Request: message is not modified: specified new message content and reply markup "
+                        "are exactly the same as a current content and reply markup of the message")})
             mid = fake.record(bot, method, params)
+            if method != "sendPhoto":
+                with fake.cond:
+                    fake.messages[(bot, str(chat_id), str(params.get("message_id") or mid))] = content
             msg = {"message_id": int(params.get("message_id") or mid), "from": me, "date": int(time.time()),
                    "chat": {"id": int(chat_id) if re.fullmatch(r"-?[0-9]+", str(chat_id)) else chat_id, "type": "private"}}
             if method == "sendPhoto":

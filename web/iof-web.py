@@ -12,7 +12,8 @@ iof audit run, она узлы только читает; проверка с П
 WebSocket, включается отдельно, IOF_WEB_TERMINAL=1) и страница «Телеграм бот»: её команды iof bot
 быстрые и узлы не трогают, поэтому идут сразу, а не задачей. Скрипт проверки с ПК и его отчёт ходят
 по одноразовому билету вместо пароля панели. Telegram-бот (iof_bot.py рядом) работает потоком
-внутри панели; включает его iof bot on, без модуля панель работает как раньше.
+внутри панели; включает его iof bot on, без модуля панель работает как раньше. Данные страниц
+бот берёт у панели (BotViews): тот же разбор, без ссылок Hysteria2.
 
 Без зависимостей, нужен только python3. По умолчанию слушает 127.0.0.1:8088,
 снаружи заходить через SSH-туннель:  ssh -L 8088:127.0.0.1:8088 admin@сервер
@@ -190,13 +191,25 @@ class StatusCache:
 
     def get(self, force=False):
         with self.lock:
-            age = time.time() - self.data["status_at"] if self.data else None
-            # Принудительное обновление не чаще раза в 5 секунд
-            fresh = age is not None and (age < 5 or (not force and age < self.ttl))
-            if fresh:
+            if self.usable(force):
                 return dict(self.data, cached=True)
             self.data = self.probe()
             return dict(self.data, cached=False)
+
+    def usable(self, force):
+        age = time.time() - self.data["status_at"] if self.data else None
+        # Принудительное обновление не чаще раза в 5 секунд
+        return age is not None and (age < 5 or (not force and age < self.ttl))
+
+    def fresh(self, force=False):
+        """Ответит ли get(force) сразу, без опроса узлов. Не ждёт: если опрос уже идёт, ответ — нет.
+        По нему бот решает, писать ли сначала «опрашиваю узлы…»."""
+        if not self.lock.acquire(blocking=False):
+            return False
+        try:
+            return self.usable(force)
+        finally:
+            self.lock.release()
 
     def invalidate(self):
         with self.lock:
@@ -1392,6 +1405,108 @@ class Terminals:
                 pass
 
 
+# Данные страниц. Их же показывает Telegram-бот (BotViews): один разбор на панель и бота
+
+def node_view(srv, name, force):
+    """Страница узла: его состояние из общего опроса, строка nodes.conf, ретрансляторы с ним
+    и есть ли в группах Hysteria2 ссылка на него. Ссылки (в них пароль) не отдаются."""
+    base = srv.base
+    data = srv.cache.get(force)
+    nodes = data.pop("nodes")
+    conf = next(({"name": n, "addr": a, "ssh": s or "local", "title": t or n}
+                 for n, a, s, t in read_conf(base / "nodes.conf", 4) if n == name), None)
+    title = conf["title"] if conf else name
+    groups = [{"name": g["name"], "label": g["label"], "created": g["created"],
+               "has_link": any(not link["relay"] and link["node"] == title for link in g["links"])}
+              for g in read_hy2_groups(base)]
+    data.update({
+        "generated_at": time.time(),
+        "name": name,
+        "conf": conf,
+        "node": next((n for n in nodes if n["name"] == name), None),
+        "relays": [r for r in read_relays(base) if name in (r["node"], r["via"])],
+        "hy2_groups": groups,
+        "hy2_template": srv.hy2_template.is_file(),
+        "busy": srv.jobs.busy(),
+        "terminal": srv.terms.enabled,
+        "migrate": read_migrate(base),
+    })
+    return data
+
+
+def service_view(srv, fetch):
+    """Страница «Сервис»: версия, клон, Telegram и cron от iof, итог iof check и логи ночного
+    обслуживания из файлов. fetch: ещё и git fetch, чтобы узнать, есть ли обновления."""
+    base = srv.base
+    info, error = iof_api(srv.iof, ["api", "service"], 20)
+    data = {
+        "version": info.get("version", ""),
+        "src": info.get("src", ""),
+        "src_version": info.get("src_version", ""),
+        "tg": info.get("tg") == "yes",
+        "cron": info.get("cron", []),
+        "error": error,
+        "check": read_check(base),
+        "nightly": read_nightly_run(NIGHTLY_RUN_LOG),
+        "nightly_local": read_nightly_local(NIGHTLY_LOG),
+        "update_log": read_update_log(UPDATE_LOG),
+        "busy": srv.jobs.busy(),
+        "migrate": read_migrate(base),
+    }
+    if fetch:
+        upd, err = iof_api(srv.iof, ["api", "updates"], 60)
+        data["updates"] = {
+            "error": err,
+            "branch": upd.get("branch", ""),
+            "commits": [dict(zip(("hash", "date", "subject"), c.split("\t", 2))) for c in upd.get("commit", [])],
+        }
+    return data
+
+
+def security_view(srv):
+    """Страница «Безопасность»: последние проверки iof audit по блокам и узлам, справочник проверок,
+    история запусков. Узлы не опрашиваются: проверку запускает POST /api/security."""
+    data, error = iof_json(srv.iof, ["api", "audit"], 20)
+    data.update({
+        "error": error,
+        "busy": srv.jobs.busy(),
+        "migrate": read_migrate(srv.base),
+        "probe_state": srv.probes.state(),
+    })
+    return data
+
+
+class BotViews:
+    """Данные страниц для Telegram-бота (iof_bot.Bot, параметр views): модуль бота не импортирует
+    iof-web.py (дефис в имени), а читает всё через этот объект. Ссылки Hysteria2 (в них пароль)
+    сюда не попадают: у групп только число ссылок и узлы."""
+
+    def __init__(self, srv):
+        self.srv = srv
+
+    def nodes(self):
+        """Узлы из nodes.conf без опроса: [{name, addr, title}]."""
+        return [{"name": n, "addr": a, "title": t or n} for n, a, _, t in read_conf(self.srv.base / "nodes.conf", 4)]
+
+    def node(self, name, force=False):
+        return node_view(self.srv, name, force)
+
+    def service(self, fetch=False):
+        return service_view(self.srv, fetch)
+
+    def audit(self):
+        return security_view(self.srv)
+
+    def hy2(self):
+        """Группы ссылок: {name, label, created, hop, links: [{node, relay, hop}]}, без самих ссылок."""
+        return [dict({k: g[k] for k in ("name", "label", "created", "hop")},
+                     links=[{k: link[k] for k in ("node", "relay", "hop")} for link in g["links"]])
+                for g in read_hy2_groups(self.srv.base)]
+
+    def migrate(self):
+        return read_migrate(self.srv.base)
+
+
 def log(text):
     sys.stderr.write(text + "\n")
     sys.stderr.flush()
@@ -1615,31 +1730,8 @@ class Handler(BaseHTTPRequestHandler):
         })
         self.send_json(data)
 
-    # Страница узла: его состояние из общего опроса, строка nodes.conf, ретрансляторы с ним
-    # и есть ли в группах Hysteria2 ссылка на него. Ссылки (в них пароль) не отдаются
     def node_info(self, name, force):
-        base = self.server.base
-        data = self.server.cache.get(force)
-        nodes = data.pop("nodes")
-        conf = next(({"name": n, "addr": a, "ssh": s or "local", "title": t or n}
-                     for n, a, s, t in read_conf(base / "nodes.conf", 4) if n == name), None)
-        title = conf["title"] if conf else name
-        groups = [{"name": g["name"], "label": g["label"], "created": g["created"],
-                   "has_link": any(not link["relay"] and link["node"] == title for link in g["links"])}
-                  for g in read_hy2_groups(base)]
-        data.update({
-            "generated_at": time.time(),
-            "name": name,
-            "conf": conf,
-            "node": next((n for n in nodes if n["name"] == name), None),
-            "relays": [r for r in read_relays(base) if name in (r["node"], r["via"])],
-            "hy2_groups": groups,
-            "hy2_template": self.server.hy2_template.is_file(),
-            "busy": self.server.jobs.busy(),
-            "terminal": self.server.terms.enabled,
-            "migrate": read_migrate(base),
-        })
-        self.send_json(data)
+        self.send_json(node_view(self.server, name, force))
 
     # POST /api/term {name, cols, rows}: одноразовый билет на WebSocket терминала узла
     def term_ticket(self, body):
@@ -1682,45 +1774,11 @@ class Handler(BaseHTTPRequestHandler):
         self.log_request(101)
         self.server.terms.run(session, WebSocket(self.rfile, self.wfile), self.connection)
 
-    # Страница «Сервис»: версия, клон, Telegram и cron от iof, итог iof check и логи ночного
-    # обслуживания из файлов. fetch: ещё и git fetch, чтобы узнать, есть ли обновления
     def service_info(self, fetch):
-        base = self.server.base
-        info, error = iof_api(self.server.iof, ["api", "service"], 20)
-        data = {
-            "version": info.get("version", ""),
-            "src": info.get("src", ""),
-            "src_version": info.get("src_version", ""),
-            "tg": info.get("tg") == "yes",
-            "cron": info.get("cron", []),
-            "error": error,
-            "check": read_check(base),
-            "nightly": read_nightly_run(NIGHTLY_RUN_LOG),
-            "nightly_local": read_nightly_local(NIGHTLY_LOG),
-            "update_log": read_update_log(UPDATE_LOG),
-            "busy": self.server.jobs.busy(),
-            "migrate": read_migrate(base),
-        }
-        if fetch:
-            upd, err = iof_api(self.server.iof, ["api", "updates"], 60)
-            data["updates"] = {
-                "error": err,
-                "branch": upd.get("branch", ""),
-                "commits": [dict(zip(("hash", "date", "subject"), c.split("\t", 2))) for c in upd.get("commit", [])],
-            }
-        self.send_json(data)
+        self.send_json(service_view(self.server, fetch))
 
-    # Страница «Безопасность»: последние проверки iof audit по блокам и узлам, справочник проверок,
-    # история запусков. Узлы не опрашиваются: проверку запускает POST /api/security
     def security_info(self):
-        data, error = iof_json(self.server.iof, ["api", "audit"], 20)
-        data.update({
-            "error": error,
-            "busy": self.server.jobs.busy(),
-            "migrate": read_migrate(self.server.base),
-            "probe_state": self.server.probes.state(),
-        })
-        self.send_json(data)
+        self.send_json(security_view(self.server))
 
     # Страница «Телеграм бот»: bot.json без хэшей приглашений (только начало), есть ли токен (сам токен
     # не отдаётся) и состояние потока бота. thread = None — модуль бота не загрузился, причина в thread_error
@@ -1939,7 +1997,7 @@ def main():
         log(f"бот: {srv.bot_error}, панель работает без бота")
     else:
         try:
-            srv.bot = iof_bot.Bot(srv.base, args.iof, jobs=srv.jobs, cache=srv.cache,
+            srv.bot = iof_bot.Bot(srv.base, args.iof, jobs=srv.jobs, cache=srv.cache, views=BotViews(srv),
                                   api=os.environ.get("IOF_TG_API"), log=log)
             srv.bot.start()
         except Exception as e:

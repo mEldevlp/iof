@@ -643,7 +643,9 @@ bot_restore() {
       rm -f /root/iof/$f
       if [[ -f /root/.iof-test-bot/$f ]]; then cp -p /root/.iof-test-bot/$f /root/iof/$f; fi
     done
-    rm -rf /root/.iof-test-bot' || true
+    rm -rf /root/.iof-test-bot
+    # Узел с длинным именем из проверки кнопок бота
+    sed -i "/^ci-bot-long-/d" /root/iof/nodes.conf' || true
   BOT_LEFT=0
 }
 
@@ -655,7 +657,10 @@ bot_restore() {
 # пишется в журнал, и бот продолжает работать; при переносе изменения и коды отказаны, на сервере,
 # принимающем управление, бот не опрашивает API; выключение и удаление токена. Страница «Телеграм бот»:
 # /api/bot без токена и хэшей, настройки, приглашение и отзыв, админы, токен и выключатель через панель,
-# при переносе панель изменения не принимает. Токен не попадает в журналы, bot.json и iof bot show
+# при переносе панель изменения не принимает. Команды просмотра (/status, /node, /audit, /service, /hy2):
+# кнопки узлов и «Обновить» (editMessageText того же сообщения), answerCallbackQuery, нажатия чужого и в
+# группе без ответа, узел с длинным именем (хэш в callback_data) и кнопка удалённого узла, в ответах нет
+# паролей Hysteria2. Токен не попадает в журналы, bot.json и iof bot show
 check_bot() {
   local out rc
   if on "$M" test -f /root/iof/migrate.conf; then echo "      идёт настоящий перенос, проверку бота пропускаю"; return 0; fi
@@ -666,7 +671,8 @@ check_bot() {
   bot_save
   GUARD_LEFT=1
   out="$(on_in "$M" python3 - 2>&1 <<'PY'
-import hashlib, json, os, re, subprocess, time, urllib.error, urllib.request
+import glob, hashlib, json, os, re, subprocess, time, urllib.error, urllib.request
+from html import escape
 
 FAKE = "http://127.0.0.1:8089"
 PANEL = "http://127.0.0.1:8088"
@@ -862,6 +868,226 @@ def check_page():
     report(code == 200 and polling() and thread_state("running"), "панель: бот включён и снова опрашивает API")
 
 
+def calls(before):
+    return fake(f"/fake/sent?after={before}")
+
+
+def wait_calls(before, done, timeout=90):
+    """Вызовы бота после before, как только done(вызовы) истинно (или по таймауту). Команды просмотра
+    бот выполняет в отдельном потоке, поэтому ответ приходит позже подтверждения апдейта."""
+    deadline = time.time() + timeout
+    while True:
+        got = calls(before)
+        if done(got) or time.time() > deadline:
+            return got
+        time.sleep(0.3)
+
+
+def text_of(c):
+    return str(c["params"].get("text", ""))
+
+
+def buttons(c):
+    markup = c["params"].get("reply_markup") or {}
+    return [b for row in markup.get("inline_keyboard", []) for b in row]
+
+
+def msg_id(c):
+    """Номер сообщения, которое показывает вызов: у правки — исправленное, у отправки — новое."""
+    return int(c["params"]["message_id"]) if c["method"] == "editMessageText" else c["message_id"]
+
+
+def last_with(got, needle, method=("sendMessage", "editMessageText")):
+    return next((c for c in reversed(got) if c["method"] in method and needle in text_of(c)), None)
+
+
+def ask(uid, text, needle, timeout=90, absent=None):
+    """Команда от uid, ждёт ответ (новый или исправленный), где есть needle и нет absent -> (все вызовы, ответ)."""
+    before = fake("/fake/state")["sent"]
+    fake("/fake/message", {"from_id": uid, "text": text})
+
+    def done(got):
+        c = last_with(got, needle)
+        return c is not None and not (absent and absent in text_of(c))
+    got = wait_calls(before, done, timeout)
+    return got, last_with(got, needle)
+
+
+def press(uid, mid, data, chat_type="private"):
+    """Нажатие кнопки data под сообщением бота mid -> (номер апдейта, номер последнего вызова, id нажатия)."""
+    before = fake("/fake/state")["sent"]
+    user = {"id": uid, "is_bot": False, "first_name": f"User{uid}", "username": f"user{uid}"}
+    chat = ({"id": uid, "type": "private", "first_name": user["first_name"]} if chat_type == "private"
+            else {"id": -1000000000000 - uid, "type": chat_type, "title": "Stand group"})
+    qid = f"{uid}{time.time_ns()}"
+    q = {"id": qid, "from": user, "chat_instance": "1", "data": data,
+         "message": {"message_id": mid, "chat": chat, "date": int(time.time()), "text": "…",
+                     "from": {"id": 777000, "is_bot": True, "first_name": "iof stand", "username": "iof_stand_bot"}}}
+    upd = fake("/fake/update", {"callback_query": q})["update_id"]
+    return upd, before, qid
+
+
+def answered(got, qid):
+    return next((c for c in got if c["method"] == "answerCallbackQuery" and c["params"].get("callback_query_id") == qid), None)
+
+
+def node_names():
+    names = []
+    for line in open("/root/iof/nodes.conf", encoding="utf-8"):
+        name = line.split("|")[0].strip()
+        if name and not name.startswith("#"):
+            names.append(name)
+    return names
+
+
+def hy2_secrets():
+    """Пароли из ссылок групп Hysteria2 (часть после «логин:» или весь пароль). Короткие не берутся:
+    логин бывает и в подписи группы."""
+    out = set()
+    for path in glob.glob("/root/iof/hy2/*.txt"):
+        for line in open(path, encoding="utf-8"):
+            if line.startswith("hy2://") and "@" in line:
+                auth = line[6:line.rindex("@")]
+                out |= {p for p in (auth, auth.split(":", 1)[-1]) if len(p) >= 8}
+    return out
+
+
+LONG = "ci-bot-long-" + "x" * 60
+
+
+def check_views():
+    """Команды просмотра (этап 3): /status с кнопками узлов и «Обновить», карточка узла и её «Обновить»
+    (editMessageText), /node с неизвестным узлом, /audit, /service, /hy2, /help; нажатия чужого и в группе
+    без ответа; узел с длинным именем (callback_data с хэшем) и устаревшая кнопка. Админ 5001, роль обычный."""
+    start = fake("/fake/state")["sent"]
+    names = node_names()
+    first_node = names[0]
+
+    # Первый /status: кэш опроса узлов к этому времени устарел (больше IOF_WEB_TTL без опроса), поэтому
+    # сначала «опрашиваю узлы…», потом то же сообщение исправлено
+    got, st = ask(5001, "/status", "<b>Узлы:")
+    keys = [b.get("callback_data", "") for b in buttons(st)] if st else []
+    report(st is not None and f"Узлы: {len(names)}" in text_of(st) and "в порядке" in text_of(st)
+           and all(f"n:{n}" in keys for n in names) and keys[-1:] == ["st"],
+           f"/status: узлов {len(names)}, кнопка на каждый узел и «Обновить»")
+    wait = next((c for c in got if c["method"] == "sendMessage" and "Опрашиваю узлы" in text_of(c)), None)
+    report(wait is not None and st is not None and st["method"] == "editMessageText" and msg_id(st) == wait["message_id"],
+           "/status: пока идёт опрос — «Опрашиваю узлы…», потом то же сообщение исправлено")
+    status_mid = msg_id(st) if st else 0
+
+    upd, before, qid = press(5001, status_mid, f"n:{first_node}")
+    got = wait_calls(before, lambda g: last_with(g, "Нагрузка") is not None)
+    card = last_with(got, "Нагрузка")
+    report(answered(got, qid) is not None, "кнопка узла: answerCallbackQuery")
+    report(card is not None and card["method"] == "sendMessage" and f"<b>{first_node}</b>" in text_of(card)
+           and all(s in text_of(card) for s in ("Адрес для клиентов", "ЦП", "Память", "Диск", "Hysteria2", "AmneziaWG"))
+           and [b.get("callback_data") for b in buttons(card)] == [f"nr:{first_node}"],
+           f"кнопка узла: карточка {first_node} новым сообщением — адрес, нагрузка, службы, кнопка «Обновить»")
+    card_mid = msg_id(card) if card else 0
+
+    # Принудительный опрос не чаще раза в 5 с: после паузы данные новые, и текст карточки другой
+    time.sleep(6)
+    upd, before, qid = press(5001, card_mid, f"nr:{first_node}")
+    got = wait_calls(before, lambda g: any(c["method"] == "editMessageText" for c in g))
+    edit = next((c for c in got if c["method"] == "editMessageText"), None)
+    report(answered(got, qid) is not None and edit is not None and msg_id(edit) == card_mid
+           and "Нагрузка" in text_of(edit) and not any(c["method"] == "sendMessage" for c in got),
+           "«Обновить» у карточки узла: то же сообщение исправлено (editMessageText), нового нет")
+    upd, before, qid = press(5001, card_mid, f"nr:{first_node}")
+    got = wait_calls(before, lambda g: answered(g, qid) is not None, 20)
+    time.sleep(3)
+    got = calls(before)
+    report(answered(got, qid) is not None and not any(c["method"] in ("sendMessage", "editMessageText") for c in got),
+           "«Обновить» сразу ещё раз: данные те же, бот не шлёт ни нового, ни ошибки")
+    time.sleep(6)
+    upd, before, qid = press(5001, status_mid, "st")
+    got = wait_calls(before, lambda g: last_with(g, "<b>Узлы:", ("editMessageText",)) is not None)
+    edit = last_with(got, "<b>Узлы:", ("editMessageText",))
+    report(answered(got, qid) is not None and edit is not None and msg_id(edit) == status_mid and len(buttons(edit)) == len(names) + 1,
+           "«Обновить» у /status: то же сообщение исправлено, кнопки на месте")
+
+    got, card = ask(5001, f"/node {first_node}", "Нагрузка")
+    report(card is not None and f"<b>{first_node}</b>" in text_of(card), f"/node {first_node}: карточка узла")
+    got, c = ask(5001, "/node no-such-node", "нет в nodes.conf")
+    report(c is not None and "no-such-node" in text_of(c) and [b.get("callback_data") for b in buttons(c)] == [f"n:{n}" for n in names],
+           "/node с неизвестным узлом: «нет в nodes.conf» и кнопки узлов")
+    got, c = ask(5001, "/node", "Какой узел")
+    report(c is not None and len(buttons(c)) == len(names), "/node без имени: выбор узла кнопками")
+
+    got, c = ask(5001, "/audit", "Защита от РКН")
+    report(c is not None and "Аудит сервера" in text_of(c) and "Проверка:" in text_of(c) and "проблем" in text_of(c),
+           "/audit: итог по блокам «Аудит сервера» и «Защита от РКН»")
+    got, c = ask(5001, "/service", "Ночное обслуживание", 120, absent="Проверяю обновления")
+    report(c is not None and all(s in text_of(c) for s in ("Установлена:", "Проверка узлов")) and "Проверяю обновления" not in text_of(c),
+           "/service: версия, обновления, проверка узлов, ночное обслуживание")
+    labels = [line.split("\t")[1] for line in open("/root/iof/hy2/index.tsv", encoding="utf-8") if "\t" in line]
+    got, c = ask(5001, "/hy2", "Группы ссылок")
+    report(c is not None and labels and all(escape(lb, quote=False) in text_of(c) for lb in labels) and "ссылк" in text_of(c),
+           f"/hy2: группы ({', '.join(labels)}) с числом ссылок")
+    got, c = ask(5001, "/help", "<b>Команды</b>")
+    report(c is not None and all(f"/{k}" in text_of(c) for k in ("status", "node", "audit", "service", "hy2")),
+           "/help: новые команды")
+
+    # Чужой и группа: ни ответа на нажатие, ни сообщений
+    upd, before, qid = press(5009, status_mid, "st")
+    replies(upd, before, 20)
+    time.sleep(2)
+    report(not calls(before), "нажатие кнопки чужим: без ответа")
+    report(in_journal("нажатие кнопки от чужого, без ответа: id 5009"), "нажатие чужого записано в журнал")
+    upd, before, qid = press(5001, status_mid, "st", chat_type="group")
+    replies(upd, before, 20)
+    time.sleep(2)
+    report(not calls(before), "нажатие кнопки в группе: без ответа и админу")
+    upd, before, qid = press(5001, status_mid, "zz:old")
+    got = wait_calls(before, lambda g: answered(g, qid) is not None, 20)
+    report("устарела" in str((answered(got, qid) or {}).get("params", {}).get("text", "")), "незнакомая кнопка: «кнопка устарела»")
+
+    # Узел с длинным именем: «n:<имя>» больше 64 байт, в кнопке хэш имени. Узла нет на самом деле:
+    # адрес из TEST-NET, iof до него не достучится
+    with open("/root/iof/nodes.conf", "a", encoding="utf-8") as f:
+        f.write(f"{LONG} | 192.0.2.10 | root@192.0.2.10 | CI бот длинное имя\n")
+    deadline = time.time() + 90
+    while time.time() < deadline and not any(n["name"] == LONG for n in panel("/api/dashboard?force=1")[1].get("nodes", [])):
+        time.sleep(2)
+    got, st = ask(5001, "/status", f"<b>Узлы: {len(names) + 1}")
+    data = next((b.get("callback_data", "") for b in buttons(st) if b["text"].endswith("…")), "") if st else ""
+    report(st is not None and data.startswith("n#") and len(data.encode()) <= 64
+           and all(len(b.get("callback_data", "").encode()) <= 64 for b in buttons(st)),
+           f"длинное имя узла: в кнопке хэш ({data}), callback_data не длиннее 64 байт")
+    upd, before, qid = press(5001, msg_id(st) if st else 0, data)
+    got = wait_calls(before, lambda g: last_with(g, "Нет связи по SSH") is not None)
+    card = last_with(got, "Нет связи по SSH")
+    nr = [b.get("callback_data", "") for b in buttons(card)] if card else []
+    report(card is not None and LONG in text_of(card) and len(nr) == 1 and nr[0].startswith("nr#"),
+           "кнопка длинного узла: карточка «нет связи по SSH», «Обновить» тоже с хэшем")
+    remove_long()
+    upd, before, qid = press(5001, msg_id(card) if card else 0, nr[0] if nr else "nr#0")
+    got = wait_calls(before, lambda g: answered(g, qid) is not None, 20)
+    time.sleep(2)
+    a = answered(calls(before), qid) or {"params": {}}
+    report("больше нет" in str(a["params"].get("text", "")) and a["params"].get("show_alert") is True
+           and not any(c["method"] in ("sendMessage", "editMessageText") for c in calls(before)),
+           "кнопка удалённого узла: «узла больше нет» во всплывающем окне")
+    upd, before, qid = press(5001, status_mid, f"n:{LONG[:40]}")
+    got = wait_calls(before, lambda g: answered(g, qid) is not None, 20)
+    report("больше нет" in str((answered(got, qid) or {"params": {}})["params"].get("text", "")),
+           "кнопка узла не из nodes.conf: «узла больше нет»")
+
+    raw = json.dumps(calls(start), ensure_ascii=False)
+    secrets = hy2_secrets()
+    leaks = [s for s in secrets if s in raw]
+    report(secrets and not leaks and TOKEN.split(":", 1)[1] not in raw and "PrivateKey" not in raw,
+           f"в ответах бота нет паролей Hysteria2 ({len(secrets)}), ключей AWG и токена")
+
+
+def remove_long():
+    with open("/root/iof/nodes.conf", encoding="utf-8") as f:
+        lines = f.readlines()
+    with open("/root/iof/nodes.conf.t", "w", encoding="utf-8") as f:
+        f.writelines(line for line in lines if not line.startswith(LONG))
+    os.replace("/root/iof/nodes.conf.t", "/root/iof/nodes.conf")
+
+
 def run():
     for f in (BOT_JSON, BOT_TOKEN):
         if os.path.exists(f):
@@ -882,7 +1108,8 @@ def run():
 
     rc, out, err = iof("on")
     report(rc == 0 and polling(), "iof bot on: бот опрашивает Bot API")
-    report([c.get("command") for c in fake("/fake/state")["commands"]] == ["start", "help"], "меню команд: /start, /help")
+    menu = [c.get("command") for c in fake("/fake/state")["commands"]]
+    report(menu == ["status", "node", "audit", "service", "hy2", "start", "help"], f"меню команд: {', '.join(menu)}")
 
     r = say(5001, "/start")
     report(r == [], "чужому на /start бот не отвечает")
@@ -962,6 +1189,7 @@ def run():
     rc2, _, _ = iof("set", "quiet", "off")
     report(rc != 0 and rc2 == 0 and cfg()["quiet"] is None, "тихие часы: неверное время — отказ, off — выключены")
     check_page()
+    check_views()
 
     # Второй опрос с тем же токеном: поддельный API, как Telegram, обрывает ждущий опрос бота ответом 409
     polling()
@@ -1017,6 +1245,7 @@ try:
 finally:
     if os.path.exists(MIGRATE):
         os.remove(MIGRATE)
+    remove_long()
 PY
 )"
   rc=$?
