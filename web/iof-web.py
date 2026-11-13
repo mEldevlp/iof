@@ -8,8 +8,9 @@
 группы ссылок: iof hy2 add | del | refresh; действия с узлом: iof hy2 restart | install, iof node del;
 обновление: iof update; перенос управляющего сервера: iof migrate; проверка безопасности:
 iof audit run, она узлы только читает; проверка с ПК: iof audit probe), по одной задаче за раз,
-с логом выполнения. Исключение — терминал на узел со страницы узла (ssh с ключом iof через
-WebSocket): он включается отдельно, IOF_WEB_TERMINAL=1. Скрипт проверки с ПК и его отчёт ходят
+с логом выполнения. Исключения — терминал на узел со страницы узла (ssh с ключом iof через
+WebSocket, включается отдельно, IOF_WEB_TERMINAL=1) и страница «Телеграм бот»: её команды iof bot
+быстрые и узлы не трогают, поэтому идут сразу, а не задачей. Скрипт проверки с ПК и его отчёт ходят
 по одноразовому билету вместо пароля панели. Telegram-бот (iof_bot.py рядом) работает потоком
 внутри панели; включает его iof bot on, без модуля панель работает как раньше.
 
@@ -76,6 +77,8 @@ STATIC_FILES = {
     "/service.js": ("service.js", "text/javascript; charset=utf-8"),
     "/security.html": ("security.html", "text/html; charset=utf-8"),
     "/security.js": ("security.js", "text/javascript; charset=utf-8"),
+    "/bot.html": ("bot.html", "text/html; charset=utf-8"),
+    "/bot.js": ("bot.js", "text/javascript; charset=utf-8"),
     "/term.js": ("term.js", "text/javascript; charset=utf-8"),
     "/xterm.js": ("xterm.js", "text/javascript; charset=utf-8"),
     "/xterm-fit.js": ("xterm-fit.js", "text/javascript; charset=utf-8"),
@@ -951,6 +954,147 @@ class Probes:
         return out
 
 
+# Страница «Телеграм бот». bot.json панель читает сама, а меняет только iof bot, и не задачей Jobs:
+# команды быстрые и узлы не трогают, а настройки не должны ждать, пока идёт hy2 install. Токен уходит
+# в iof bot token через stdin, панель его не отдаёт и не пишет в журнал, от токена только «есть или нет».
+# Код приглашения страница получает один раз, в ответе на POST; на сервере остаётся только его хэш
+
+BOT_ROLES = ("main", "regular")
+BOT_TOKEN = re.compile(r"^[0-9]{1,20}:[A-Za-z0-9_-]{20,100}$")
+BOT_CLOCK = re.compile(r"^([01][0-9]|2[0-3]):[0-5][0-9]$")
+BOT_CODE = re.compile(r"^[0-9a-f]{64}$", re.M)
+BOT_HASH = 12  # знаков хэша приглашения на странице, как в iof bot show: по ним приглашение и отзывают
+
+
+def bot_admin(a):
+    username = a.get("username")
+    return {
+        "id": a["id"],
+        "name": a.get("name") if isinstance(a.get("name"), str) else "",
+        "username": username if isinstance(username, str) and re.match(r"^[A-Za-z0-9_]{1,32}$", username) else "",
+        "role": a.get("role") if a.get("role") in BOT_ROLES else "regular",
+        "sound": a.get("sound") is True,
+        "added": a.get("added") if isinstance(a.get("added"), (int, float)) else None,
+    }
+
+
+def read_bot(base):
+    """bot.json для страницы -> (настройки, ошибка или None). Поля по умолчанию как у iof bot,
+    от приглашения только начало хэша, истёкшие не показываются (iof выбросит их при записи)."""
+    path = base / "bot.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        data = {}
+    except (OSError, ValueError) as e:
+        return None, f"{path} не читается ({e}): исправь его или удали и настрой бота заново"
+    if not isinstance(data, dict):
+        return None, f"{path}: нужен JSON-объект, исправь его или удали"
+    quiet = data.get("quiet")
+    if not (isinstance(quiet, dict) and all(BOT_CLOCK.match(str(quiet.get(k, ""))) for k in ("from", "to"))):
+        quiet = None
+    now = time.time()
+    admins = data.get("admins") if isinstance(data.get("admins"), list) else []
+    invites = data.get("invites") if isinstance(data.get("invites"), list) else []
+    return {
+        "enabled": data.get("enabled") is True,
+        "username": data.get("username") if isinstance(data.get("username"), str) else "",
+        "actions": data.get("actions") is True,
+        "hy2_links": data.get("hy2_links", True) is True,
+        "quiet": {"from": quiet["from"], "to": quiet["to"]} if quiet else None,
+        "admins": [bot_admin(a) for a in admins if isinstance(a, dict) and type(a.get("id")) is int],
+        "invites": sorted(({"hash": str(i.get("hash", ""))[:BOT_HASH],
+                            "role": i.get("role") if i.get("role") in BOT_ROLES else "regular",
+                            "created": i.get("created"), "expires": i["expires"]}
+                           for i in invites if isinstance(i, dict) and isinstance(i.get("expires"), (int, float))
+                           and i["expires"] > now), key=lambda i: i["expires"]),
+    }, None
+
+
+def bot_flag(body, key):
+    v = body.get(key)
+    if not isinstance(v, bool):
+        raise ValueError(f"{key}: true или false")
+    return "on" if v else "off"
+
+
+def bot_admin_id(body):
+    uid = body.get("id")
+    if type(uid) is not int or not 0 < uid < 10 ** 16:
+        raise ValueError("ID админа: число")
+    return str(uid)
+
+
+def bot_args(body):
+    """POST /api/bot -> (аргументы iof bot, stdin или None, токен для вычистки из ответа или "").
+    ValueError с текстом для страницы. iof проверяет всё ещё раз сам."""
+    action = body.get("action")
+    if action == "token":
+        if body.get("delete") is True:
+            return ["token"], b"\n", ""
+        token = body.get("token", "")
+        if not isinstance(token, str) or len(token) > 200:
+            raise ValueError("токен: строка")
+        token = token.strip()
+        if not BOT_TOKEN.match(token):
+            raise ValueError("это не токен бота: он выглядит как 123456789:AAF… (@BotFather, /mybots → API Token)")
+        return ["token"], (token + "\n").encode(), token
+    if action == "enable":
+        return [bot_flag(body, "on")], None, ""
+    if action == "set":
+        key = body.get("key")
+        if key in ("actions", "links"):
+            return ["set", key, bot_flag(body, "on")], None, ""
+        if key == "quiet":
+            value = body.get("value")
+            if value != "off":
+                parts = value.split("-") if isinstance(value, str) else []
+                if len(parts) != 2 or not all(BOT_CLOCK.match(p) for p in parts):
+                    raise ValueError("тихие часы: ЧЧ:ММ-ЧЧ:ММ, например 23:00-08:00, или off")
+                if parts[0] == parts[1]:
+                    raise ValueError("у тихих часов начало и конец совпадают")
+            return ["set", "quiet", value], None, ""
+        raise ValueError("неизвестная настройка")
+    if action == "invite":
+        role = body.get("role")
+        if role not in BOT_ROLES:
+            raise ValueError("роль: main или regular")
+        return ["invite", role], None, ""
+    if action == "invite_del":
+        prefix = text_field(body, "hash", 64).lower()
+        if not re.match(r"^[0-9a-f]{6,64}$", prefix):
+            raise ValueError("хэш приглашения: хотя бы 6 знаков hex")
+        return ["invite", "del", prefix], None, ""
+    if action == "admin_set":
+        uid = bot_admin_id(body)
+        if "role" in body:
+            if body["role"] not in BOT_ROLES:
+                raise ValueError("роль: main или regular")
+            return ["admin", "set", uid, "role", body["role"]], None, ""
+        return ["admin", "set", uid, "sound", bot_flag(body, "sound")], None, ""
+    if action == "admin_del":
+        return ["admin", "del", bot_admin_id(body)], None, ""
+    raise ValueError("неизвестное действие")
+
+
+def iof_bot_cmd(iof, args, stdin):
+    """iof bot <args> -> (вывод, текст ошибки или None). Секреты только в stdin."""
+    env = dict(os.environ, LC_ALL="C.UTF-8", LANG="C.UTF-8")
+    io = {"input": stdin} if stdin is not None else {"stdin": subprocess.DEVNULL}
+    try:
+        p = subprocess.run([iof, "bot", *args], capture_output=True, timeout=40, env=env, **io)
+    except FileNotFoundError:
+        return "", f"не найден {iof}"
+    except subprocess.TimeoutExpired:
+        return "", f"iof bot {args[0]} не уложился в 40 секунд"
+    out = p.stdout.decode("utf-8", "replace")
+    if p.returncode != 0:
+        err = p.stderr.decode("utf-8", "replace").strip().splitlines()
+        line = next((s for s in err if s.startswith("Ошибка: ")), err[-1] if err else f"iof завершился с кодом {p.returncode}")
+        return out, line.removeprefix("Ошибка: ")
+    return out, None
+
+
 # Терминал на узел со страницы узла: xterm.js в браузере, WebSocket к панели, на сервере ssh на узел
 # (для local — оболочка root) в псевдотерминале. Выключен, пока в web.env нет IOF_WEB_TERMINAL=1:
 # это root-доступ ко всем узлам из браузера
@@ -1302,6 +1446,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.security_info()
         if url.path == "/api/probe":
             return self.send_json(self.server.probes.state())
+        if url.path == "/api/bot":
+            return self.send_json(self.bot_info())
         if url.path == "/api/jobs":
             return self.send_json({"jobs": self.server.jobs.list()})
         if url.path in STATIC_FILES:
@@ -1321,7 +1467,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self.authorized() or not self.same_origin():
             return
         if path not in ("/api/nodes", "/api/migrate", "/api/hy2", "/api/node", "/api/service", "/api/security",
-                        "/api/term", "/api/probe"):
+                        "/api/term", "/api/probe", "/api/bot"):
             return self.send_json({"error": "не найдено"}, HTTPStatus.NOT_FOUND)
         body = self.read_json()
         if body is None:
@@ -1330,6 +1476,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.term_ticket(body)
         if path == "/api/probe":
             return self.probe_action(body)
+        if path == "/api/bot":
+            return self.bot_action(body)
         try:
             kind, title, steps = self.job_for(path, body)
         except ValueError as e:
@@ -1574,6 +1722,57 @@ class Handler(BaseHTTPRequestHandler):
         })
         self.send_json(data)
 
+    # Страница «Телеграм бот»: bot.json без хэшей приглашений (только начало), есть ли токен (сам токен
+    # не отдаётся) и состояние потока бота. thread = None — модуль бота не загрузился, причина в thread_error
+    def bot_info(self):
+        srv = self.server
+        cfg, error = read_bot(srv.base)
+        try:
+            token = (srv.base / "bot.token").stat().st_size > 0
+        except OSError:
+            token = False
+        return {
+            "config": cfg,
+            "config_error": error,
+            "token": token,
+            "thread": srv.bot.state() if srv.bot else None,
+            "thread_error": None if srv.bot else srv.bot_error,
+            "tz": time.strftime("%z"),
+            "now": time.time(),
+            "migrate": read_migrate(srv.base),
+        }
+
+    # POST /api/bot {action, ...}: iof bot сразу, без очереди задач. Ответ — первая строка вывода iof
+    # и свежее состояние страницы, на invite ещё код приглашения: единственный раз, больше его нигде нет
+    def bot_action(self, body):
+        srv = self.server
+        try:
+            not_migrating(read_migrate(srv.base))
+            args, stdin, secret = bot_args(body)
+        except ValueError as e:
+            return self.send_json({"error": str(e)}, HTTPStatus.BAD_REQUEST)
+        out, error = iof_bot_cmd(srv.iof, args, stdin)
+        if secret:
+            out, error = out.replace(secret, "***"), error and error.replace(secret, "***")
+        # В журнал только команда: токен уходит в iof через stdin, код приглашения приходит в stdout
+        what = "iof bot " + " ".join(args) + (" (удалить токен)" if args == ["token"] and not secret else "")
+        log(f"бот: из панели {what}" + (f": {error}" if error else ""))
+        if error:
+            return self.send_json({"error": error, "bot": self.bot_info()}, HTTPStatus.BAD_REQUEST)
+        data = {"message": next((s.strip() for s in out.splitlines() if s.strip()), "Готово"), "bot": self.bot_info()}
+        if args[0] == "invite" and args[1] in BOT_ROLES:
+            m = BOT_CODE.search(out)
+            if not m:
+                return self.send_json({"error": "iof bot invite не напечатал код: обнови iof, sudo iof update",
+                                       "bot": data["bot"]}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            code, cfg = m.group(0), data["bot"]["config"] or {}
+            prefix = hashlib.sha256(code.encode()).hexdigest()[:BOT_HASH]
+            inv = next((i for i in cfg.get("invites", []) if i["hash"] == prefix), None)
+            data["message"] = "Приглашение создано"
+            data["invite"] = {"code": code, "role": args[1], "hash": prefix, "expires": inv["expires"] if inv else None,
+                              "link": f"https://t.me/{cfg['username']}?start={code}" if cfg.get("username") else None}
+        self.send_json(data)
+
     # POST /api/probe {action: start, nodes, origin} — мишени и билет для ПК; {action: cancel} — остановить.
     # origin — адрес панели в браузере: по нему скрипт с ПК сдаст отчёт
     def probe_action(self, body):
@@ -1733,17 +1932,19 @@ def main():
 
     # Telegram-бот: поток внутри панели с общей очередью задач и опросом узлов. Работает, когда
     # включён (iof bot on) и есть токен; адрес Bot API меняет только IOF_TG_API (стенд, CI)
-    srv.bot = None
+    # Без бота страница «Телеграм бот» показывает причину из bot_error
+    srv.bot, srv.bot_error = None, None
     if iof_bot is None:
-        log(f"бот: модуль iof_bot не загрузился, панель работает без бота: {BOT_IMPORT_ERROR}")
+        srv.bot_error = f"модуль iof_bot не загрузился: {BOT_IMPORT_ERROR}"
+        log(f"бот: {srv.bot_error}, панель работает без бота")
     else:
         try:
             srv.bot = iof_bot.Bot(srv.base, args.iof, jobs=srv.jobs, cache=srv.cache,
                                   api=os.environ.get("IOF_TG_API"), log=log)
             srv.bot.start()
         except Exception as e:
-            srv.bot = None
-            log(f"бот: не запустился, панель работает без бота: {e}")
+            srv.bot, srv.bot_error = None, f"бот не запустился: {type(e).__name__}: {e}"
+            log(f"бот: {srv.bot_error}, панель работает без бота")
     print(f"iof-web: http://{args.listen}/" + ("  (терминал включён)" if srv.terms.enabled else ""), file=sys.stderr)
     try:
         srv.serve_forever()

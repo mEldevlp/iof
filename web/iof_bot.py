@@ -292,6 +292,10 @@ class Bot:
         api = Api(self.api_base, token)
         if not self.ready:
             self.prepare(api)
+        elif self.status["state"] in ("starting", "off", "no_token", "migrate"):
+            # Токен уже проверен, бот снова опрашивает Telegram: «работает» сразу, а не после ответа
+            # на опрос (до POLL секунд). После ошибки — только когда опрос пройдёт
+            self.set_state("running")
         params = {"timeout": self.POLL, "allowed_updates": ["message", "callback_query"]}
         if self.offset is not None:
             params["offset"] = self.offset

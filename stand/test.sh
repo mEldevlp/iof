@@ -653,8 +653,9 @@ bot_restore() {
 # по ссылке /start <код>, из группового чата; старое сообщение пропускается; админу отвечает на /start
 # и /help, в группе не отвечает и ему; настройки и админы меняются командой; 409 от второго опроса
 # пишется в журнал, и бот продолжает работать; при переносе изменения и коды отказаны, на сервере,
-# принимающем управление, бот не опрашивает API; выключение и удаление токена. Токен не попадает
-# в журналы, bot.json и iof bot show
+# принимающем управление, бот не опрашивает API; выключение и удаление токена. Страница «Телеграм бот»:
+# /api/bot без токена и хэшей, настройки, приглашение и отзыв, админы, токен и выключатель через панель,
+# при переносе панель изменения не принимает. Токен не попадает в журналы, bot.json и iof bot show
 check_bot() {
   local out rc
   if on "$M" test -f /root/iof/migrate.conf; then echo "      идёт настоящий перенос, проверку бота пропускаю"; return 0; fi
@@ -665,9 +666,11 @@ check_bot() {
   bot_save
   GUARD_LEFT=1
   out="$(on_in "$M" python3 - 2>&1 <<'PY'
-import hashlib, json, os, re, subprocess, time, urllib.request
+import hashlib, json, os, re, subprocess, time, urllib.error, urllib.request
 
 FAKE = "http://127.0.0.1:8089"
+PANEL = "http://127.0.0.1:8088"
+POST = {"X-IOF-Request": "1", "Content-Type": "application/json", "Origin": PANEL}
 # Токены для поддельного API: номер 0 он считает отозванным. Настоящего токена здесь нет
 TOKEN = "777000:AAEstandFakeTokenForIofBotTests_x1"
 BAD_TOKEN = "0:AAEstandFakeTokenRevokedXXXXXXXXXX"
@@ -690,6 +693,31 @@ def fake(path, body=None):
                                headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(r, timeout=20) as resp:
         return json.loads(resp.read())
+
+
+def panel(path, body=None, headers=None):
+    """Запрос к панели: без тела GET, с телом POST с обычной защитой. -> (код, JSON-ответ)."""
+    data = json.dumps(body).encode() if body is not None else None
+    r = urllib.request.Request(PANEL + path, data=data, method="POST" if data else "GET",
+                               headers=headers if headers is not None else (POST if data else {}))
+    try:
+        with urllib.request.urlopen(r, timeout=60) as resp:
+            return resp.status, json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read() or b"{}")
+        except ValueError:
+            return e.code, {}
+
+
+def thread_state(want, timeout=20):
+    """Поток бота в /api/bot пришёл в состояние want."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if (panel("/api/bot")[1].get("thread") or {}).get("state") == want:
+            return True
+        time.sleep(0.5)
+    return False
 
 
 def cfg():
@@ -765,6 +793,73 @@ def quiet(seconds=5):
     time.sleep(seconds)
     st = fake("/fake/state")
     return st["waiting"] == 0 and st["polls"] == polls
+
+
+def check_page():
+    """Страница «Телеграм бот»: /api/bot без токена и хэшей приглашений; настройки, приглашение и его
+    отзыв, админы, токен и выключатель через POST /api/bot. Бот включён, токен TOKEN, админ 5001."""
+    secret = TOKEN.split(":", 1)[1]
+    code, data = panel("/api/bot")
+    c = data.get("config") or {}
+    report(code == 200 and data.get("token") is True and (data.get("thread") or {}).get("state") == "running"
+           and c.get("enabled") is True and c.get("username") == "iof_stand_bot" and any(a["id"] == 5001 for a in c.get("admins", [])),
+           f"панель: /api/bot ({code}) — токен есть, бот работает, админы на месте")
+    report(secret not in json.dumps(data), "панель: токена нет в /api/bot")
+
+    codes = [panel("/api/bot", {"action": "set", "key": "actions", "on": False})[0],
+             panel("/api/bot", {"action": "set", "key": "links", "on": True})[0],
+             panel("/api/bot", {"action": "set", "key": "quiet", "value": "22:30-07:00"})[0]]
+    c = cfg()
+    report(codes == [200, 200, 200] and c["actions"] is False and c["hy2_links"] is True and c["quiet"] == {"from": "22:30", "to": "07:00"},
+           f"панель: настройки бота — действия, ссылки, тихие часы ({codes})")
+    code, _ = panel("/api/bot", {"action": "set", "key": "quiet", "value": "25:00-07:00"})
+    report(code == 400 and cfg()["quiet"] == {"from": "22:30", "to": "07:00"}, f"панель: неверные тихие часы не приняты ({code})")
+    code, _ = panel("/api/bot", {"action": "set", "key": "quiet", "value": "off"})
+    report(code == 200 and cfg()["quiet"] is None, "панель: тихие часы выключены")
+    code, _ = panel("/api/bot", {"action": "set", "key": "actions", "on": True}, {"Content-Type": "application/json"})
+    report(code == 403 and cfg()["actions"] is False, f"панель: изменение бота без X-IOF-Request отклонено ({code})")
+
+    code, data = panel("/api/bot", {"action": "invite", "role": "main"})
+    inv = data.get("invite") or {}
+    pcode = inv.get("code", "")
+    h = hashlib.sha256(pcode.encode()).hexdigest()
+    report(code == 200 and re.fullmatch(r"[0-9a-f]{64}", pcode) is not None and inv.get("role") == "main"
+           and inv.get("link") == f"https://t.me/iof_stand_bot?start={pcode}" and any(i["hash"] == h for i in cfg()["invites"]),
+           "панель: приглашение создано — код из 64 знаков, ссылка t.me, в bot.json его хэш")
+    code, data = panel("/api/bot")
+    raw = json.dumps(data)
+    report([i["hash"] for i in (data.get("config") or {}).get("invites", [])] == [h[:12]] and pcode not in raw and h not in raw,
+           "панель: в /api/bot у приглашения только начало хэша, кода нет")
+    code, _ = panel("/api/bot", {"action": "invite_del", "hash": h[:12]})
+    r = say(5006, pcode)
+    report(code == 200 and not cfg()["invites"] and "не подошёл" in first(r) and admin(5006) is None,
+           "панель: приглашение отозвано, код больше не принимается")
+    code, data = panel("/api/bot", {"action": "invite", "role": "regular"})
+    pcode2 = (data.get("invite") or {}).get("code", "")
+    r = say(5006, pcode2)
+    report(code == 200 and "обычный" in first(r) and (admin(5006) or {}).get("role") == "regular",
+           "панель: по коду из панели бот добавил админа с ролью «обычный»")
+    report(pcode not in journal() and pcode2 not in journal(), "панель: кодов приглашений нет в журнале")
+
+    c1 = panel("/api/bot", {"action": "admin_set", "id": 5006, "role": "main"})[0]
+    c2 = panel("/api/bot", {"action": "admin_set", "id": 5006, "sound": True})[0]
+    a = admin(5006) or {}
+    report(c1 == 200 and c2 == 200 and a.get("role") == "main" and a.get("sound") is True, "панель: роль и звук в тихие часы у админа")
+    code, _ = panel("/api/bot", {"action": "admin_del", "id": 5006})
+    report(code == 200 and admin(5006) is None, "панель: админ удалён")
+    code, data = panel("/api/bot", {"action": "admin_del", "id": 9999})
+    report(code == 400 and "нет" in data.get("error", ""), f"панель: удаление неизвестного админа отклонено ({code})")
+
+    code, data = panel("/api/bot", {"action": "token", "token": BAD_TOKEN})
+    report(code == 400 and "не принял" in data.get("error", "") and open(BOT_TOKEN).read().strip() == TOKEN,
+           "панель: отозванный токен не принят, прежний на месте")
+    code, data = panel("/api/bot", {"action": "token", "token": TOKEN})
+    report(code == 200 and (data.get("bot") or {}).get("token") is True and secret not in json.dumps(data),
+           "панель: токен принят (iof bot token со stdin), в ответе его нет")
+    code, _ = panel("/api/bot", {"action": "enable", "on": False})
+    report(code == 200 and quiet() and cfg()["enabled"] is False and thread_state("off"), "панель: бот выключен и не опрашивает API")
+    code, _ = panel("/api/bot", {"action": "enable", "on": True})
+    report(code == 200 and polling() and thread_state("running"), "панель: бот включён и снова опрашивает API")
 
 
 def run():
@@ -866,6 +961,7 @@ def run():
     rc, _, _ = iof("set", "quiet", "25:00-08:00")
     rc2, _, _ = iof("set", "quiet", "off")
     report(rc != 0 and rc2 == 0 and cfg()["quiet"] is None, "тихие часы: неверное время — отказ, off — выключены")
+    check_page()
 
     # Второй опрос с тем же токеном: поддельный API, как Telegram, обрывает ждущий опрос бота ответом 409
     polling()
@@ -886,12 +982,15 @@ def run():
     report(rc != 0 and "идёт перенос" in err, "при переносе отсюда: iof bot invite отказана")
     rc, out, err = iof("show")
     report(rc == 0 and "Перенос" in out, "при переносе: iof bot show работает")
+    code, data = panel("/api/bot", {"action": "set", "key": "actions", "on": True})
+    report(code == 400 and "перенос" in data.get("error", "") and cfg()["actions"] is False, "при переносе: панель не меняет настройки бота")
     r = say(5005, code5)
     report("перенос" in first(r) and admin(5005) is None and len(cfg()["invites"]) == 1, "при переносе: код не принят, бот отвечает, что идёт перенос")
 
     with open(MIGRATE, "w") as f:
         f.write(f"role=target\nid=iof-test\npeer=root@192.0.2.1\nstarted={int(time.time())}\n")
     report(quiet(), "сервер принимает управление (role=target): бот не опрашивает API")
+    report(thread_state("migrate"), "role=target: /api/bot показывает, что бот ждёт конца переноса")
     upd, before = say(5001, "/help", wait=False)
     time.sleep(4)
     report(fake("/fake/state")["offset"] <= upd and not fake(f"/fake/sent?after={before}"), "role=target: сообщение не обработано")
