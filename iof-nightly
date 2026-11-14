@@ -2,6 +2,8 @@
 # Ночное обслуживание всех узлов iof: обновление пакетов и перезагрузка.
 # На каждом узле работа запускается отдельным systemd-юнитом, поэтому она не зависит
 # от SSH-сессии и не прервётся, когда управляющий сервер сам уйдёт в перезагрузку.
+# Итог запуска уходит в Telegram уведомлением nightly (iof notify): на скольких узлах запущено
+# и где не вышло. Как прошло обновление, видно позже на странице «Сервис» и в /var/log/iof-nightly.log
 
 JOB='export DEBIAN_FRONTEND=noninteractive
 {
@@ -19,8 +21,28 @@ JOB='export DEBIAN_FRONTEND=noninteractive
 
 # base64, чтобы не возиться с кавычками при передаче через iof exec и ssh
 B64="$(printf '%s' "$JOB" | base64 -w0)"
+LOG=/var/log/iof-nightly-run.log
 
+# Вывод iof exec: "== узел", вывод узла, "   код выхода N" при ошибке, в конце "Выполнено на N узлах, с ошибкой: M"
+STARTED="$(date '+%F %T')"
+OUT="$(/usr/local/bin/iof exec "systemd-run --unit=iof-nightly --collect /bin/bash -c 'echo $B64 | base64 -d | bash'" 2>&1)"
 {
-  echo "== $(date '+%F %T')"
-  /usr/local/bin/iof exec "systemd-run --unit=iof-nightly --collect /bin/bash -c 'echo $B64 | base64 -d | bash'"
-} >> /var/log/iof-nightly-run.log 2>&1
+  echo "== $STARTED"
+  printf '%s\n' "$OUT"
+} >> "$LOG"
+
+# Узлы, где юнит не запустился: имя, код выхода и первая строка вывода (255 — нет связи по SSH)
+FAILED="$(awk '
+  /^== / { node = substr($0, 4); first = ""; next }
+  /^   код выхода / { code = $3; print node ": код " code (code == 255 ? ", нет связи по SSH" : "") (first != "" ? " (" first ")" : ""); next }
+  first == "" && NF { first = substr($0, 1, 120) }
+' <<<"$OUT")"
+SUMMARY="$(grep '^Выполнено на ' <<<"$OUT" | tail -n 1)"
+if [[ -z "$SUMMARY" ]]; then
+  TEXT="Не запустилось: iof exec не дал итога."$'\n'"$(tail -n 5 <<<"$OUT")"
+else
+  TEXT="Обновление пакетов и перезагрузка: ${SUMMARY/Выполнено/запущено}"
+  if [[ -n "$FAILED" ]]; then TEXT+=$'\n'"$FAILED"; fi
+  TEXT+=$'\n'"Как прошло обновление — на странице «Сервис» панели после перезагрузки"
+fi
+printf '%s\n' "$TEXT" | /usr/local/bin/iof notify nightly >> "$LOG" 2>&1 || true

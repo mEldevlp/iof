@@ -234,6 +234,26 @@ function toast(text) {
 
 // Плашка и отметка в меню о незавершённом переносе управляющего сервера (поле migrate в ответах панели).
 // На самой странице «Перенос» плашки нет
+// Куда уходят уведомления iof одного типа (страницы «Сервис» и «Безопасность»). bot — через бота:
+// {username, subs: {тип: сколько админов подписано}}; chat — TG_TOKEN и TG_CHAT в iof.env (без бота туда
+// уходят только узлы и аудит). -> [ячейка для kv, подсказка или ""]
+function tgView(bot, chat, kind, title) {
+  const page = `<a href="bot.html${DEMO ? "?demo" : ""}">«Телеграм бот»</a>`;
+  if (bot) {
+    const n = (bot.subs || {})[kind] || 0;
+    const name = bot.username ? ` @${esc(bot.username)}` : "";
+    return [`через бота${name}<span class="sub-line">${n
+      ? badge("good", `получают ${n} ${plural(n, ["админ", "админа", "админов"])}`)
+      : badge("warn", "нет подписчиков")}</span>`,
+    n ? "" : `Отметь админам «${title}» на странице ${page}.`];
+  }
+  if (chat) {
+    return [badge("good", "в TG_CHAT из iof.env"),
+      `Бот выключен, поэтому сообщения идут в <code>TG_CHAT</code> из <code>/root/iof/iof.env</code>. Через бота (страница ${page}) они приходят каждому админу, кому отмечены.`];
+  }
+  return [badge("none", "не настроен"), `Сообщения в Telegram: включи бота на странице ${page} и отметь админам «${title}».`];
+}
+
 function renderMigrate(m) {
   const badge = $("#nav-migrate");
   badge.hidden = !m;

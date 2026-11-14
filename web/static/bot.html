@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Телеграм бот · Island of Freedom</title>
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="app.css">
+  <script src="common.js"></script>
+  <script src="bot.js" defer></script>
+</head>
+<body>
+  <div class="shell">
+    <aside id="sidebar" class="sidebar">
+      <a class="brand" href="./">
+        <svg class="logo" viewBox="0 0 64 64" aria-hidden="true">
+          <defs><clipPath id="logo-sky"><rect width="64" height="44"/></clipPath></defs>
+          <circle class="logo-sun" cx="42" cy="44" r="13" clip-path="url(#logo-sky)"/>
+          <path class="logo-palm" d="M14.4 48C15.8 37.5 18.6 28.5 24.2 21.4L27 22.8C22.2 30 20.2 39 19.6 48ZM25.5 21Q12 8 6 27Q15 18 25.5 21ZM25.5 21Q39 8 46 26Q37 17 25.5 21ZM25.5 21Q16 4 9 10Q19 11 25.5 21ZM25.5 21Q33 3 42 8Q31 12 25.5 21ZM25.5 21Q21 9 27.5 2.5Q28.5 13 25.5 21ZM4 50C16 43 28 44 38 47C46 49.5 54 48 60 43C55 50.5 46 53 37 51.5C27 50 16 48 4 50Z"/>
+          <path class="logo-wave" d="M12 56C22 52 32 52.5 41 54.5C48 56 55 55 60 51C56 57 48 59.5 40 58.5C31 57.5 22 55 12 56Z"/>
+        </svg>
+        <span><b>Island of Freedom</b><small>VPN-узлы: Hysteria2 и AWG</small></span>
+      </a>
+      <nav class="nav" aria-label="Разделы">
+        <p class="nav-label">Мониторинг</p>
+        <a href="./">
+          <svg class="nav-ico" viewBox="0 0 20 20" aria-hidden="true"><rect x="3" y="3" width="6" height="6" rx="1.5"/><rect x="11" y="3" width="6" height="6" rx="1.5"/><rect x="3" y="11" width="6" height="6" rx="1.5"/><rect x="11" y="11" width="6" height="6" rx="1.5"/></svg>
+          <span>Обзор</span>
+        </a>
+        <a href="hy2.html">
+          <svg class="nav-ico" viewBox="0 0 20 20" aria-hidden="true"><path d="M8.5 11.5l3-3M9.3 6.2l1.1-1.1a3 3 0 0 1 4.3 4.3l-1.1 1.1M10.7 13.8l-1.1 1.1a3 3 0 0 1-4.3-4.3l1.1-1.1"/></svg>
+          <span>Hysteria2</span>
+        </a>
+        <a href="security.html">
+          <svg class="nav-ico" viewBox="0 0 20 20" aria-hidden="true"><path d="M10 2.5l6 2.2v4.5c0 3.7-2.4 6.6-6 8.3-3.6-1.7-6-4.6-6-8.3V4.7zM7.4 10l1.9 1.9 3.4-3.7"/></svg>
+          <span>Безопасность</span>
+        </a>
+        <p class="nav-label">Управление</p>
+        <a href="add.html">
+          <svg class="nav-ico" viewBox="0 0 20 20" aria-hidden="true"><rect x="2.5" y="3" width="15" height="5.5" rx="1.5"/><path d="M9.5 11.5H4A1.5 1.5 0 0 0 2.5 13v1.5A1.5 1.5 0 0 0 4 16h5.5M15 11v6M12 14h6M5.5 5.75h.01"/></svg>
+          <span>Добавить сервер</span>
+        </a>
+        <a href="migrate.html">
+          <svg class="nav-ico" viewBox="0 0 20 20" aria-hidden="true"><path d="M3 7h13M13 4l3 3-3 3M17 13H4M7 10l-3 3 3 3"/></svg>
+          <span>Перенос</span>
+          <span id="nav-migrate" class="nav-badge" hidden></span>
+        </a>
+        <a href="bot.html" aria-current="page">
+          <svg class="nav-ico" viewBox="0 0 20 20" aria-hidden="true"><path d="M17 3L3 9.2l5.6 2.2L10.8 17zM8.6 11.4L17 3"/></svg>
+          <span>Телеграм бот</span>
+        </a>
+        <a href="service.html">
+          <svg class="nav-ico" viewBox="0 0 20 20" aria-hidden="true"><path d="M12.6 3.3a4 4 0 0 0-5 5.1l-4.3 4.3a1.6 1.6 0 0 0 2.3 2.3l4.3-4.3a4 4 0 0 0 5.1-5l-2.4 2.4-2.1-.3-.3-2.1z"/></svg>
+          <span>Сервис</span>
+        </a>
+      </nav>
+      <div class="side-foot">
+        <p id="demo-chip" class="demo-chip" hidden>Демо-режим: данные выдуманы, сервер не нужен</p>
+        <div class="theme-row">
+          <span id="theme-label">Тема</span>
+          <div class="theme" role="group" aria-labelledby="theme-label">
+            <button type="button" data-set-theme="auto" title="Как в системе" aria-label="Как в системе"><svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="5.75"/><path class="fill" d="M8 2.25a5.75 5.75 0 0 1 0 11.5z"/></svg></button>
+            <button type="button" data-set-theme="light" title="Светлая" aria-label="Светлая"><svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="2.75"/><path d="M8 1.5v1.5M8 13v1.5M1.5 8H3M13 8h1.5M3.4 3.4l1.06 1.06M11.54 11.54l1.06 1.06M3.4 12.6l1.06-1.06M11.54 4.46l1.06-1.06"/></svg></button>
+            <button type="button" data-set-theme="dark" title="Тёмная" aria-label="Тёмная"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13.5 9.6A5.75 5.75 0 0 1 6.4 2.5a5.75 5.75 0 1 0 7.1 7.1z"/></svg></button>
+          </div>
+        </div>
+      </div>
+    </aside>
+
+    <div class="content">
+      <header class="page-head">
+        <button id="menu-btn" class="btn menu-btn" type="button" aria-controls="sidebar" aria-expanded="false" aria-label="Меню">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 4h11M2.5 8h11M2.5 12h11" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+        </button>
+        <div class="page-title">
+          <h1>Телеграм бот</h1>
+          <p>Бот iof в Telegram: работает внутри панели и отвечает только админам в личном чате</p>
+        </div>
+        <div class="controls">
+          <button id="refresh" class="btn" type="button">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9M13.5 2.5v3h-3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            <span>Обновить</span>
+          </button>
+        </div>
+      </header>
+
+      <main>
+        <div id="alert" class="alert" role="alert" hidden></div>
+        <div id="migrate-banner" class="note warn banner" role="status" hidden></div>
+        <div id="action-error" class="form-error banner" role="alert" hidden></div>
+
+        <div class="grid2">
+          <section class="card">
+            <div class="card-head">
+              <h2>Бот</h2>
+              <label class="switch">
+                <input id="bot-enable" type="checkbox" role="switch" data-lock>
+                <span class="switch-track" aria-hidden="true"></span>
+                <span>Включён</span>
+              </label>
+            </div>
+            <div id="bot-state" class="health" role="status"></div>
+            <dl id="bot-kv" class="kv"></dl>
+            <form id="token-form" class="form" novalidate autocomplete="off">
+              <fieldset>
+                <legend>Токен</legend>
+                <div class="field">
+                  <label id="token-label" for="f-token">Токен от @BotFather</label>
+                  <div class="input-row">
+                    <input id="f-token" type="password" autocomplete="off" spellcheck="false" maxlength="200">
+                    <button id="toggle-token" class="btn small" type="button">Показать</button>
+                  </div>
+                  <p id="token-hint" class="hint"></p>
+                </div>
+              </fieldset>
+              <div class="form-actions">
+                <button id="token-del" class="btn danger" type="button" data-lock hidden>Удалить токен</button>
+                <button class="btn primary" type="submit" data-lock>Сохранить токен</button>
+              </div>
+            </form>
+          </section>
+
+          <section class="card">
+            <div class="card-head"><h2>Настройки</h2></div>
+            <ul class="settings">
+              <li>
+                <div class="setting-text">
+                  <b id="actions-label">Действия из бота</b>
+                  <p class="hint">Главные админы смогут запускать из бота проверку узлов, перезапуск Hysteria2 и группы
+                    ссылок, каждое действие — с подтверждением. Удаление узлов, перенос и обновление — только в панели.</p>
+                </div>
+                <label class="switch"><input id="set-actions" type="checkbox" role="switch" aria-labelledby="actions-label" data-lock><span class="switch-track" aria-hidden="true"></span></label>
+              </li>
+              <li>
+                <div class="setting-text">
+                  <b id="links-label">Ссылки Hysteria2</b>
+                  <p class="hint">Бот выдаёт админам ссылки групп с QR-кодами. В ссылках пароль: выключи, если не хочешь держать их в Telegram.</p>
+                </div>
+                <label class="switch"><input id="set-links" type="checkbox" role="switch" aria-labelledby="links-label" data-lock><span class="switch-track" aria-hidden="true"></span></label>
+              </li>
+              <li>
+                <div class="setting-text">
+                  <b id="quiet-label">Тихие часы</b>
+                  <p class="hint">Уведомления в это время приходят без звука, кроме админов со звуком в тихие часы. <span id="quiet-tz"></span></p>
+                  <form id="quiet-form" class="time-row" novalidate>
+                    <label for="quiet-from">с</label>
+                    <input id="quiet-from" type="time" value="23:00" required data-lock>
+                    <label for="quiet-to">до</label>
+                    <input id="quiet-to" type="time" value="08:00" required data-lock>
+                    <button id="quiet-save" class="btn small" type="submit" data-lock hidden>Сохранить</button>
+                  </form>
+                </div>
+                <label class="switch"><input id="set-quiet" type="checkbox" role="switch" aria-labelledby="quiet-label" data-lock><span class="switch-track" aria-hidden="true"></span></label>
+              </li>
+            </ul>
+          </section>
+        </div>
+
+        <section class="card">
+          <div class="card-head">
+            <h2>Админы <span id="admins-count" class="count"></span></h2>
+            <button id="add-admin" class="btn small primary" type="button" data-lock>Добавить админа</button>
+          </div>
+          <div id="admins" class="table-wrap"></div>
+          <div id="invites-box" hidden>
+            <h3 class="sub-head">Неиспользованные приглашения <span id="invites-count" class="count"></span></h3>
+            <ul id="invites" class="invites"></ul>
+          </div>
+        </section>
+
+        <section class="card">
+          <div class="card-head"><h2>Уведомления</h2></div>
+          <p id="notify-hint" class="hint pad"></p>
+          <div id="notify" class="table-wrap"></div>
+          <h3 class="sub-head">Когда приходят</h3>
+          <dl id="notify-types" class="cmds"></dl>
+        </section>
+
+        <section class="card">
+          <div class="card-head"><h2>Команды на сервере</h2></div>
+          <dl class="cmds">
+            <dt><code>sudo iof bot show</code></dt><dd>включён ли бот, админы и неиспользованные приглашения</dd>
+            <dt><code>sudo iof bot token</code></dt><dd>задать токен: спросит, не показывая; пустой ввод удаляет токен и выключает бота</dd>
+            <dt><code>sudo iof bot on</code>, <code>off</code></dt><dd>включить или выключить бота</dd>
+            <dt><code>sudo iof bot invite main</code></dt><dd>код приглашения главного админа (<code>regular</code> — обычного)</dd>
+            <dt><code>sudo iof bot admin set ID notify nodes,audit</code></dt><dd>какие уведомления получает админ: типы через запятую, <code>all</code> или <code>off</code></dd>
+            <dt><code>sudo iof notify nodes проверка</code></dt><dd>пробное уведомление: придёт тем, у кого отмечен этот тип</dd>
+            <dt><code>sudo iof bot admin del ID</code></dt><dd>удалить админа: бот перестанет ему отвечать</dd>
+          </dl>
+        </section>
+      </main>
+
+      <footer class="foot">iof-web · бот работает внутри панели: остановится панель — остановится и бот. Токен и коды приглашений на сервере не показываются</footer>
+    </div>
+  </div>
+
+  <dialog id="invite-dialog" class="dialog" aria-labelledby="invite-title">
+    <div class="dialog-head">
+      <h2 id="invite-title">Добавить админа</h2>
+      <button id="invite-close" class="btn" type="button">Закрыть</button>
+    </div>
+    <div id="invite-body" class="dialog-body"></div>
+  </dialog>
+</body>
+</html>

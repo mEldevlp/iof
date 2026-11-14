@@ -12,7 +12,8 @@
 #   bash stand/stand.sh up [сервер...]   собрать образ и поднять серверы (по умолчанию все, CI: old node1)
 #   bash stand/stand.sh setup         поставить iof на old из рабочей копии, подключить поднятые node1
 #                                     и node2, Hysteria2, группу ссылок, задания cron, терминал в панели,
-#                                     python3 на node1 для мишеней проверки с ПК
+#                                     python3 на node1 для мишеней проверки с ПК, поддельный Bot API
+#                                     (stand/fake-tg.py, служба fake-tg) для бота панели на old
 #   bash stand/stand.sh test [сервер] проверить, что iof работает (stand/test.sh); сервер — управляющий,
 #                                     по умолчанию old
 #   bash stand/stand.sh sync [сервер] обновить iof из рабочей копии (по умолчанию на old и new, где он стоит)
@@ -136,10 +137,35 @@ chmod 700 /root/iof
 grep -q '^PROBE_PORTS=' /root/iof/iof.env 2>/dev/null || (umask 077; echo 'PROBE_PORTS=47000' >> /root/iof/iof.env)
 
 echo "== old: терминал в панели (IOF_WEB_TERMINAL=1)"
+restart=0
 if ! grep -qx 'IOF_WEB_TERMINAL=1' /root/iof/web.env 2>/dev/null; then
   (umask 077; echo 'IOF_WEB_TERMINAL=1' >> /root/iof/web.env)
-  systemctl restart iof-web
+  restart=1
 fi
+
+# Бот панели ходит в поддельный Bot API (stand/fake-tg.py) на этом же сервере, а не в Telegram
+echo "== old: поддельный Bot API fake-tg, IOF_TG_API в web.env"
+cat > /etc/systemd/system/fake-tg.service <<'EOF'
+[Unit]
+Description=Поддельный Bot API Telegram для стенда iof
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/iof/stand/fake-tg.py --listen 127.0.0.1:8089 --max-wait 5
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable -q fake-tg
+systemctl restart fake-tg
+if ! grep -qx 'IOF_TG_API=http://127.0.0.1:8089' /root/iof/web.env; then
+  sed -i '/^IOF_TG_API=/d' /root/iof/web.env
+  echo 'IOF_TG_API=http://127.0.0.1:8089' >> /root/iof/web.env
+  restart=1
+fi
+if (( restart )); then systemctl restart iof-web; fi
 
 for n in $NODES; do
   name="${n%%:*}"
@@ -175,6 +201,8 @@ cmd_sync() {
     echo "== $s"
     push_src "$s"
     on "$s" bash /opt/iof/install.sh
+    # Поддельный Bot API запущен из /opt/iof: после замены рабочей копии — заново
+    on "$s" bash -c 'if systemctl is-enabled --quiet fake-tg 2>/dev/null; then systemctl restart fake-tg; fi'
   done
 }
 
@@ -267,5 +295,5 @@ case "${1:-}" in
   iof)    shift; s="${1:?укажи сервер}"; shift; on "$s" iof "$@" ;;
   sh)     dc exec "${2:?укажи сервер}" bash ;;
   down)   dc down ;;
-  *)      sed -n '3,27p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *)      sed -n '3,28p' "$0" | sed 's/^# \{0,1\}//' ;;
 esac

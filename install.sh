@@ -49,11 +49,15 @@ fi
 if (( ! WEB )); then exit 0; fi
 
 command -v python3 >/dev/null 2>&1 || die "нет python3: sudo apt install python3"
-python3 -c 'import ast, sys; ast.parse(open(sys.argv[1], encoding="utf-8").read())' "$SRC/web/iof-web.py" \
-  || die "web/iof-web.py с ошибкой, панель не обновлял"
+for f in iof-web.py iof_bot.py; do
+  python3 -c 'import ast, sys; ast.parse(open(sys.argv[1], encoding="utf-8").read())' "$SRC/web/$f" \
+    || die "web/$f с ошибкой, панель не обновлял"
+done
 
 install -d -m 755 "$WEB_DIR" "$WEB_DIR/static"
 install -m 644 "$SRC/web/iof-web.py" "$WEB_DIR/iof-web.py"
+# Telegram-бот: модуль рядом с панелью, она запускает его потоком (включается iof bot on)
+install -m 644 "$SRC/web/iof_bot.py" "$WEB_DIR/iof_bot.py"
 # Статику заменяем целиком, чтобы не оставались удалённые из репозитория файлы
 rm -f "$WEB_DIR"/static/*
 install -m 644 "$SRC"/web/static/* "$WEB_DIR/static/"

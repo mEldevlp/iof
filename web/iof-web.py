@@ -8,9 +8,13 @@
 группы ссылок: iof hy2 add | del | refresh; действия с узлом: iof hy2 restart | install, iof node del;
 обновление: iof update; перенос управляющего сервера: iof migrate; проверка безопасности:
 iof audit run, она узлы только читает; проверка с ПК: iof audit probe), по одной задаче за раз,
-с логом выполнения. Исключение — терминал на узел со страницы узла (ssh с ключом iof через
-WebSocket): он включается отдельно, IOF_WEB_TERMINAL=1. Скрипт проверки с ПК и его отчёт ходят
-по одноразовому билету вместо пароля панели.
+с логом выполнения. Исключения — терминал на узел со страницы узла (ssh с ключом iof через
+WebSocket, включается отдельно, IOF_WEB_TERMINAL=1) и страница «Телеграм бот»: её команды iof bot
+быстрые и узлы не трогают, поэтому идут сразу, а не задачей. Скрипт проверки с ПК и его отчёт ходят
+по одноразовому билету вместо пароля панели. Telegram-бот (iof_bot.py рядом) работает потоком
+внутри панели; включает его iof bot on, без модуля панель работает как раньше. Данные страниц
+бот берёт у панели (BotViews): тот же разбор, ссылки Hysteria2 — отдельным методом и только админу.
+Действия бота (BotActions) — задачи в той же очереди с теми же шагами, что у кнопок панели.
 
 Без зависимостей, нужен только python3. По умолчанию слушает 127.0.0.1:8088,
 снаружи заходить через SSH-туннель:  ssh -L 8088:127.0.0.1:8088 admin@сервер
@@ -46,6 +50,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
+# Telegram-бот: модуль рядом с панелью. Если он не загрузился, панель работает без бота
+try:
+    import iof_bot
+    BOT_IMPORT_ERROR = None
+except Exception as e:  # ошибка в модуле бота не должна ронять панель
+    iof_bot = None
+    BOT_IMPORT_ERROR = f"{type(e).__name__}: {e}"
+
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 # Только эти файлы раздаются как статика, остальное 404
@@ -67,6 +79,8 @@ STATIC_FILES = {
     "/service.js": ("service.js", "text/javascript; charset=utf-8"),
     "/security.html": ("security.html", "text/html; charset=utf-8"),
     "/security.js": ("security.js", "text/javascript; charset=utf-8"),
+    "/bot.html": ("bot.html", "text/html; charset=utf-8"),
+    "/bot.js": ("bot.js", "text/javascript; charset=utf-8"),
     "/term.js": ("term.js", "text/javascript; charset=utf-8"),
     "/xterm.js": ("xterm.js", "text/javascript; charset=utf-8"),
     "/xterm-fit.js": ("xterm-fit.js", "text/javascript; charset=utf-8"),
@@ -178,13 +192,25 @@ class StatusCache:
 
     def get(self, force=False):
         with self.lock:
-            age = time.time() - self.data["status_at"] if self.data else None
-            # Принудительное обновление не чаще раза в 5 секунд
-            fresh = age is not None and (age < 5 or (not force and age < self.ttl))
-            if fresh:
+            if self.usable(force):
                 return dict(self.data, cached=True)
             self.data = self.probe()
             return dict(self.data, cached=False)
+
+    def usable(self, force):
+        age = time.time() - self.data["status_at"] if self.data else None
+        # Принудительное обновление не чаще раза в 5 секунд
+        return age is not None and (age < 5 or (not force and age < self.ttl))
+
+    def fresh(self, force=False):
+        """Ответит ли get(force) сразу, без опроса узлов. Не ждёт: если опрос уже идёт, ответ — нет.
+        По нему бот решает, писать ли сначала «опрашиваю узлы…»."""
+        if not self.lock.acquire(blocking=False):
+            return False
+        try:
+            return self.usable(force)
+        finally:
+            self.lock.release()
 
     def invalidate(self):
         with self.lock:
@@ -329,6 +355,20 @@ def qr_svg(text, level):
         if p.returncode == 0 and p.stdout:
             return p.stdout
     return None
+
+
+def qr_png(text, level="M"):
+    """PNG с QR-кодом через qrencode, для Telegram-бота: SVG он в фото не принимает. None, если
+    qrencode нет или текст не помещается. Текст (ссылка с паролем) идёт через stdin."""
+    exe = shutil.which("qrencode")
+    if not exe:
+        return None
+    try:
+        p = subprocess.run([exe, "-t", "PNG", "-l", level, "-m", "2", "-s", "8", "-o", "-"],
+                           input=text.encode("utf-8"), capture_output=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return p.stdout if p.returncode == 0 and p.stdout.startswith(b"\x89PNG") else None
 
 
 def read_awg_clients(base):
@@ -505,8 +545,9 @@ class Jobs:
             return [dict(j, log=list(j["log"])) for j in reversed(self.items)]
 
     def start(self, title, steps, kind):
-        """steps: [(подпись для лога, argv, stdin bytes или None)], kind: по нему страница находит
-        свои задачи (node, migrate, hy2, service, audit, node:<имя>). None, если занято."""
+        """steps: [(подпись для лога, argv, stdin bytes или None[, коды выхода «выполнено с проблемами»])],
+        kind: по нему страница находит свои задачи (node, migrate, hy2, service, audit, node:<имя>,
+        bot — задачи Telegram-бота). None, если занято."""
         with self.lock:
             if self.running:
                 return None
@@ -526,7 +567,10 @@ class Jobs:
         env = dict(os.environ, LC_ALL="C.UTF-8", LANG="C.UTF-8")
         state = "ok"
         try:
-            for label, argv, stdin in steps:
+            for label, argv, stdin, *extra in steps:
+                # iof check выходит с кодом 1, если на узлах проблемы: это итог проверки, а не ошибка.
+                # Но с «Ошибка: …» в выводе (die, n_err) тот же код — настоящая ошибка
+                warn_rc, failed = (extra[0] if extra else ()), False
                 self.say(job, f"$ {label}")
                 p = subprocess.Popen(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                      stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL)
@@ -546,10 +590,13 @@ class Jobs:
                             self.say(job, line)
                         if line.startswith(WARN_LINES):
                             state = "warn"
+                        failed = failed or line.startswith("Ошибка")
                     rc = p.wait()
                 finally:
                     timer.cancel()
-                if rc != 0:
+                if rc != 0 and rc in warn_rc and not failed:
+                    state = "warn"
+                elif rc != 0:
                     self.say(job, f"Команда завершилась с кодом {rc}")
                     state = "error"
                     break
@@ -788,6 +835,32 @@ def audit_steps(iof, body, nodes, migrate):
     return f"{AUDIT_BLOCKS[block]}: {name}", [step(iof, "-n", name, "audit", "run", block)]
 
 
+def check_steps(iof):
+    """Проверка всех узлов, как по cron (команда /check бота, в панели кнопки нет): состояние в state/,
+    итог в check.last, изменения в Telegram. Узлы не меняет, поэтому идёт и во время переноса.
+    Код 1 — на узлах проблемы: задача тогда warn, а не error."""
+    return "Проверка всех узлов (iof check)", [(*step(iof, "check"), (1,))]
+
+
+def action_steps(srv, kind, body):
+    """Кнопки панели и действия Telegram-бота -> (вид задачи, заголовок, шаги). kind: hy2 (группы ссылок),
+    node (действия с узлом), audit (проверка и действия «Безопасности»), check. body — тело запроса
+    страницы. ValueError с текстом для страницы и бота, в том числе при переносе."""
+    migrate = read_migrate(srv.base)
+    if kind == "hy2":
+        return ("hy2", *hy2_steps(srv.iof, body, read_index(srv.base / "hy2" / "index.tsv"), migrate))
+    if kind == "node":
+        name, title, steps = node_steps(srv.iof, body, read_conf(srv.base / "nodes.conf", 4),
+                                        read_relays(srv.base), srv.hy2_template, migrate)
+        return f"node:{name}", title, steps
+    if kind == "audit":
+        names = {r[0] for r in read_conf(srv.base / "nodes.conf", 4)}
+        return ("audit", *audit_steps(srv.iof, body, names, migrate))
+    if kind == "check":
+        return ("check", *check_steps(srv.iof))
+    raise ValueError("неизвестное действие")
+
+
 # Проверка доступности узлов с ПК (iof audit probe). Страница запускает мишени задачей Jobs и
 # получает одноразовый билет. По билету скрипт probe.ps1 забирается один раз (в него вписываются
 # мишени, их отпечатки, токен и сам билет) и один раз сдаёт сырой отчёт. Пароль панели на этих
@@ -940,6 +1013,196 @@ class Probes:
                 "script_at": s["script_at"], "result_at": s["result_at"], "pending": bool(s["pending"]),
             }
         return out
+
+
+# Страница «Телеграм бот». bot.json панель читает сама, а меняет только iof bot, и не задачей Jobs:
+# команды быстрые и узлы не трогают, а настройки не должны ждать, пока идёт hy2 install. Токен уходит
+# в iof bot token через stdin, панель его не отдаёт и не пишет в журнал, от токена только «есть или нет».
+# Код приглашения страница получает один раз, в ответе на POST; на сервере остаётся только его хэш
+
+BOT_ROLES = ("main", "regular")
+BOT_TOKEN = re.compile(r"^[0-9]{1,20}:[A-Za-z0-9_-]{20,100}$")
+BOT_CLOCK = re.compile(r"^([01][0-9]|2[0-3]):[0-5][0-9]$")
+BOT_CODE = re.compile(r"^[0-9a-f]{64}$", re.M)
+BOT_HASH = 12  # знаков хэша приглашения на странице, как в iof bot show: по ним приглашение и отзывают
+# Типы уведомлений, как NOTIFY в BOT_PY iof.sh (сверяет ci/lint.sh); admins — только главным
+BOT_NOTIFY = ("nodes", "audit", "nightly", "updates", "ru", "admins")
+BOT_NOTIFY_MAIN = ("admins",)
+
+
+def bot_kinds(role):
+    return [k for k in BOT_NOTIFY if role == "main" or k not in BOT_NOTIFY_MAIN]
+
+
+def bot_admin(a):
+    username = a.get("username")
+    role = a.get("role") if a.get("role") in BOT_ROLES else "regular"
+    notify = a.get("notify")
+    return {
+        "id": a["id"],
+        "name": a.get("name") if isinstance(a.get("name"), str) else "",
+        "username": username if isinstance(username, str) and re.match(r"^[A-Za-z0-9_]{1,32}$", username) else "",
+        "role": role,
+        "sound": a.get("sound") is True,
+        # null — по умолчанию, то есть ничего; типы, недоступные роли, не приходят и не показываются
+        "notify": [k for k in bot_kinds(role) if k in notify] if isinstance(notify, list) else None,
+        "added": a.get("added") if isinstance(a.get("added"), (int, float)) else None,
+    }
+
+
+def read_bot(base):
+    """bot.json для страницы -> (настройки, ошибка или None). Поля по умолчанию как у iof bot,
+    от приглашения только начало хэша, истёкшие не показываются (iof выбросит их при записи)."""
+    path = base / "bot.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        data = {}
+    except (OSError, ValueError) as e:
+        return None, f"{path} не читается ({e}): исправь его или удали и настрой бота заново"
+    if not isinstance(data, dict):
+        return None, f"{path}: нужен JSON-объект, исправь его или удали"
+    quiet = data.get("quiet")
+    if not (isinstance(quiet, dict) and all(BOT_CLOCK.match(str(quiet.get(k, ""))) for k in ("from", "to"))):
+        quiet = None
+    now = time.time()
+    admins = data.get("admins") if isinstance(data.get("admins"), list) else []
+    invites = data.get("invites") if isinstance(data.get("invites"), list) else []
+    return {
+        "enabled": data.get("enabled") is True,
+        "username": data.get("username") if isinstance(data.get("username"), str) else "",
+        "actions": data.get("actions") is True,
+        "hy2_links": data.get("hy2_links", True) is True,
+        "quiet": {"from": quiet["from"], "to": quiet["to"]} if quiet else None,
+        "admins": [bot_admin(a) for a in admins if isinstance(a, dict) and type(a.get("id")) is int],
+        "invites": sorted(({"hash": str(i.get("hash", ""))[:BOT_HASH],
+                            "role": i.get("role") if i.get("role") in BOT_ROLES else "regular",
+                            "created": i.get("created"), "expires": i["expires"]}
+                           for i in invites if isinstance(i, dict) and isinstance(i.get("expires"), (int, float))
+                           and i["expires"] > now), key=lambda i: i["expires"]),
+    }, None
+
+
+def bot_flag(body, key):
+    v = body.get(key)
+    if not isinstance(v, bool):
+        raise ValueError(f"{key}: true или false")
+    return "on" if v else "off"
+
+
+def bot_admin_id(body):
+    uid = body.get("id")
+    if type(uid) is not int or not 0 < uid < 10 ** 16:
+        raise ValueError("ID админа: число")
+    return str(uid)
+
+
+def bot_args(body):
+    """POST /api/bot -> (аргументы iof bot, stdin или None, токен для вычистки из ответа или "").
+    ValueError с текстом для страницы. iof проверяет всё ещё раз сам."""
+    action = body.get("action")
+    if action == "token":
+        if body.get("delete") is True:
+            return ["token"], b"\n", ""
+        token = body.get("token", "")
+        if not isinstance(token, str) or len(token) > 200:
+            raise ValueError("токен: строка")
+        token = token.strip()
+        if not BOT_TOKEN.match(token):
+            raise ValueError("это не токен бота: он выглядит как 123456789:AAF… (@BotFather, /mybots → API Token)")
+        return ["token"], (token + "\n").encode(), token
+    if action == "enable":
+        return [bot_flag(body, "on")], None, ""
+    if action == "set":
+        key = body.get("key")
+        if key in ("actions", "links"):
+            return ["set", key, bot_flag(body, "on")], None, ""
+        if key == "quiet":
+            value = body.get("value")
+            if value != "off":
+                parts = value.split("-") if isinstance(value, str) else []
+                if len(parts) != 2 or not all(BOT_CLOCK.match(p) for p in parts):
+                    raise ValueError("тихие часы: ЧЧ:ММ-ЧЧ:ММ, например 23:00-08:00, или off")
+                if parts[0] == parts[1]:
+                    raise ValueError("у тихих часов начало и конец совпадают")
+            return ["set", "quiet", value], None, ""
+        raise ValueError("неизвестная настройка")
+    if action == "invite":
+        role = body.get("role")
+        if role not in BOT_ROLES:
+            raise ValueError("роль: main или regular")
+        return ["invite", role], None, ""
+    if action == "invite_del":
+        prefix = text_field(body, "hash", 64).lower()
+        if not re.match(r"^[0-9a-f]{6,64}$", prefix):
+            raise ValueError("хэш приглашения: хотя бы 6 знаков hex")
+        return ["invite", "del", prefix], None, ""
+    if action == "admin_set":
+        uid = bot_admin_id(body)
+        if "role" in body:
+            if body["role"] not in BOT_ROLES:
+                raise ValueError("роль: main или regular")
+            return ["admin", "set", uid, "role", body["role"]], None, ""
+        if "notify" in body:
+            kinds = body["notify"]
+            if not isinstance(kinds, list) or not all(k in BOT_NOTIFY for k in kinds):
+                raise ValueError("уведомления: список типов из " + ", ".join(BOT_NOTIFY))
+            return ["admin", "set", uid, "notify", ",".join(k for k in BOT_NOTIFY if k in kinds) or "off"], None, ""
+        return ["admin", "set", uid, "sound", bot_flag(body, "sound")], None, ""
+    if action == "admin_del":
+        return ["admin", "del", bot_admin_id(body)], None, ""
+    raise ValueError("неизвестное действие")
+
+
+def bot_notify(base):
+    """Куда идут уведомления iof для страниц «Сервис» и «Безопасность»: через бота (включён, есть токен,
+    сервер не принимает управление при переносе) — {username, subs: {тип: сколько админов подписано}},
+    иначе None, и iof шлёт узлы и аудит в TG_CHAT из iof.env, если он задан."""
+    cfg, _ = read_bot(base)
+    try:
+        token = (base / "bot.token").stat().st_size > 0
+    except OSError:
+        token = False
+    if not cfg or not cfg["enabled"] or not token or (read_migrate(base) or {}).get("role") == "target":
+        return None
+    return {"username": cfg["username"],
+            "subs": {k: sum(1 for a in cfg["admins"] if k in (a["notify"] or [])) for k in BOT_NOTIFY}}
+
+
+def read_daily(base):
+    """check.daily (раз в сутки из iof check, key=value) -> {at, updates, ru} или None. updates — сколько
+    коммитов принесёт iof update, None — не проверено; ru — доступ к российским серверам с узлов или None."""
+    try:
+        lines = (base / "check.daily").read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    kv = dict(line.split("=", 1) for line in lines if "=" in line)
+    if not kv.get("time", "").isdigit():
+        return None
+    ru = None
+    if kv.get("ru_time", "").isdigit() and not kv.get("ru_off"):
+        ru = {"at": int(kv["ru_time"]), "nodes": to_int(kv.get("ru_nodes")), "cut": kv.get("ru_cut", "").split(),
+              "noinet": kv.get("ru_noinet", "").split(), "down": kv.get("ru_down", "").split()}
+    return {"at": int(kv["time"]), "updates": to_int(kv["updates"]) if kv.get("updates", "").isdigit() else None,
+            "ru": ru, "ru_off": bool(kv.get("ru_off"))}
+
+
+def iof_bot_cmd(iof, args, stdin):
+    """iof bot <args> -> (вывод, текст ошибки или None). Секреты только в stdin."""
+    env = dict(os.environ, LC_ALL="C.UTF-8", LANG="C.UTF-8")
+    io = {"input": stdin} if stdin is not None else {"stdin": subprocess.DEVNULL}
+    try:
+        p = subprocess.run([iof, "bot", *args], capture_output=True, timeout=40, env=env, **io)
+    except FileNotFoundError:
+        return "", f"не найден {iof}"
+    except subprocess.TimeoutExpired:
+        return "", f"iof bot {args[0]} не уложился в 40 секунд"
+    out = p.stdout.decode("utf-8", "replace")
+    if p.returncode != 0:
+        err = p.stderr.decode("utf-8", "replace").strip().splitlines()
+        line = next((s for s in err if s.startswith("Ошибка: ")), err[-1] if err else f"iof завершился с кодом {p.returncode}")
+        return out, line.removeprefix("Ошибка: ")
+    return out, None
 
 
 # Терминал на узел со страницы узла: xterm.js в браузере, WebSocket к панели, на сервере ssh на узел
@@ -1239,6 +1502,145 @@ class Terminals:
                 pass
 
 
+# Данные страниц. Их же показывает Telegram-бот (BotViews): один разбор на панель и бота
+
+def node_view(srv, name, force):
+    """Страница узла: его состояние из общего опроса, строка nodes.conf, ретрансляторы с ним
+    и есть ли в группах Hysteria2 ссылка на него. Ссылки (в них пароль) не отдаются."""
+    base = srv.base
+    data = srv.cache.get(force)
+    nodes = data.pop("nodes")
+    conf = next(({"name": n, "addr": a, "ssh": s or "local", "title": t or n}
+                 for n, a, s, t in read_conf(base / "nodes.conf", 4) if n == name), None)
+    title = conf["title"] if conf else name
+    groups = [{"name": g["name"], "label": g["label"], "created": g["created"],
+               "has_link": any(not link["relay"] and link["node"] == title for link in g["links"])}
+              for g in read_hy2_groups(base)]
+    data.update({
+        "generated_at": time.time(),
+        "name": name,
+        "conf": conf,
+        "node": next((n for n in nodes if n["name"] == name), None),
+        "relays": [r for r in read_relays(base) if name in (r["node"], r["via"])],
+        "hy2_groups": groups,
+        "hy2_template": srv.hy2_template.is_file(),
+        "busy": srv.jobs.busy(),
+        "terminal": srv.terms.enabled,
+        "migrate": read_migrate(base),
+    })
+    return data
+
+
+def service_view(srv, fetch):
+    """Страница «Сервис»: версия, клон, Telegram и cron от iof, итог iof check и логи ночного
+    обслуживания из файлов. fetch: ещё и git fetch, чтобы узнать, есть ли обновления."""
+    base = srv.base
+    info, error = iof_api(srv.iof, ["api", "service"], 20)
+    data = {
+        "version": info.get("version", ""),
+        "src": info.get("src", ""),
+        "src_version": info.get("src_version", ""),
+        "tg": info.get("tg") == "yes",
+        "bot": bot_notify(base),
+        "cron": info.get("cron", []),
+        "error": error,
+        "check": read_check(base),
+        "daily": read_daily(base),
+        "nightly": read_nightly_run(NIGHTLY_RUN_LOG),
+        "nightly_local": read_nightly_local(NIGHTLY_LOG),
+        "update_log": read_update_log(UPDATE_LOG),
+        "busy": srv.jobs.busy(),
+        "migrate": read_migrate(base),
+    }
+    if fetch:
+        upd, err = iof_api(srv.iof, ["api", "updates"], 60)
+        data["updates"] = {
+            "error": err,
+            "branch": upd.get("branch", ""),
+            "commits": [dict(zip(("hash", "date", "subject"), c.split("\t", 2))) for c in upd.get("commit", [])],
+        }
+    return data
+
+
+def security_view(srv):
+    """Страница «Безопасность»: последние проверки iof audit по блокам и узлам, справочник проверок,
+    история запусков. Узлы не опрашиваются: проверку запускает POST /api/security."""
+    data, error = iof_json(srv.iof, ["api", "audit"], 20)
+    data.update({
+        "error": error,
+        "busy": srv.jobs.busy(),
+        "migrate": read_migrate(srv.base),
+        "probe_state": srv.probes.state(),
+        "bot": bot_notify(srv.base),
+    })
+    return data
+
+
+class BotViews:
+    """Данные страниц для Telegram-бота (iof_bot.Bot, параметр views): модуль бота не импортирует
+    iof-web.py (дефис в имени), а читает всё через этот объект. Ссылки Hysteria2 (в них пароль)
+    отдаёт только hy2_links: у групп из hy2() только число ссылок и узлы."""
+
+    def __init__(self, srv):
+        self.srv = srv
+
+    def nodes(self):
+        """Узлы из nodes.conf без опроса: [{name, addr, title}]."""
+        return [{"name": n, "addr": a, "title": t or n} for n, a, _, t in read_conf(self.srv.base / "nodes.conf", 4)]
+
+    def node(self, name, force=False):
+        return node_view(self.srv, name, force)
+
+    def service(self, fetch=False):
+        return service_view(self.srv, fetch)
+
+    def audit(self):
+        return security_view(self.srv)
+
+    def hy2(self):
+        """Группы ссылок: {name, label, created, hop, links: [{node, relay, hop}]}, без самих ссылок."""
+        return [dict({k: g[k] for k in ("name", "label", "created", "hop")},
+                     links=[{k: link[k] for k in ("node", "relay", "hop")} for link in g["links"]])
+                for g in read_hy2_groups(self.srv.base)]
+
+    def hy2_links(self, name):
+        """Ссылки группы с паролями — только для сообщений админу: {label, links: [{node, relay, url}]}
+        или None, если группы нет."""
+        g = next((g for g in read_hy2_groups(self.srv.base) if g["name"] == name), None)
+        if g is None:
+            return None
+        return {"label": g["label"], "links": [{k: link[k] for k in ("node", "relay", "url")} for link in g["links"]]}
+
+    @staticmethod
+    def qr_png(text):
+        return qr_png(text)
+
+    def migrate(self):
+        return read_migrate(self.srv.base)
+
+
+class BotActions:
+    """Действия Telegram-бота (параметр actions): шаги задач собирает action_steps, как для кнопок
+    панели, с теми же проверками, в том числе запретом при переносе. Задачу в Jobs бот ставит сам,
+    вид bot. Удаление узлов, перенос, iof update, блок-лист и смену портов бот не делает."""
+
+    KINDS = ("hy2", "node", "audit", "check")
+
+    def __init__(self, srv):
+        self.srv = srv
+
+    def plan(self, kind, body):
+        """(kind из KINDS, тело запроса как у страницы) -> (заголовок задачи, шаги). ValueError — почему нельзя."""
+        if kind not in self.KINDS:
+            raise ValueError("неизвестное действие")
+        if kind == "node" and body.get("action") != "restart_hy2":
+            raise ValueError("из бота с узлом можно только перезапустить Hysteria2")
+        if kind == "audit" and body.get("action") is not None:
+            raise ValueError("смена портов и блок-лист — только в панели")
+        _, title, steps = action_steps(self.srv, kind, body)
+        return title, steps
+
+
 def log(text):
     sys.stderr.write(text + "\n")
     sys.stderr.flush()
@@ -1293,6 +1695,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.security_info()
         if url.path == "/api/probe":
             return self.send_json(self.server.probes.state())
+        if url.path == "/api/bot":
+            return self.send_json(self.bot_info())
         if url.path == "/api/jobs":
             return self.send_json({"jobs": self.server.jobs.list()})
         if url.path in STATIC_FILES:
@@ -1312,7 +1716,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self.authorized() or not self.same_origin():
             return
         if path not in ("/api/nodes", "/api/migrate", "/api/hy2", "/api/node", "/api/service", "/api/security",
-                        "/api/term", "/api/probe"):
+                        "/api/term", "/api/probe", "/api/bot"):
             return self.send_json({"error": "не найдено"}, HTTPStatus.NOT_FOUND)
         body = self.read_json()
         if body is None:
@@ -1321,6 +1725,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.term_ticket(body)
         if path == "/api/probe":
             return self.probe_action(body)
+        if path == "/api/bot":
+            return self.bot_action(body)
         try:
             kind, title, steps = self.job_for(path, body)
         except ValueError as e:
@@ -1342,14 +1748,9 @@ class Handler(BaseHTTPRequestHandler):
             return "node", title, steps
         if path == "/api/migrate":
             return ("migrate", *migrate_steps(srv.iof, body, migrate))
-        if path == "/api/hy2":
-            return ("hy2", *hy2_steps(srv.iof, body, read_index(srv.base / "hy2" / "index.tsv"), migrate))
-        if path == "/api/node":
-            name, title, steps = node_steps(srv.iof, body, read_conf(srv.base / "nodes.conf", 4),
-                                            read_relays(srv.base), srv.hy2_template, migrate)
-            return f"node:{name}", title, steps
-        if path == "/api/security":
-            return ("audit", *audit_steps(srv.iof, body, self.node_names(), migrate))
+        kind = {"/api/hy2": "hy2", "/api/node": "node", "/api/security": "audit"}.get(path)
+        if kind:
+            return action_steps(srv, kind, body)
         return ("service", *service_steps(srv.iof, body))
 
     # Защита от DNS rebinding: чужой домен, указывающий на 127.0.0.1, не получит ответ панели
@@ -1458,31 +1859,8 @@ class Handler(BaseHTTPRequestHandler):
         })
         self.send_json(data)
 
-    # Страница узла: его состояние из общего опроса, строка nodes.conf, ретрансляторы с ним
-    # и есть ли в группах Hysteria2 ссылка на него. Ссылки (в них пароль) не отдаются
     def node_info(self, name, force):
-        base = self.server.base
-        data = self.server.cache.get(force)
-        nodes = data.pop("nodes")
-        conf = next(({"name": n, "addr": a, "ssh": s or "local", "title": t or n}
-                     for n, a, s, t in read_conf(base / "nodes.conf", 4) if n == name), None)
-        title = conf["title"] if conf else name
-        groups = [{"name": g["name"], "label": g["label"], "created": g["created"],
-                   "has_link": any(not link["relay"] and link["node"] == title for link in g["links"])}
-                  for g in read_hy2_groups(base)]
-        data.update({
-            "generated_at": time.time(),
-            "name": name,
-            "conf": conf,
-            "node": next((n for n in nodes if n["name"] == name), None),
-            "relays": [r for r in read_relays(base) if name in (r["node"], r["via"])],
-            "hy2_groups": groups,
-            "hy2_template": self.server.hy2_template.is_file(),
-            "busy": self.server.jobs.busy(),
-            "terminal": self.server.terms.enabled,
-            "migrate": read_migrate(base),
-        })
-        self.send_json(data)
+        self.send_json(node_view(self.server, name, force))
 
     # POST /api/term {name, cols, rows}: одноразовый билет на WebSocket терминала узла
     def term_ticket(self, body):
@@ -1525,44 +1903,61 @@ class Handler(BaseHTTPRequestHandler):
         self.log_request(101)
         self.server.terms.run(session, WebSocket(self.rfile, self.wfile), self.connection)
 
-    # Страница «Сервис»: версия, клон, Telegram и cron от iof, итог iof check и логи ночного
-    # обслуживания из файлов. fetch: ещё и git fetch, чтобы узнать, есть ли обновления
     def service_info(self, fetch):
-        base = self.server.base
-        info, error = iof_api(self.server.iof, ["api", "service"], 20)
-        data = {
-            "version": info.get("version", ""),
-            "src": info.get("src", ""),
-            "src_version": info.get("src_version", ""),
-            "tg": info.get("tg") == "yes",
-            "cron": info.get("cron", []),
-            "error": error,
-            "check": read_check(base),
-            "nightly": read_nightly_run(NIGHTLY_RUN_LOG),
-            "nightly_local": read_nightly_local(NIGHTLY_LOG),
-            "update_log": read_update_log(UPDATE_LOG),
-            "busy": self.server.jobs.busy(),
-            "migrate": read_migrate(base),
-        }
-        if fetch:
-            upd, err = iof_api(self.server.iof, ["api", "updates"], 60)
-            data["updates"] = {
-                "error": err,
-                "branch": upd.get("branch", ""),
-                "commits": [dict(zip(("hash", "date", "subject"), c.split("\t", 2))) for c in upd.get("commit", [])],
-            }
-        self.send_json(data)
+        self.send_json(service_view(self.server, fetch))
 
-    # Страница «Безопасность»: последние проверки iof audit по блокам и узлам, справочник проверок,
-    # история запусков. Узлы не опрашиваются: проверку запускает POST /api/security
     def security_info(self):
-        data, error = iof_json(self.server.iof, ["api", "audit"], 20)
-        data.update({
-            "error": error,
-            "busy": self.server.jobs.busy(),
-            "migrate": read_migrate(self.server.base),
-            "probe_state": self.server.probes.state(),
-        })
+        self.send_json(security_view(self.server))
+
+    # Страница «Телеграм бот»: bot.json без хэшей приглашений (только начало), есть ли токен (сам токен
+    # не отдаётся) и состояние потока бота. thread = None — модуль бота не загрузился, причина в thread_error
+    def bot_info(self):
+        srv = self.server
+        cfg, error = read_bot(srv.base)
+        try:
+            token = (srv.base / "bot.token").stat().st_size > 0
+        except OSError:
+            token = False
+        return {
+            "config": cfg,
+            "config_error": error,
+            "token": token,
+            "thread": srv.bot.state() if srv.bot else None,
+            "thread_error": None if srv.bot else srv.bot_error,
+            "tz": time.strftime("%z"),
+            "now": time.time(),
+            "migrate": read_migrate(srv.base),
+        }
+
+    # POST /api/bot {action, ...}: iof bot сразу, без очереди задач. Ответ — первая строка вывода iof
+    # и свежее состояние страницы, на invite ещё код приглашения: единственный раз, больше его нигде нет
+    def bot_action(self, body):
+        srv = self.server
+        try:
+            not_migrating(read_migrate(srv.base))
+            args, stdin, secret = bot_args(body)
+        except ValueError as e:
+            return self.send_json({"error": str(e)}, HTTPStatus.BAD_REQUEST)
+        out, error = iof_bot_cmd(srv.iof, args, stdin)
+        if secret:
+            out, error = out.replace(secret, "***"), error and error.replace(secret, "***")
+        # В журнал только команда: токен уходит в iof через stdin, код приглашения приходит в stdout
+        what = "iof bot " + " ".join(args) + (" (удалить токен)" if args == ["token"] and not secret else "")
+        log(f"бот: из панели {what}" + (f": {error}" if error else ""))
+        if error:
+            return self.send_json({"error": error, "bot": self.bot_info()}, HTTPStatus.BAD_REQUEST)
+        data = {"message": next((s.strip() for s in out.splitlines() if s.strip()), "Готово"), "bot": self.bot_info()}
+        if args[0] == "invite" and args[1] in BOT_ROLES:
+            m = BOT_CODE.search(out)
+            if not m:
+                return self.send_json({"error": "iof bot invite не напечатал код: обнови iof, sudo iof update",
+                                       "bot": data["bot"]}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            code, cfg = m.group(0), data["bot"]["config"] or {}
+            prefix = hashlib.sha256(code.encode()).hexdigest()[:BOT_HASH]
+            inv = next((i for i in cfg.get("invites", []) if i["hash"] == prefix), None)
+            data["message"] = "Приглашение создано"
+            data["invite"] = {"code": code, "role": args[1], "hash": prefix, "expires": inv["expires"] if inv else None,
+                              "link": f"https://t.me/{cfg['username']}?start={code}" if cfg.get("username") else None}
         self.send_json(data)
 
     # POST /api/probe {action: start, nodes, origin} — мишени и билет для ПК; {action: cancel} — остановить.
@@ -1721,6 +2116,22 @@ def main():
 
     srv.jobs = Jobs(on_done=on_done)
     srv.terms = Terminals(os.environ.get("IOF_WEB_TERMINAL", "").strip() == "1", ssh_key)
+
+    # Telegram-бот: поток внутри панели с общей очередью задач и опросом узлов. Работает, когда
+    # включён (iof bot on) и есть токен; адрес Bot API меняет только IOF_TG_API (стенд, CI)
+    # Без бота страница «Телеграм бот» показывает причину из bot_error
+    srv.bot, srv.bot_error = None, None
+    if iof_bot is None:
+        srv.bot_error = f"модуль iof_bot не загрузился: {BOT_IMPORT_ERROR}"
+        log(f"бот: {srv.bot_error}, панель работает без бота")
+    else:
+        try:
+            srv.bot = iof_bot.Bot(srv.base, args.iof, jobs=srv.jobs, cache=srv.cache, views=BotViews(srv),
+                                  actions=BotActions(srv), api=os.environ.get("IOF_TG_API"), log=log)
+            srv.bot.start()
+        except Exception as e:
+            srv.bot, srv.bot_error = None, f"бот не запустился: {type(e).__name__}: {e}"
+            log(f"бот: {srv.bot_error}, панель работает без бота")
     print(f"iof-web: http://{args.listen}/" + ("  (терминал включён)" if srv.terms.enabled else ""), file=sys.stderr)
     try:
         srv.serve_forever()

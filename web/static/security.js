@@ -305,16 +305,17 @@ function renderSchedule() {
   const d = sec.data, s = d.settings;
   const when = s.cron.trim().split(/\s+/).slice(0, 5).join(" ");
   const bwhen = (s.block_cron || "").trim().split(/\s+/).slice(0, 5).join(" ");
+  const [tg, tgHint] = tgView(d.bot, s.tg, "audit", "Аудит");
   $("#sched").innerHTML =
     `<dt>Расписание</dt><dd>${s.cron ? `<code>${esc(when)}</code> · iof audit cron` : badge("warn", "не запланирована")}</dd>
-     <dt>Telegram</dt><dd>${s.tg ? badge("good", "настроен") : badge("none", "не настроен")}</dd>
+     <dt>Telegram</dt><dd>${tg}</dd>
      <dt>Блок-лист</dt><dd>${!s.blocklist ? badge("none", "BLOCKLIST_URL не задан")
        : s.block_cron ? `<code>${esc(bwhen)}</code> · iof block update` : badge("warn", "обновление не запланировано")}</dd>`;
   const hints = [];
   if (!s.cron) hints.push("Раз в сутки, после ночного обслуживания: <code>sudo crontab -e</code>, строка <code>30 5 * * * /usr/local/bin/iof audit cron >/dev/null 2>&1</code>");
   if (s.blocklist && !s.block_cron) hints.push("Список сканеров на узлах обновляется раз в сутки строкой <code>15 5 * * * /usr/local/bin/iof block update >/dev/null 2>&1</code> в <code>sudo crontab -e</code>");
-  if (!s.tg) hints.push("Сообщения о том, что стало хуже: <code>TG_TOKEN</code> и <code>TG_CHAT</code> в <code>/root/iof/iof.env</code>");
-  else hints.push("В Telegram уходит сообщение, только когда проверка из cron оказалась хуже прошлой.");
+  if (tgHint) hints.push(tgHint);
+  if (d.bot || s.tg) hints.push("В Telegram уходит сообщение, только когда проверка из cron оказалась хуже прошлой.");
   $("#sched-hint").hidden = !hints.length;
   $("#sched-hint").innerHTML = hints.join("<br>");
 
@@ -1106,6 +1107,7 @@ function demoAudit() {
       block_cron: "15 5 * * * /usr/local/bin/iof block update >/dev/null 2>&1", blocklist: true },
     probe: demoProbeData(),
     probe_state: demoProbeState(),
+    bot: { username: "island_of_freedom_bot", subs: { nodes: 2, audit: 1, nightly: 0, updates: 1, ru: 2, admins: 1 } },
     error: null,
     busy: false,
     migrate: null,

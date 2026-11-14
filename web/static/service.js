@@ -102,17 +102,38 @@ function renderCheck() {
     const when = new Date(c.at * 1000).toLocaleString("ru-RU", { dateStyle: "short", timeStyle: "short" });
     last = `${when}${stale}<span class="sub-line">${res}</span>`;
   }
+  const [tg, tgHint] = tgView(i.bot, i.tg, "nodes", "Узлы");
   $("#check").innerHTML = kv([
     ["Расписание", cron ? cronCell(cron) : badge("warn", "не запланирована")],
-    ["Telegram", i.tg ? badge("good", "настроен") : badge("none", "не настроен")],
+    ["Telegram", tg],
     ["Последняя", last],
+    ["Раз в сутки", dailyCell(i.daily)],
   ]);
   const hints = [];
   if (!cron) hints.push("Добавить в cron: <code>sudo crontab -e</code>, строка <code>*/5 * * * * /usr/local/bin/iof check >/dev/null 2>&1</code>");
-  if (!i.tg) hints.push("Уведомления о проблемах и восстановлении узлов: <code>TG_TOKEN</code> и <code>TG_CHAT</code> в <code>/root/iof/iof.env</code>");
-  if (i.tg && c) hints.push("В Telegram уходит сообщение, только когда состояние узла меняется.");
+  if (tgHint) hints.push(tgHint);
+  if ((i.bot || i.tg) && c) hints.push("В Telegram уходит сообщение, только когда состояние узла меняется.");
+  hints.push("Раз в сутки <code>iof check</code> ещё проверяет, вышла ли новая версия iof и отвечают ли с узлов российские серверы (<code>RU_TARGETS</code> в <code>/root/iof/iof.env</code>): об этом бот пишет тем, кому отмечены «Обновления iof» и «Доступ к РФ». Сейчас: <code>sudo iof check --daily</code>.");
   $("#check-hint").hidden = !hints.length;
   $("#check-hint").innerHTML = hints.join("<br>");
+}
+
+// Ежедневная часть iof check: когда была, обновления iof, доступ к российским серверам с узлов
+function dailyCell(d) {
+  if (!d) return '<span class="muted">ещё не было</span>';
+  const when = new Date(d.at * 1000).toLocaleString("ru-RU", { dateStyle: "short", timeStyle: "short" });
+  const lines = [];
+  if (d.updates === null) lines.push(badge("none", "обновления не проверены"));
+  else lines.push(d.updates ? badge("warn", `вышла новая версия: ${d.updates} ${plural(d.updates, ["коммит", "коммита", "коммитов"])}`) : badge("good", "обновлений нет"));
+  const ru = d.ru;
+  if (d.ru_off) lines.push(badge("none", "доступ к РФ не проверяется: RU_TARGETS пуст"));
+  else if (ru) {
+    if (ru.cut.length) lines.push(badge("crit", `РФ недоступна с: ${ru.cut.join(", ")}`));
+    if (ru.noinet.length) lines.push(badge("warn", `нет интернета: ${ru.noinet.join(", ")}`));
+    if (!ru.cut.length && !ru.noinet.length) lines.push(badge("good", `российские серверы отвечают с узлов: ${ru.nodes}`));
+    if (ru.down.length) lines.push(badge("none", `не проверены, нет связи: ${ru.down.join(", ")}`));
+  }
+  return `${when}${lines.map((l) => `<span class="sub-line">${l}</span>`).join("")}`;
 }
 
 function renderNightly() {
@@ -124,9 +145,12 @@ function renderNightly() {
     const res = !n.summary ? badge("warn", "итога в логе нет") : m && +m[1] ? badge("warn", n.summary.replace("Выполнено", "запущено")) : badge("good", n.summary.replace("Выполнено", "запущено"));
     last = `${fmtStamp(n.started)}<span class="sub-line">${res}</span>`;
   }
+  // Итог запуска приходит только через бота: в TG_CHAT без бота уходят лишь узлы и аудит
+  const [tg, tgHint] = tgView(i.bot, false, "nightly", "Ночное обслуживание");
   const rows = [
     ["Расписание", cron ? cronCell(cron) : badge("warn", "не запланировано")],
     ["Последний запуск", last],
+    ["Telegram", tg],
   ];
   if (local) {
     const steps = local.steps.map((s) => {
@@ -139,6 +163,7 @@ function renderNightly() {
   const hints = [];
   if (!cron) hints.push("Добавить в cron: <code>sudo crontab -e</code>, строка <code>0 4 * * * /usr/local/sbin/iof-nightly</code>");
   if (n) hints.push("Здесь видно, на скольких узлах запустилось обновление и перезагрузка. Как прошло на узле — в его <code>/var/log/iof-nightly.log</code>");
+  if (cron && tgHint) hints.push(tgHint);
   $("#nightly-hint").hidden = !hints.length;
   $("#nightly-hint").innerHTML = hints.join("<br>");
   $("#nightly-more").hidden = !n;

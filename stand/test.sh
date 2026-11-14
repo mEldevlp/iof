@@ -5,7 +5,9 @@
 # пересылает трафик, смена портов Hysteria2 включается и выключается (клиент ходит по ссылке со списком
 # портов), аудит безопасности видит изменения на узле (в том числе расхождение конфига Hysteria2
 # с шаблоном в блоке dpi), блок-лист отбрасывает пакеты с адресов из списка и не трогает защищённые,
-# действия запрещены во время переноса, мишени проверки с ПК отвечают только с токеном, готовый отчёт
+# действия запрещены во время переноса, Telegram-бот панели через поддельный Bot API принимает коды
+# приглашений, молчит чужим, показывает состояние, выполняет действия после подтверждения, выдаёт
+# ссылки Hysteria2 с QR и шлёт уведомления подписанным админам, мишени проверки с ПК отвечают только с токеном, готовый отчёт
 # даёт ожидаемые оценки, мишени исчезают по сроку; панель отвечает, отбивает чужие
 # запросы, выполняет задачи, выдаёт скрипт для ПК по билету и открывает терминал на каждый узел
 # (stand.sh setup включает его в web.env). Созданные группы ссылок и ретранслятор удаляются,
@@ -22,6 +24,7 @@ PROBE_URL="${PROBE_URL:-http://connectivitycheck.gstatic.com/generate_204}"
 GROUP="CI проверка"
 PANEL_GROUP="CI панель"
 HOP_GROUP="CI смена портов"
+BOT_GROUP="CI бот"
 export MSYS_NO_PATHCONV=1
 
 PASSED=0
@@ -35,6 +38,7 @@ PROBE_PY=()         # узлы с python3: на них поднимаются м
 HOP_LEFT=0          # 1 — могла остаться смена портов на узлах и группа со списком портов
 BLOCK_LEFT=""       # «узел|сервер с тестовыми адресами»: там мог остаться блок-лист
 GUARD_LEFT=0        # 1 — на управляющем сервере остался поддельный migrate.conf
+BOT_LEFT=0          # 1 — bot.json и bot.token заменены проверкой бота, прежние лежат в /root/.iof-test-bot
 NAMES=()
 declare -A ADDR=()
 
@@ -62,6 +66,10 @@ cleanup() {
   if (( GUARD_LEFT )); then
     echo "Убираю поддельный migrate.conf"
     on "$M" rm -f /root/iof/migrate.conf || true
+  fi
+  if (( BOT_LEFT )); then
+    echo "Возвращаю настройки бота как были"
+    bot_restore
   fi
   if (( HOP_LEFT )); then
     echo "Выключаю смену портов и убираю группу «$HOP_GROUP»"
@@ -174,6 +182,16 @@ hop_flows() {
 # Доходит ли TCP с сервера $1 до порта 22 сервера $2, $3 — ключи curl (например, --interface адрес)
 reach() {
   on "$1" bash -c "curl -sv -m 3 $3 telnet://$2:22 </dev/null 2>&1 | grep -q 'Connected to'"
+}
+
+# То же с адреса $3, который висит на сервере $1 только на время захода. Иначе, если $1 — управляющий
+# сервер (в CI другого нет), iof block взял бы и этот адрес в «не блокировать» вместе с hostname -I
+reach_from() {
+  local rc=0
+  on "$1" ip addr add "$3/32" dev eth0 >/dev/null 2>&1 || true
+  reach "$1" "$2" "--interface $3" || rc=1
+  on "$1" ip addr del "$3/32" dev eth0 >/dev/null 2>&1 || true
+  return "$rc"
 }
 
 # Задача панели: POST /api/security с телом $1 (JSON) на управляющем сервере, ждёт её конца.
@@ -509,8 +527,9 @@ block_restore() {
     rm -f /root/iof/audit/cache/blocklist.txt*' >/dev/null 2>&1 || true
 }
 
-# Блок-лист сканеров на первом узле, который не управляющий сервер. У другого сервера стенда два внешних
-# адреса: 1.2.3.4 из списка и 1.2.3.5 из BLOCK_ALLOW, узел ходит к ним через этот сервер. Список
+# Блок-лист сканеров на первом узле, который не управляющий сервер. Другой сервер стенда на время каждого
+# захода получает внешний адрес: 1.2.3.4 из списка или 1.2.3.5 из BLOCK_ALLOW, узел ходит к ним через этот
+# сервер. Список
 # (с частными сетями, IPv6, слишком широкими записями и мусором, их iof пропускает) раздаёт управляющий
 # сервер python3 -m http.server на 127.0.0.1. Пакеты с 1.2.3.4 узел отбрасывает, с остальных — нет,
 # после перезапуска службы список на месте, update без изменений ничего не меняет, снятие убирает всё
@@ -533,7 +552,6 @@ printf 'BLOCKLIST_URL="http://127.0.0.1:8765/list.txt"\nBLOCK_ALLOW="1.2.3.5"\n'
 rm -f /root/iof/audit/cache/blocklist.txt*
 sleep 1
 EOF
-  on "$src" bash -c 'ip addr add 1.2.3.4/32 dev eth0; ip addr add 1.2.3.5/32 dev eth0' >/dev/null 2>&1 || true
   on "$node" ip route replace 1.2.3.0/24 via "${ADDR[$src]}"
 
   if out="$(iofm block on "$node" 2>&1)" && grep -q "^  $node: записей 1," <<<"$out"; then
@@ -557,13 +575,13 @@ EOF
   if [[ "$got" == ok ]]; then ok "$node: не блокируются узлы из nodes.conf, управляющий сервер ($me) и BLOCK_ALLOW"
   else fail "$node: в block.allow $got"; fi
 
-  if ! reach "$src" "${ADDR[$node]}" "--interface 1.2.3.4"; then ok "$node отбрасывает пакеты с 1.2.3.4 (в списке)"; else fail "$node принимает пакеты с 1.2.3.4"; fi
-  if reach "$src" "${ADDR[$node]}" "--interface 1.2.3.5"; then ok "$node принимает 1.2.3.5 (BLOCK_ALLOW)"; else fail "$node отбрасывает 1.2.3.5 из BLOCK_ALLOW"; fi
+  if ! reach_from "$src" "${ADDR[$node]}" 1.2.3.4; then ok "$node отбрасывает пакеты с 1.2.3.4 (в списке)"; else fail "$node принимает пакеты с 1.2.3.4"; fi
+  if reach_from "$src" "${ADDR[$node]}" 1.2.3.5; then ok "$node принимает 1.2.3.5 (BLOCK_ALLOW)"; else fail "$node отбрасывает 1.2.3.5 из BLOCK_ALLOW"; fi
   if reach "$src" "${ADDR[$node]}" ""; then ok "$node принимает $src с его адреса из nodes.conf"; else fail "$node отбрасывает $src"; fi
   if reach "$M" "${ADDR[$node]}" ""; then ok "$node принимает управляющий сервер $M"; else fail "$node отбрасывает управляющий сервер"; fi
 
   out="$(on "$node" bash -c 'systemctl restart iof-block && ipset list -t iof-block | sed -n "s/^Number of entries: //p"; iptables -w -t raw -C PREROUTING -j IOF-BLOCK && echo hook')"
-  if [[ "$out" == $'1\nhook' ]] && ! reach "$src" "${ADDR[$node]}" "--interface 1.2.3.4"; then
+  if [[ "$out" == $'1\nhook' ]] && ! reach_from "$src" "${ADDR[$node]}" 1.2.3.4; then
     ok "$node: после перезапуска iof-block список на месте"
   else
     fail "$node после перезапуска iof-block: $(paste -sd' ' - <<<"$out")"
@@ -585,7 +603,7 @@ EOF
     fail "панель: снятие блок-листа с $node: $(paste -sd' ' - <<<"$got")"
     details "$out"
   fi
-  if reach "$src" "${ADDR[$node]}" "--interface 1.2.3.4"; then ok "$node после снятия принимает 1.2.3.4"; else fail "$node после снятия отбрасывает 1.2.3.4"; fi
+  if reach_from "$src" "${ADDR[$node]}" 1.2.3.4; then ok "$node после снятия принимает 1.2.3.4"; else fail "$node после снятия отбрасывает 1.2.3.4"; fi
   got="$(audit_get "$node" blocklist dpi)"
   if [[ "$got" == warn*"не применён"* ]]; then ok "dpi $node после снятия: $got"; else fail "dpi $node после снятия: «$got»"; fi
   block_restore "$node" "$src"
@@ -613,6 +631,1203 @@ check_guard() {
   if out="$(iofm -n "$n" audit run dpi 2>&1)"; then ok "во время переноса: iof audit run разрешена"; else fail "audit run во время переноса"; details "$out"; fi
   on "$M" rm -f /root/iof/migrate.conf
   GUARD_LEFT=0
+}
+
+# Копии bot.json и bot.token до проверки бота, после неё всё возвращается как было. Уведомления меняют
+# ещё iof.env (TG_TOKEN, RU_TARGETS, IOF_SRC), check.daily и состояние доступа к РФ в /root/iof/ru
+bot_save() {
+  on "$M" bash -c 'rm -rf /root/.iof-test-bot && mkdir -m 700 /root/.iof-test-bot
+    for f in bot.json bot.token iof.env check.daily check.last; do if [[ -f /root/iof/$f ]]; then cp -p /root/iof/$f /root/.iof-test-bot/; fi; done
+    if [[ -d /root/iof/state ]]; then cp -a /root/iof/state /root/.iof-test-bot/state; fi
+    if [[ -d /root/iof/ru ]]; then cp -a /root/iof/ru /root/.iof-test-bot/ru; fi'
+  BOT_LEFT=1
+}
+
+bot_restore() {
+  on "$M" bash -c 'for f in bot.json bot.token iof.env check.daily check.last; do
+      rm -f /root/iof/$f
+      if [[ -f /root/.iof-test-bot/$f ]]; then cp -p /root/.iof-test-bot/$f /root/iof/$f; fi
+    done
+    rm -rf /root/iof/ru /root/iof-test-upd /root/iof/state
+    if [[ -d /root/.iof-test-bot/state ]]; then cp -a /root/.iof-test-bot/state /root/iof/state; fi
+    if [[ -d /root/.iof-test-bot/ru ]]; then cp -a /root/.iof-test-bot/ru /root/iof/ru; fi
+    rm -rf /root/.iof-test-bot
+    # Узел с длинным именем из проверки кнопок бота
+    sed -i "/^ci-bot-long-/d" /root/iof/nodes.conf
+    # qrencode, убранный для проверки ссылок без QR
+    for f in /usr/bin/qrencode.iof-test /usr/local/bin/qrencode.iof-test; do
+      if [[ -e $f ]]; then mv "$f" "${f%.iof-test}"; fi
+    done' || true
+  # Группа, которую создаёт бот
+  if on "$M" cut -f2 /root/iof/hy2/index.tsv 2>/dev/null | grep -qxF "$BOT_GROUP"; then
+    iofm hy2 del "$BOT_GROUP" >/dev/null 2>&1 || true
+  fi
+  BOT_LEFT=0
+}
+
+# Telegram-бот панели через поддельный Bot API (stand/fake-tg.py, его ставит stand.sh setup на old):
+# iof bot token (неверный и верный), on без токена, бот опрашивает API и ставит меню команд; чужому
+# не отвечает, на неверный код отвечает «не подошёл»; приглашение верное, повторное, просроченное,
+# по ссылке /start <код>, из группового чата; старое сообщение пропускается; админу отвечает на /start
+# и /help, в группе не отвечает и ему; настройки и админы меняются командой; 409 от второго опроса
+# пишется в журнал, и бот продолжает работать; при переносе изменения и коды отказаны, на сервере,
+# принимающем управление, бот не опрашивает API; выключение и удаление токена. Страница «Телеграм бот»:
+# /api/bot без токена и хэшей, настройки, приглашение и отзыв, админы, токен и выключатель через панель,
+# при переносе панель изменения не принимает. Команды просмотра (/status, /node, /audit, /service, /hy2):
+# кнопки узлов и «Обновить» (editMessageText того же сообщения), answerCallbackQuery, нажатия чужого и в
+# группе без ответа, узел с длинным именем (хэш в callback_data) и кнопка удалённого узла, в ответах нет
+# паролей Hysteria2. Действия: отказ при выключенных действиях и обычному админу, кнопки только главному,
+# подтверждение и отмена, повторное, чужое, истёкшее нажатие и после перезапуска панели, занятая очередь,
+# ход задачи правками одного сообщения, перенос (check разрешён), перезапуск Hysteria2 и проверка узла,
+# группа $BOT_GROUP создаётся и удаляется из бота, её ссылки с QR и без qrencode, выдача ссылок выключена;
+# паролей Hysteria2 нет в журнале и логах задач. Уведомления: только подписанным и только типы роли, набор из
+# iof bot и из панели, тихие часы и звук, новый админ, iof check, доступ к РФ и новая версия iof из ежедневной
+# части iof check, нет связи с Bot API, старый путь TG_TOKEN без бота. Токен не попадает в журналы, bot.json
+# и iof bot show
+check_bot() {
+  local out rc
+  if on "$M" test -f /root/iof/migrate.conf; then echo "      идёт настоящий перенос, проверку бота пропускаю"; return 0; fi
+  if ! on "$M" bash -c 'systemctl is-active --quiet fake-tg && grep -qx "IOF_TG_API=http://127.0.0.1:8089" /root/iof/web.env'; then
+    echo "      на $M нет поддельного Bot API (его ставит stand.sh setup на old), проверку бота пропускаю"
+    return 0
+  fi
+  bot_save
+  GUARD_LEFT=1
+  out="$(on_in "$M" python3 - "$BOT_GROUP" 2>&1 <<'PY'
+import glob, hashlib, json, os, re, shutil, subprocess, sys, time, urllib.error, urllib.request
+from html import escape
+
+FAKE = "http://127.0.0.1:8089"
+PANEL = "http://127.0.0.1:8088"
+POST = {"X-IOF-Request": "1", "Content-Type": "application/json", "Origin": PANEL}
+# Токены для поддельного API: номер 0 он считает отозванным. Настоящего токена здесь нет
+TOKEN = "777000:AAEstandFakeTokenForIofBotTests_x1"
+BAD_TOKEN = "0:AAEstandFakeTokenRevokedXXXXXXXXXX"
+BOT_JSON, BOT_TOKEN, MIGRATE = "/root/iof/bot.json", "/root/iof/bot.token", "/root/iof/migrate.conf"
+T0 = time.time()
+
+
+def report(good, text):
+    print(("ok" if good else "fail") + "\t" + text, flush=True)
+
+
+def iof(*args, stdin=""):
+    p = subprocess.run(["iof", "bot", *args], input=stdin.encode(), capture_output=True, timeout=60)
+    return p.returncode, p.stdout.decode("utf-8", "replace"), p.stderr.decode("utf-8", "replace")
+
+
+def fake(path, body=None):
+    data = json.dumps(body).encode() if body is not None else None
+    r = urllib.request.Request(FAKE + path, data=data, method="POST" if data else "GET",
+                               headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(r, timeout=20) as resp:
+        return json.loads(resp.read())
+
+
+def panel(path, body=None, headers=None):
+    """Запрос к панели: без тела GET, с телом POST с обычной защитой. -> (код, JSON-ответ)."""
+    data = json.dumps(body).encode() if body is not None else None
+    r = urllib.request.Request(PANEL + path, data=data, method="POST" if data else "GET",
+                               headers=headers if headers is not None else (POST if data else {}))
+    try:
+        with urllib.request.urlopen(r, timeout=60) as resp:
+            return resp.status, json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read() or b"{}")
+        except ValueError:
+            return e.code, {}
+
+
+def thread_state(want, timeout=20):
+    """Поток бота в /api/bot пришёл в состояние want."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if (panel("/api/bot")[1].get("thread") or {}).get("state") == want:
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def cfg():
+    with open(BOT_JSON, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def admin(uid):
+    return next((a for a in cfg()["admins"] if a["id"] == uid), None)
+
+
+def code_of(out):
+    m = re.search(r"^([0-9a-f]{64})$", out, re.M)
+    return m.group(1) if m else ""
+
+
+def say(uid, text, wait=True, **kw):
+    """Сообщение боту от uid. Ждёт, пока бот подтвердит апдейт (обработал его) -> тексты ответов бота,
+    None — не подтвердил за 20 с. wait=False: не ждать, (номер апдейта, номер последнего вызова)."""
+    before = fake("/fake/state")["sent"]
+    upd = fake("/fake/message", {"from_id": uid, "text": text, **kw})["update_id"]
+    if not wait:
+        return upd, before
+    return replies(upd, before, 20)
+
+
+def replies(upd, before, timeout):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if fake("/fake/state")["offset"] > upd:
+            return [s["params"].get("text", "") for s in fake(f"/fake/sent?after={before}") if s["method"] == "sendMessage"]
+        time.sleep(0.3)
+    return None
+
+
+def first(r):
+    return r[0] if r else ""
+
+
+def journal():
+    p = subprocess.run(["journalctl", "-u", "iof-web", "-u", "fake-tg", "--since", f"@{int(T0) - 1}", "-o", "cat", "--no-pager"],
+                       capture_output=True, timeout=30)
+    return p.stdout.decode("utf-8", "replace")
+
+
+def in_journal(text, timeout=5):
+    """Строка появилась в журнале: journald пишет его с небольшой задержкой."""
+    deadline = time.time() + timeout
+    while True:
+        if text in journal():
+            return True
+        if time.time() > deadline:
+            return False
+        time.sleep(0.5)
+
+
+def polling(timeout=20):
+    """Бот ждёт ответа на getUpdates."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if fake("/fake/state")["waiting"] > 0:
+            return True
+        time.sleep(0.3)
+    return False
+
+
+def quiet(seconds=5):
+    """Бот не опрашивает API: никто не ждёт getUpdates и новых опросов за seconds секунд нет."""
+    deadline = time.time() + 15
+    while time.time() < deadline and fake("/fake/state")["waiting"] > 0:
+        time.sleep(0.5)
+    polls = fake("/fake/state")["polls"]
+    time.sleep(seconds)
+    st = fake("/fake/state")
+    return st["waiting"] == 0 and st["polls"] == polls
+
+
+def check_page():
+    """Страница «Телеграм бот»: /api/bot без токена и хэшей приглашений; настройки, приглашение и его
+    отзыв, админы, токен и выключатель через POST /api/bot. Бот включён, токен TOKEN, админ 5001."""
+    secret = TOKEN.split(":", 1)[1]
+    code, data = panel("/api/bot")
+    c = data.get("config") or {}
+    report(code == 200 and data.get("token") is True and (data.get("thread") or {}).get("state") == "running"
+           and c.get("enabled") is True and c.get("username") == "iof_stand_bot" and any(a["id"] == 5001 for a in c.get("admins", [])),
+           f"панель: /api/bot ({code}) — токен есть, бот работает, админы на месте")
+    report(secret not in json.dumps(data), "панель: токена нет в /api/bot")
+
+    codes = [panel("/api/bot", {"action": "set", "key": "actions", "on": False})[0],
+             panel("/api/bot", {"action": "set", "key": "links", "on": True})[0],
+             panel("/api/bot", {"action": "set", "key": "quiet", "value": "22:30-07:00"})[0]]
+    c = cfg()
+    report(codes == [200, 200, 200] and c["actions"] is False and c["hy2_links"] is True and c["quiet"] == {"from": "22:30", "to": "07:00"},
+           f"панель: настройки бота — действия, ссылки, тихие часы ({codes})")
+    code, _ = panel("/api/bot", {"action": "set", "key": "quiet", "value": "25:00-07:00"})
+    report(code == 400 and cfg()["quiet"] == {"from": "22:30", "to": "07:00"}, f"панель: неверные тихие часы не приняты ({code})")
+    code, _ = panel("/api/bot", {"action": "set", "key": "quiet", "value": "off"})
+    report(code == 200 and cfg()["quiet"] is None, "панель: тихие часы выключены")
+    code, _ = panel("/api/bot", {"action": "set", "key": "actions", "on": True}, {"Content-Type": "application/json"})
+    report(code == 403 and cfg()["actions"] is False, f"панель: изменение бота без X-IOF-Request отклонено ({code})")
+
+    code, data = panel("/api/bot", {"action": "invite", "role": "main"})
+    inv = data.get("invite") or {}
+    pcode = inv.get("code", "")
+    h = hashlib.sha256(pcode.encode()).hexdigest()
+    report(code == 200 and re.fullmatch(r"[0-9a-f]{64}", pcode) is not None and inv.get("role") == "main"
+           and inv.get("link") == f"https://t.me/iof_stand_bot?start={pcode}" and any(i["hash"] == h for i in cfg()["invites"]),
+           "панель: приглашение создано — код из 64 знаков, ссылка t.me, в bot.json его хэш")
+    code, data = panel("/api/bot")
+    raw = json.dumps(data)
+    report([i["hash"] for i in (data.get("config") or {}).get("invites", [])] == [h[:12]] and pcode not in raw and h not in raw,
+           "панель: в /api/bot у приглашения только начало хэша, кода нет")
+    code, _ = panel("/api/bot", {"action": "invite_del", "hash": h[:12]})
+    r = say(5006, pcode)
+    report(code == 200 and not cfg()["invites"] and "не подошёл" in first(r) and admin(5006) is None,
+           "панель: приглашение отозвано, код больше не принимается")
+    code, data = panel("/api/bot", {"action": "invite", "role": "regular"})
+    pcode2 = (data.get("invite") or {}).get("code", "")
+    r = say(5006, pcode2)
+    report(code == 200 and "обычный" in first(r) and (admin(5006) or {}).get("role") == "regular",
+           "панель: по коду из панели бот добавил админа с ролью «обычный»")
+    report(pcode not in journal() and pcode2 not in journal(), "панель: кодов приглашений нет в журнале")
+
+    c1 = panel("/api/bot", {"action": "admin_set", "id": 5006, "role": "main"})[0]
+    c2 = panel("/api/bot", {"action": "admin_set", "id": 5006, "sound": True})[0]
+    a = admin(5006) or {}
+    report(c1 == 200 and c2 == 200 and a.get("role") == "main" and a.get("sound") is True, "панель: роль и звук в тихие часы у админа")
+    code, _ = panel("/api/bot", {"action": "admin_del", "id": 5006})
+    report(code == 200 and admin(5006) is None, "панель: админ удалён")
+    code, data = panel("/api/bot", {"action": "admin_del", "id": 9999})
+    report(code == 400 and "нет" in data.get("error", ""), f"панель: удаление неизвестного админа отклонено ({code})")
+
+    code, data = panel("/api/bot", {"action": "token", "token": BAD_TOKEN})
+    report(code == 400 and "не принял" in data.get("error", "") and open(BOT_TOKEN).read().strip() == TOKEN,
+           "панель: отозванный токен не принят, прежний на месте")
+    code, data = panel("/api/bot", {"action": "token", "token": TOKEN})
+    report(code == 200 and (data.get("bot") or {}).get("token") is True and secret not in json.dumps(data),
+           "панель: токен принят (iof bot token со stdin), в ответе его нет")
+    code, _ = panel("/api/bot", {"action": "enable", "on": False})
+    report(code == 200 and quiet() and cfg()["enabled"] is False and thread_state("off"), "панель: бот выключен и не опрашивает API")
+    code, _ = panel("/api/bot", {"action": "enable", "on": True})
+    report(code == 200 and polling() and thread_state("running"), "панель: бот включён и снова опрашивает API")
+
+
+def calls(before):
+    return fake(f"/fake/sent?after={before}")
+
+
+def wait_calls(before, done, timeout=90):
+    """Вызовы бота после before, как только done(вызовы) истинно (или по таймауту). Команды просмотра
+    бот выполняет в отдельном потоке, поэтому ответ приходит позже подтверждения апдейта."""
+    deadline = time.time() + timeout
+    while True:
+        got = calls(before)
+        if done(got) or time.time() > deadline:
+            return got
+        time.sleep(0.3)
+
+
+def text_of(c):
+    return str(c["params"].get("text", ""))
+
+
+def buttons(c):
+    markup = c["params"].get("reply_markup") or {}
+    return [b for row in markup.get("inline_keyboard", []) for b in row]
+
+
+def msg_id(c):
+    """Номер сообщения, которое показывает вызов: у правки — исправленное, у отправки — новое."""
+    return int(c["params"]["message_id"]) if c["method"] == "editMessageText" else c["message_id"]
+
+
+def last_with(got, needle, method=("sendMessage", "editMessageText")):
+    return next((c for c in reversed(got) if c["method"] in method and needle in text_of(c)), None)
+
+
+def ask(uid, text, needle, timeout=90, absent=None):
+    """Команда от uid, ждёт ответ (новый или исправленный), где есть needle и нет absent -> (все вызовы, ответ)."""
+    before = fake("/fake/state")["sent"]
+    fake("/fake/message", {"from_id": uid, "text": text})
+
+    def done(got):
+        c = last_with(got, needle)
+        return c is not None and not (absent and absent in text_of(c))
+    got = wait_calls(before, done, timeout)
+    return got, last_with(got, needle)
+
+
+def press(uid, mid, data, chat_type="private"):
+    """Нажатие кнопки data под сообщением бота mid -> (номер апдейта, номер последнего вызова, id нажатия)."""
+    before = fake("/fake/state")["sent"]
+    user = {"id": uid, "is_bot": False, "first_name": f"User{uid}", "username": f"user{uid}"}
+    chat = ({"id": uid, "type": "private", "first_name": user["first_name"]} if chat_type == "private"
+            else {"id": -1000000000000 - uid, "type": chat_type, "title": "Stand group"})
+    qid = f"{uid}{time.time_ns()}"
+    q = {"id": qid, "from": user, "chat_instance": "1", "data": data,
+         "message": {"message_id": mid, "chat": chat, "date": int(time.time()), "text": "…",
+                     "from": {"id": 777000, "is_bot": True, "first_name": "iof stand", "username": "iof_stand_bot"}}}
+    upd = fake("/fake/update", {"callback_query": q})["update_id"]
+    return upd, before, qid
+
+
+def answered(got, qid):
+    return next((c for c in got if c["method"] == "answerCallbackQuery" and c["params"].get("callback_query_id") == qid), None)
+
+
+def node_names():
+    names = []
+    for line in open("/root/iof/nodes.conf", encoding="utf-8"):
+        name = line.split("|")[0].strip()
+        if name and not name.startswith("#"):
+            names.append(name)
+    return names
+
+
+def hy2_secrets():
+    """Пароли из ссылок групп Hysteria2 (часть после «логин:» или весь пароль). Короткие не берутся:
+    логин бывает и в подписи группы."""
+    out = set()
+    for path in glob.glob("/root/iof/hy2/*.txt"):
+        for line in open(path, encoding="utf-8"):
+            if line.startswith("hy2://") and "@" in line:
+                auth = line[6:line.rindex("@")]
+                out |= {p for p in (auth, auth.split(":", 1)[-1]) if len(p) >= 8}
+    return out
+
+
+LONG = "ci-bot-long-" + "x" * 60
+
+
+def check_views():
+    """Команды просмотра (этап 3): /status с кнопками узлов и «Обновить», карточка узла и её «Обновить»
+    (editMessageText), /node с неизвестным узлом, /audit, /service, /hy2, /help; нажатия чужого и в группе
+    без ответа; узел с длинным именем (callback_data с хэшем) и устаревшая кнопка. Админ 5001, роль обычный."""
+    start = fake("/fake/state")["sent"]
+    names = node_names()
+    first_node = names[0]
+
+    # Первый /status: кэш опроса узлов к этому времени устарел (больше IOF_WEB_TTL без опроса), поэтому
+    # сначала «опрашиваю узлы…», потом то же сообщение исправлено
+    got, st = ask(5001, "/status", "<b>Узлы:")
+    keys = [b.get("callback_data", "") for b in buttons(st)] if st else []
+    report(st is not None and f"Узлы: {len(names)}" in text_of(st) and "в порядке" in text_of(st)
+           and all(f"n:{n}" in keys for n in names) and keys[-1:] == ["st"],
+           f"/status: узлов {len(names)}, кнопка на каждый узел и «Обновить»")
+    wait = next((c for c in got if c["method"] == "sendMessage" and "Опрашиваю узлы" in text_of(c)), None)
+    report(wait is not None and st is not None and st["method"] == "editMessageText" and msg_id(st) == wait["message_id"],
+           "/status: пока идёт опрос — «Опрашиваю узлы…», потом то же сообщение исправлено")
+    status_mid = msg_id(st) if st else 0
+
+    upd, before, qid = press(5001, status_mid, f"n:{first_node}")
+    got = wait_calls(before, lambda g: last_with(g, "Нагрузка") is not None)
+    card = last_with(got, "Нагрузка")
+    report(answered(got, qid) is not None, "кнопка узла: answerCallbackQuery")
+    report(card is not None and card["method"] == "sendMessage" and f"<b>{first_node}</b>" in text_of(card)
+           and all(s in text_of(card) for s in ("Адрес для клиентов", "ЦП", "Память", "Диск", "Hysteria2", "AmneziaWG"))
+           and [b.get("callback_data") for b in buttons(card)] == [f"nr:{first_node}"],
+           f"кнопка узла: карточка {first_node} новым сообщением — адрес, нагрузка, службы, кнопка «Обновить»")
+    card_mid = msg_id(card) if card else 0
+
+    # Принудительный опрос не чаще раза в 5 с: после паузы данные новые, и текст карточки другой
+    time.sleep(6)
+    upd, before, qid = press(5001, card_mid, f"nr:{first_node}")
+    got = wait_calls(before, lambda g: any(c["method"] == "editMessageText" for c in g))
+    edit = next((c for c in got if c["method"] == "editMessageText"), None)
+    report(answered(got, qid) is not None and edit is not None and msg_id(edit) == card_mid
+           and "Нагрузка" in text_of(edit) and not any(c["method"] == "sendMessage" for c in got),
+           "«Обновить» у карточки узла: то же сообщение исправлено (editMessageText), нового нет")
+    upd, before, qid = press(5001, card_mid, f"nr:{first_node}")
+    got = wait_calls(before, lambda g: answered(g, qid) is not None, 20)
+    time.sleep(3)
+    got = calls(before)
+    report(answered(got, qid) is not None and not any(c["method"] in ("sendMessage", "editMessageText") for c in got),
+           "«Обновить» сразу ещё раз: данные те же, бот не шлёт ни нового, ни ошибки")
+    time.sleep(6)
+    upd, before, qid = press(5001, status_mid, "st")
+    got = wait_calls(before, lambda g: last_with(g, "<b>Узлы:", ("editMessageText",)) is not None)
+    edit = last_with(got, "<b>Узлы:", ("editMessageText",))
+    report(answered(got, qid) is not None and edit is not None and msg_id(edit) == status_mid and len(buttons(edit)) == len(names) + 1,
+           "«Обновить» у /status: то же сообщение исправлено, кнопки на месте")
+
+    got, card = ask(5001, f"/node {first_node}", "Нагрузка")
+    report(card is not None and f"<b>{first_node}</b>" in text_of(card), f"/node {first_node}: карточка узла")
+    got, c = ask(5001, "/node no-such-node", "нет в nodes.conf")
+    report(c is not None and "no-such-node" in text_of(c) and [b.get("callback_data") for b in buttons(c)] == [f"n:{n}" for n in names],
+           "/node с неизвестным узлом: «нет в nodes.conf» и кнопки узлов")
+    got, c = ask(5001, "/node", "Какой узел")
+    report(c is not None and len(buttons(c)) == len(names), "/node без имени: выбор узла кнопками")
+
+    got, c = ask(5001, "/audit", "Защита от РКН")
+    report(c is not None and "Аудит сервера" in text_of(c) and "Проверка:" in text_of(c) and "проблем" in text_of(c),
+           "/audit: итог по блокам «Аудит сервера» и «Защита от РКН»")
+    got, c = ask(5001, "/service", "Ночное обслуживание", 120, absent="Проверяю обновления")
+    report(c is not None and all(s in text_of(c) for s in ("Установлена:", "Проверка узлов")) and "Проверяю обновления" not in text_of(c),
+           "/service: версия, обновления, проверка узлов, ночное обслуживание")
+    labels = [line.split("\t")[1] for line in open("/root/iof/hy2/index.tsv", encoding="utf-8") if "\t" in line]
+    got, c = ask(5001, "/hy2", "Группы ссылок")
+    report(c is not None and labels and all(escape(lb, quote=False) in text_of(c) for lb in labels) and "ссылк" in text_of(c),
+           f"/hy2: группы ({', '.join(labels)}) с числом ссылок")
+    got, c = ask(5001, "/help", "<b>Команды</b>")
+    report(c is not None and all(f"/{k}" in text_of(c) for k in ("status", "node", "audit", "service", "hy2")),
+           "/help: новые команды")
+
+    # Чужой и группа: ни ответа на нажатие, ни сообщений
+    upd, before, qid = press(5009, status_mid, "st")
+    replies(upd, before, 20)
+    time.sleep(2)
+    report(not calls(before), "нажатие кнопки чужим: без ответа")
+    report(in_journal("нажатие кнопки от чужого, без ответа: id 5009"), "нажатие чужого записано в журнал")
+    upd, before, qid = press(5001, status_mid, "st", chat_type="group")
+    replies(upd, before, 20)
+    time.sleep(2)
+    report(not calls(before), "нажатие кнопки в группе: без ответа и админу")
+    upd, before, qid = press(5001, status_mid, "zz:old")
+    got = wait_calls(before, lambda g: answered(g, qid) is not None, 20)
+    report("устарела" in str((answered(got, qid) or {}).get("params", {}).get("text", "")), "незнакомая кнопка: «кнопка устарела»")
+
+    # Узел с длинным именем: «n:<имя>» больше 64 байт, в кнопке хэш имени. Узла нет на самом деле:
+    # адрес из TEST-NET, iof до него не достучится
+    with open("/root/iof/nodes.conf", "a", encoding="utf-8") as f:
+        f.write(f"{LONG} | 192.0.2.10 | root@192.0.2.10 | CI бот длинное имя\n")
+    deadline = time.time() + 90
+    while time.time() < deadline and not any(n["name"] == LONG for n in panel("/api/dashboard?force=1")[1].get("nodes", [])):
+        time.sleep(2)
+    got, st = ask(5001, "/status", f"<b>Узлы: {len(names) + 1}")
+    data = next((b.get("callback_data", "") for b in buttons(st) if b["text"].endswith("…")), "") if st else ""
+    report(st is not None and data.startswith("n#") and len(data.encode()) <= 64
+           and all(len(b.get("callback_data", "").encode()) <= 64 for b in buttons(st)),
+           f"длинное имя узла: в кнопке хэш ({data}), callback_data не длиннее 64 байт")
+    upd, before, qid = press(5001, msg_id(st) if st else 0, data)
+    got = wait_calls(before, lambda g: last_with(g, "Нет связи по SSH") is not None)
+    card = last_with(got, "Нет связи по SSH")
+    nr = [b.get("callback_data", "") for b in buttons(card)] if card else []
+    report(card is not None and LONG in text_of(card) and len(nr) == 1 and nr[0].startswith("nr#"),
+           "кнопка длинного узла: карточка «нет связи по SSH», «Обновить» тоже с хэшем")
+    remove_long()
+    upd, before, qid = press(5001, msg_id(card) if card else 0, nr[0] if nr else "nr#0")
+    got = wait_calls(before, lambda g: answered(g, qid) is not None, 20)
+    time.sleep(2)
+    a = answered(calls(before), qid) or {"params": {}}
+    report("больше нет" in str(a["params"].get("text", "")) and a["params"].get("show_alert") is True
+           and not any(c["method"] in ("sendMessage", "editMessageText") for c in calls(before)),
+           "кнопка удалённого узла: «узла больше нет» во всплывающем окне")
+    upd, before, qid = press(5001, status_mid, f"n:{LONG[:40]}")
+    got = wait_calls(before, lambda g: answered(g, qid) is not None, 20)
+    report("больше нет" in str((answered(got, qid) or {"params": {}})["params"].get("text", "")),
+           "кнопка узла не из nodes.conf: «узла больше нет»")
+
+    raw = json.dumps(calls(start), ensure_ascii=False)
+    secrets = hy2_secrets()
+    leaks = [s for s in secrets if s in raw]
+    report(secrets and not leaks and TOKEN.split(":", 1)[1] not in raw and "PrivateKey" not in raw,
+           f"в ответах бота нет паролей Hysteria2 ({len(secrets)}), ключей AWG и токена")
+
+
+def remove_long():
+    with open("/root/iof/nodes.conf", encoding="utf-8") as f:
+        lines = f.readlines()
+    with open("/root/iof/nodes.conf.t", "w", encoding="utf-8") as f:
+        f.writelines(line for line in lines if not line.startswith(LONG))
+    os.replace("/root/iof/nodes.conf.t", "/root/iof/nodes.conf")
+
+
+FINAL = re.compile(r"^(✅|⚠️|❌) <b>")
+INDEX = "/root/iof/hy2/index.tsv"
+
+
+def ref(kind, name):
+    """callback_data кнопки узла или группы, как ref_button в боте."""
+    data = f"{kind}:{name}"
+    return data if len(data.encode()) <= 64 else f"{kind}#{hashlib.sha256(name.encode()).hexdigest()[:24]}"
+
+
+def keys(c):
+    return [b.get("callback_data", "") for b in buttons(c)] if c else []
+
+
+def ok_no(c):
+    """Кнопки «Подтвердить» и «Отмена» под сообщением c."""
+    k = keys(c)
+    return (next((x for x in k if x.startswith("ok:")), "ok:" + "0" * 16),
+            next((x for x in k if x.startswith("no:")), "no:" + "0" * 16))
+
+
+def tap(uid, mid, data, done=lambda g: True, timeout=60):
+    """Нажатие кнопки data под сообщением mid -> (вызовы бота после него, ответ на нажатие), как только
+    ответ на нажатие есть и done(вызовы) истинно."""
+    upd, before, qid = press(uid, mid, data)
+    got = wait_calls(before, lambda g: answered(g, qid) is not None and done(g), timeout)
+    return got, answered(got, qid)
+
+
+def toast(a):
+    return str(((a or {}).get("params") or {}).get("text", ""))
+
+
+def bot_jobs():
+    return [j for j in panel("/api/jobs")[1].get("jobs", []) if j.get("kind") == "bot"]
+
+
+def job_ids():
+    return {j["id"] for j in bot_jobs()}
+
+
+def final_edit(got, mid):
+    """Итог задачи: правка сообщения mid, которая начинается с ✅, ⚠️ или ❌."""
+    return next((c for c in reversed(got) if c["method"] == "editMessageText" and msg_id(c) == mid
+                 and FINAL.match(text_of(c))), None)
+
+
+def confirmation(got):
+    return last_with(got, "Подтверди действие", ("sendMessage",))
+
+
+def run_action(uid, c, timeout=300):
+    """«Подтвердить» под сообщением c и ход задачи до итога -> (вызовы, ответ на нажатие, итог, задача)."""
+    mid, known = msg_id(c) if c else 0, job_ids()
+    got, a = tap(uid, mid, ok_no(c)[0], lambda g: final_edit(g, mid) is not None, timeout)
+    return got, a, final_edit(got, mid), next((j for j in bot_jobs() if j["id"] not in known), None)
+
+
+def groups():
+    """index.tsv: {подпись: логин}."""
+    out = {}
+    for line in open(INDEX, encoding="utf-8"):
+        parts = line.rstrip("\n").split("\t")
+        if len(parts) >= 2:
+            out[parts[1]] = parts[0]
+    return out
+
+
+def links_of(login):
+    try:
+        return [line.strip() for line in open(f"/root/iof/hy2/{login}.txt", encoding="utf-8") if line.startswith("hy2://")]
+    except OSError:
+        return []
+
+
+def panel_up(timeout=30):
+    """Панель снова отвечает после systemctl restart."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            if panel("/api/bot")[0] == 200:
+                return True
+        except OSError:
+            pass
+        time.sleep(0.5)
+    return False
+
+
+def wait_job(job_id, timeout=300):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        job = next((j for j in panel("/api/jobs")[1].get("jobs", []) if j["id"] == job_id), None)
+        if job and job["state"] != "running":
+            return job
+        time.sleep(1)
+    return None
+
+
+def check_expired():
+    """Истёкший номер подтверждения: 5 минут в тесте не ждать, поэтому Bot из модуля панели в этом
+    процессе и номер, которому срок уже вышел."""
+    sys.path.insert(0, "/opt/iof-web")
+    import iof_bot
+    sent = []
+
+    class Stub:
+        token = "1:stub"
+
+        def call(self, method, params=None, timeout=20, files=None):
+            sent.append((method, params or {}))
+            return True
+    bot = iof_bot.Bot("/root/iof", "/usr/local/bin/iof")
+    num = "0123456789abcdef"
+    bot.pending[num] = {"uid": 5001, "msg": 7, "kind": "check", "body": {}, "title": "t", "expires": time.time() - 1}
+    bot.confirm(Stub(), "q1", {"id": 5001}, {"id": 5001, "role": "main"}, 5001, 7, "ok", num)
+    report(sent and sent[0][0] == "answerCallbackQuery" and "устарело" in sent[0][1].get("text", "") and num not in bot.pending,
+           "истёкший номер подтверждения (старше 5 минут): «устарело», номер удалён")
+
+
+def check_actions(label):
+    """Действия (этап 4): права (действия выключены, обычный админ), кнопки только главному, подтверждение
+    и отмена, ход задачи одним сообщением, повторное, чужое, устаревшее нажатие и после перезапуска панели,
+    занятая очередь, перенос, перезапуск Hysteria2 и проверка узла, создание и удаление группы, ссылки
+    с QR и без qrencode, выдача ссылок выключена. Админ 5001 обычный, действия выключены, ссылки включены."""
+    start = fake("/fake/state")["sent"]
+    node = node_names()[0]
+
+    got, c = ask(5001, "/check", "выключены")
+    report(c is not None and "Телеграм бот" in text_of(c) and not buttons(c), "действия выключены: /check — отказ «включить в панели»")
+    iof("set", "actions", "on")
+    got, c = ask(5001, "/check", "только главному")
+    report(c is not None and not buttons(c), "обычному админу /check — отказ «только главному админу»")
+    got, card = ask(5001, f"/node {node}", "Нагрузка")
+    report(keys(card) == [f"nr:{node}"], "обычному админу под карточкой узла кнопок действий нет")
+    got, c = ask(5001, "/hy2", "Группы ссылок")
+    report(keys(c) and all(k.startswith(("g:", "g#")) for k in keys(c)), "обычному админу в /hy2 только кнопки ссылок")
+    got, c = ask(5001, "/audit", "Защита от РКН")
+    report(c is not None and not buttons(c), "обычному админу под /audit кнопок нет")
+    got, a = tap(5001, msg_id(card), f"hr:{node}")
+    report("только главному" in toast(a) and not any(x["method"] == "sendMessage" for x in got),
+           "обычный админ нажал старую кнопку «Перезапустить»: отказ во всплывающем окне")
+
+    iof("admin", "set", "5001", "role", "main")
+    got, card = ask(5001, f"/node {node}", "Нагрузка")
+    report(keys(card) == [f"hr:{node}", f"as:{node}", f"ad:{node}", f"nr:{node}"],
+           f"главному под карточкой {node}: перезапуск Hysteria2, проверки, «Обновить» ({', '.join(keys(card))})")
+    logins = list(groups().values())
+    got, c = ask(5001, "/hy2", "Группы ссылок")
+    report(all(ref(k, g) in keys(c) for g in logins for k in ("g", "gd")) and keys(c)[-1:] == ["hf"],
+           "главному в /hy2: ссылки и удаление у каждой группы, «Пересобрать все»")
+    got, c = ask(5001, "/audit", "Защита от РКН")
+    report(keys(c) == ["au:server", "au:dpi"], "главному под /audit: проверить все узлы по блокам")
+    got, c = ask(5001, "/help", "<b>Команды</b>")
+    report(c is not None and all(f"/{k}" in text_of(c) for k in ("check", "hy2add", "hy2refresh")) and "Тебе они доступны" in text_of(c),
+           "/help: команды действий и «тебе они доступны»")
+    menu = [x.get("command") for x in fake("/fake/state")["commands"]]
+    report(all(k in menu for k in ("check", "hy2add", "hy2refresh")), "меню команд с действиями")
+
+    # «Отмена», потом «Подтвердить» того же сообщения
+    got, c = ask(5001, "/check", "Подтверди действие")
+    ok, no = ok_no(c)
+    mid, known = msg_id(c) if c else 0, job_ids()
+    report(c is not None and "iof check" in text_of(c) and re.fullmatch(r"ok:[0-9a-f]{16}", ok) is not None and no == "no:" + ok[3:],
+           "/check: «что будет сделано», кнопки «Подтвердить» и «Отмена»")
+    got, a = tap(5001, mid, no, lambda g: any(x["method"] == "editMessageText" for x in g))
+    edit = next((x for x in got if x["method"] == "editMessageText"), None)
+    report(toast(a) == "Отменено" and edit is not None and msg_id(edit) == mid and "Отменено" in text_of(edit) and not buttons(edit),
+           "«Отмена»: сообщение исправлено, кнопок больше нет")
+    got, a = tap(5001, mid, ok)
+    report("устарело" in toast(a) and job_ids() == known, "«Подтвердить» после «Отмены»: «устарело», задачи нет")
+
+    # Запуск, ход задачи в том же сообщении, итог; повторное нажатие
+    got, c = ask(5001, "/check", "Подтверди действие")
+    mid = msg_id(c) if c else 0
+    got, a, fin, job = run_action(5001, c)
+    edits = [x for x in got if x["method"] == "editMessageText"]
+    report(toast(a) == "Запускаю" and job is not None and job["title"] == "Проверка всех узлов (iof check)" and job["state"] in ("ok", "warn"),
+           f"«Подтвердить»: задача бота в очереди панели, вид bot ({job and job['state']})")
+    report(fin is not None and all(msg_id(x) == mid for x in edits) and any("Выполняется" in text_of(x) for x in edits)
+           and not any(x["method"] == "sendMessage" for x in got) and not buttons(fin),
+           f"ход задачи: правки того же сообщения ({len(edits)}), «выполняется», потом итог")
+    report(fin is not None and job is not None and "<pre>" in text_of(fin) and all(f"{n}: " in text_of(fin) for n in node_names())
+           and ("готово" in text_of(fin) if job["state"] == "ok" else "проблемы" in text_of(fin)),
+           "итог /check: состояние и последние строки лога по каждому узлу")
+    count = len(bot_jobs())
+    got, a = tap(5001, mid, ok_no(c)[0])
+    report("устарело" in toast(a) and len(bot_jobs()) == count, "повторное «Подтвердить»: «устарело», второй задачи нет")
+    check_expired()
+
+    # Чужой номер, занятая очередь, потом то же «Подтвердить» срабатывает
+    rc, out, err = iof("invite", "main")
+    say(5010, code_of(out))
+    got, c3 = ask(5001, "/hy2refresh", "Подтверди действие")
+    known = job_ids()
+    got, a = tap(5010, msg_id(c3) if c3 else 0, ok_no(c3)[0])
+    report(admin(5010) is not None and "устарело" in toast(a) and job_ids() == known, "номер подтверждения другого админа: «устарело»")
+    code, data = panel("/api/security", {"block": "dpi"})
+    got, a = tap(5001, msg_id(c3) if c3 else 0, ok_no(c3)[0])
+    report(code == 202 and "«Защита от РКН: все узлы»" in toast(a) and job_ids() == known,
+           f"очередь занята задачей панели: «сейчас идёт задача «Защита от РКН: все узлы»» ({code})")
+    wait_job(data.get("job", ""))
+    got, a, fin, job = run_action(5001, c3)
+    report(job is not None and job["title"] == "Пересборка всех групп Hysteria2" and job["state"] == "ok" and fin is not None and "готово" in text_of(fin),
+           "очередь освободилась: то же «Подтвердить» запускает hy2 refresh, итог «готово»")
+
+    # Кнопки действий под карточкой узла
+    got, _ = tap(5001, msg_id(card), f"hr:{node}", lambda g: confirmation(g) is not None)
+    conf = confirmation(got)
+    report(conf is not None and f"Перезапуск Hysteria2 на {node}" in text_of(conf) and "прервутся" in text_of(conf),
+           "«Перезапустить Hysteria2»: подтверждение с предупреждением, новым сообщением")
+    got, a, fin, job = run_action(5001, conf)
+    report(job is not None and job["title"] == f"Перезапуск Hysteria2 на {node}" and job["state"] == "ok" and fin is not None,
+           f"перезапуск Hysteria2 на {node} из бота: «готово»")
+    got, _ = tap(5001, msg_id(card), f"as:{node}", lambda g: confirmation(g) is not None)
+    conf = confirmation(got)
+    got, a, fin, job = run_action(5001, conf)
+    report(job is not None and job["title"] == f"Аудит сервера: {node}" and job["state"] == "ok" and fin is not None,
+           f"проверка узла {node} (аудит сервера) из бота")
+
+    # После перезапуска панели номера подтверждений забыты
+    got, c4 = ask(5001, "/hy2refresh", "Подтверди действие")
+    subprocess.run(["systemctl", "restart", "iof-web"], timeout=60)
+    restarted = panel_up() and thread_state("running", 30) and polling()
+    known = job_ids()
+    got, a = tap(5001, msg_id(c4) if c4 else 0, ok_no(c4)[0])
+    report(restarted and "устарело" in toast(a) and job_ids() == known, "«Подтвердить» после перезапуска панели: «устарело»")
+
+    # Перенос отсюда: меняющее действие отказано сразу, check разрешён
+    got, c5 = ask(5001, "/hy2refresh", "Подтверди действие")
+    with open(MIGRATE, "w") as f:
+        f.write(f"role=source\nid=iof-test\npeer=root@192.0.2.1\nstarted={int(time.time())}\n")
+    try:
+        got, c = ask(5001, f"/hy2add {label}", "перенос")
+        report(c is not None and "идёт перенос управления" in text_of(c) and not buttons(c),
+               "при переносе /hy2add — отказ «идёт перенос управления», без подтверждения")
+        known = job_ids()
+        got, a = tap(5001, msg_id(c5) if c5 else 0, ok_no(c5)[0])
+        report("перенос" in toast(a) and job_ids() == known, "при переносе «Подтвердить», полученное до него: отказ")
+        got, c = ask(5001, "/check", "Подтверди действие")
+        got, a, fin, job = run_action(5001, c)
+        report(job is not None and job["title"] == "Проверка всех узлов (iof check)" and fin is not None,
+               "при переносе /check разрешён, как iof check")
+    finally:
+        os.remove(MIGRATE)
+
+    # Группа из бота: создание, ссылки с QR и без qrencode, выдача ссылок выключена, удаление
+    got, c = ask(5001, f"/hy2add {label}", "Подтверди действие")
+    report(c is not None and f"«{label}»" in text_of(c) and "iof hy2 add" in text_of(c), f"/hy2add {label}: подтверждение с командой")
+    got, a, fin, job = run_action(5001, c)
+    login = groups().get(label, "")
+    links = links_of(login)
+    btn = next((k for k in keys(fin) if k.startswith(("g:", "g#"))), "")
+    report(job is not None and job["title"] == f"Создание группы «{label}»" and job["state"] == "ok" and login and links,
+           f"группа «{label}» создана из бота: есть в index.tsv, ссылок {len(links)}")
+    report(btn == ref("g", login), f"под итогом — кнопка ссылок группы ({btn})")
+    secrets = {p for link in links for p in (link[6:link.rindex("@")], link[6:link.rindex("@")].split(":", 1)[-1]) if len(p) >= 8}
+    mid = msg_id(fin) if fin else 0
+    got, a = tap(5001, mid, btn, lambda g: sum(x["method"] == "sendPhoto" for x in g) >= len(links))
+    photos = [x for x in got if x["method"] == "sendPhoto"]
+    caps = [str(x["params"].get("caption", "")) for x in photos]
+    report(len(photos) == len(links) and all((x["params"].get("photo") or {}).get("filename") == "qr.png"
+                                              and (x["params"].get("photo") or {}).get("size", 0) > 100 for x in photos)
+           and all(any(escape(link, quote=False) in cap for cap in caps) for link in links) and all("<pre>hy2://" in cap for cap in caps),
+           f"ссылки группы: {len(photos)} фото QR (PNG), в подписи узел и ссылка в <pre>")
+    qr = shutil.which("qrencode")
+    if qr:
+        os.rename(qr, qr + ".iof-test")
+    try:
+        got, a = tap(5001, mid, btn, lambda g: sum(x["method"] == "sendMessage" for x in g) >= len(links))
+    finally:
+        if qr:
+            os.rename(qr + ".iof-test", qr)
+    texts = [text_of(x) for x in got if x["method"] == "sendMessage"]
+    report(qr and len(texts) == len(links) and not any(x["method"] == "sendPhoto" for x in got)
+           and all(any(escape(link, quote=False) in t for t in texts) for link in links),
+           "без qrencode: ссылки только текстом")
+    iof("set", "links", "off")
+    got, c = ask(5001, "/hy2", "Группы ссылок")
+    report(c is not None and "выключена" in text_of(c) and not any(k.startswith(("g:", "g#")) for k in keys(c)) and ref("gd", login) in keys(c),
+           "выдача ссылок выключена: в /hy2 нет кнопок ссылок, «выключена в панели»")
+    got, a = tap(5001, mid, btn)
+    report("выключена" in toast(a) and not any(x["method"] in ("sendPhoto", "sendMessage") for x in got),
+           "выдача ссылок выключена: старая кнопка ссылок — отказ")
+    iof("set", "links", "on")
+    got, _ = tap(5001, msg_id(c) if c else 0, ref("gd", login), lambda g: confirmation(g) is not None)
+    conf = confirmation(got)
+    report(conf is not None and f"Удаление группы «{label}»" in text_of(conf) and "перестанут работать" in text_of(conf),
+           "🗑 у группы: подтверждение удаления с предупреждением")
+    got, a, fin2, job = run_action(5001, conf)
+    report(job is not None and job["title"] == f"Удаление группы «{label}»" and job["state"] == "ok" and label not in groups(),
+           f"группа «{label}» удалена из бота: в index.tsv её нет")
+    got, a = tap(5001, mid, btn)
+    report("Группы больше нет" in toast(a), "кнопка ссылок удалённой группы: «группы больше нет»")
+
+    answers = json.dumps(calls(start), ensure_ascii=False)
+    logs = journal() + json.dumps(panel("/api/jobs")[1], ensure_ascii=False)
+    report(secrets and all(s in answers for s in secrets) and not [s for s in secrets | hy2_secrets() if s in logs],
+           f"паролей Hysteria2 ({len(secrets)}) нет в журнале iof-web и логах задач, они только в ответах админу")
+    iof("set", "actions", "off")
+
+
+ENV = "/root/iof/iof.env"
+UPD = "/root/iof-test-upd"   # git-репозитории для проверки уведомления о новой версии iof
+
+
+def run_iof(*args, stdin="", env=None, timeout=180):
+    p = subprocess.run(["iof", *args], input=stdin.encode(), capture_output=True, timeout=timeout,
+                       env=dict(os.environ, **(env or {})))
+    return p.returncode, p.stdout.decode("utf-8", "replace"), p.stderr.decode("utf-8", "replace")
+
+
+def env_with(base, **kv):
+    """iof.env = base без строк этих ключей плюс они сами (пустое значение — тоже строка)."""
+    lines = [s for s in base.splitlines() if not any(re.match(rf"\s*{k}=", s) for k in kv)]
+    lines += [f'{k}="{v}"' for k, v in kv.items()]
+    with open(ENV + ".t", "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    os.chmod(ENV + ".t", 0o600)
+    os.replace(ENV + ".t", ENV)
+
+
+def mark():
+    return fake("/fake/state")["sent"]
+
+
+def notes(before, title=None):
+    """Отправленные с номера before сообщения (sendMessage) -> {chat_id: [вызов]}, только с заголовком title."""
+    out = {}
+    for s in fake(f"/fake/sent?after={before}"):
+        if s["method"] == "sendMessage" and (title is None or f"<b>{title}</b>" in s["params"].get("text", "")):
+            out.setdefault(s["params"].get("chat_id"), []).append(s)
+    return out
+
+
+def hhmm(minutes):
+    t = time.localtime()
+    m = (t.tm_hour * 60 + t.tm_min + minutes) % 1440
+    return f"{m // 60:02d}:{m % 60:02d}"
+
+
+def git(*args, cwd=None):
+    subprocess.run(["git", "-c", "user.name=iof-test", "-c", "user.email=iof-test@example.invalid", *args],
+                   cwd=cwd, check=True, capture_output=True, timeout=60)
+
+
+def check_notify():
+    """Уведомления (этап 5): notify null — ничего, набор из iof bot и из панели, обычному недоступны новые админы,
+    уведомление только подписанным и только доступных роли типов, текст экранирован, тихие часы
+    (disable_notification, у админа со звуком без него), новый админ — главным, iof check (узел снова
+    работает), доступ к РФ (закрыт, снова открыт, нет интернета) и новая версия iof из ежедневной части
+    iof check, нет связи с Bot API — iof check всё равно завершается, бот выключен — старый путь TG_TOKEN
+    и TG_CHAT (только узлы и аудит) или ничего. Токенов нет в выводе. Бот включён, токен TOKEN, админ 5001."""
+    secret = TOKEN.split(":", 1)[1]
+    old_token = "777001:AAEstandOldPathTokenForIofTestsXX"
+    outputs = []
+    env0 = open(ENV, encoding="utf-8").read()
+    node = node_names()[0]
+    NODES, AUDIT, RU, UPDATES, ADMINS = ("Узлы", "Аудит безопасности: стало хуже", "Доступ к российским серверам",
+                                         "Вышла новая версия iof", "Новый админ")
+
+    iof("admin", "set", "5001", "role", "regular")
+    iof("admin", "set", "5001", "notify", "off")
+    rc, out, err = iof("invite", "main")
+    r = say(5020, code_of(out))
+    a = admin(5020) or {}
+    report("ты админ" in first(r) and a.get("role") == "main" and a.get("notify") is None, "новый админ: notify null")
+    before = mark()
+    rc, out, err = run_iof("notify", "nodes", "проверка: никому")
+    outputs.append(out + err)
+    report(rc == 0 and not notes(before) and "никто" in out, "notify null и off: уведомление никому не ушло")
+
+    rc, out, err = iof("admin", "set", "5001", "notify", "nodes,admins")
+    report(rc != 0 and "только главным" in err, "iof bot admin set notify: обычному «новые админы» — отказ")
+    rc, out, err = iof("admin", "set", "5001", "notify", "nodes,bogus")
+    report(rc != 0 and "bogus" in err, "iof bot admin set notify: неизвестный тип — отказ")
+    rc, out, err = iof("admin", "set", "5001", "notify", "all")
+    report(rc == 0 and (admin(5001) or {}).get("notify") == ["nodes", "audit", "nightly", "updates", "ru"],
+           "iof bot admin set notify all: обычному все типы, кроме новых админов")
+    code, data = panel("/api/bot", {"action": "admin_set", "id": 5020, "notify": ["admins", "nodes"]})
+    shown = next((x for x in ((data.get("bot") or {}).get("config") or {}).get("admins", []) if x["id"] == 5020), {})
+    report(code == 200 and (admin(5020) or {}).get("notify") == ["nodes", "admins"] and shown.get("notify") == ["nodes", "admins"],
+           f"панель: главному отмечены узлы и новые админы ({code})")
+    code, _ = panel("/api/bot", {"action": "admin_set", "id": 5020, "notify": ["nodes", "bogus"]})
+    report(code == 400 and (admin(5020) or {}).get("notify") == ["nodes", "admins"], f"панель: неизвестный тип не принят ({code})")
+    rc, out, err = iof("show")
+    report(rc == 0 and "nodes,admins" in out and "nodes,audit,nightly,updates,ru" in out, "iof bot show: уведомления админов")
+
+    before = mark()
+    rc, out, err = run_iof("notify", "nodes", "[ПРОБЛЕМА] node-x (192.0.2.7): <b>не тег</b> & ещё")
+    outputs.append(out + err)
+    got = notes(before, NODES)
+    text = got.get(5020, [{}])[0].get("params", {}).get("text", "")
+    report(rc == 0 and set(got) == {5001, 5020} and "отправлено 2 из 2" in out, "узлы: обоим подписанным админам")
+    report(text.startswith("<b>Узлы</b>\n❌ node-x") and "&lt;b&gt;не тег&lt;/b&gt; &amp; ещё" in text
+           and got[5020][0]["params"].get("parse_mode") == "HTML" and "disable_notification" not in got[5020][0]["params"],
+           "текст уведомления: заголовок, значок вместо метки, HTML экранирован, со звуком вне тихих часов")
+    before = mark()
+    rc, out, err = run_iof("notify", "audit", stdin="server: вход по паролю\n")
+    report(rc == 0 and set(notes(before, AUDIT)) == {5001}, "аудит (текст со stdin): только тому, кто подписан")
+    before = mark()
+    long_text = "<&😀>" * 2000
+    rc, out, err = run_iof("notify", "nightly", stdin=long_text)
+    got = notes(before, "Ночное обслуживание")
+    texts = [s["params"]["text"] for s in got.get(5001, [])]
+    report(rc == 0 and set(got) == {5001} and len(texts) > 1
+           and all(len(t.encode("utf-16-le")) // 2 <= 4096 for t in texts)
+           and "".join(t.split("\n", 1)[1] for t in texts) == escape(long_text),
+           "ночное обслуживание: только подписанному, длинный HTML и emoji разбиты без потерь")
+
+    data = cfg()
+    next(x for x in data["admins"] if x["id"] == 5001)["notify"] = ["nodes", "admins"]
+    with open(BOT_JSON + ".t", "w", encoding="utf-8") as f:
+        json.dump(data, f)
+    os.chmod(BOT_JSON + ".t", 0o600)
+    os.replace(BOT_JSON + ".t", BOT_JSON)
+    before = mark()
+    rc, out, err = run_iof("notify", "admins", "проверка")
+    shown = next((x for x in (panel("/api/bot")[1].get("config") or {}).get("admins", []) if x["id"] == 5001), {})
+    report(rc == 0 and set(notes(before, ADMINS)) == {5020} and shown.get("notify") == ["nodes"],
+           "новые админы у обычного в bot.json: ему не приходят, панель их не показывает")
+    iof("admin", "set", "5020", "role", "regular")
+    report((admin(5020) or {}).get("notify") == ["nodes"], "смена роли на обычного снимает «новые админы»")
+    iof("admin", "set", "5020", "role", "main")
+    iof("admin", "set", "5020", "notify", "nodes,admins")
+    iof("admin", "set", "5001", "notify", "all")
+
+    before = mark()
+    rc, out, err = iof("invite", "main")
+    r = say(5021, code_of(out))
+    got = notes(before, ADMINS)
+    text = got.get(5020, [{}])[0].get("params", {}).get("text", "")
+    report(any("ты админ" in t for t in r or []) and set(got) == {5020} and "ID 5021" in text and "главный" in text and "admin del 5021" in text,
+           "по приглашению добавился главный админ: уведомление главному, подписанному на новых админов")
+    iof("admin", "del", "5021")
+
+    iof("admin", "set", "5020", "sound", "on")
+    rc, _, _ = iof("set", "quiet", f"{hhmm(-60)}-{hhmm(60)}")
+    before = mark()
+    rc2, out, err = run_iof("notify", "nodes", "в тихие часы")
+    got = notes(before, NODES)
+    report(rc == 0 and rc2 == 0 and set(got) == {5001, 5020} and got[5001][0]["params"].get("disable_notification") is True
+           and "disable_notification" not in got[5020][0]["params"] and "тихие часы" in out,
+           "тихие часы вокруг текущего времени: без звука, у админа со звуком — со звуком")
+    iof("set", "quiet", f"{hhmm(60)}-{hhmm(120)}")
+    before = mark()
+    run_iof("notify", "nodes", "вне тихих часов")
+    got = notes(before, NODES)
+    report(set(got) == {5001, 5020} and "disable_notification" not in got[5001][0]["params"], "вне тихих часов: со звуком у всех")
+    iof("set", "quiet", "off")
+    iof("admin", "set", "5020", "sound", "off")
+
+    # iof check: узел был с проблемой, теперь в порядке — «снова работает»
+    with open(f"/root/iof/state/{node}", "w", encoding="utf-8") as f:
+        f.write("проверка уведомлений\n")
+    before = mark()
+    rc, out, err = run_iof("-n", node, "check")
+    outputs.append(out + err)
+    got = notes(before, NODES)
+    report(rc == 0 and set(got) == {5001, 5020} and f"✅ {node}" in got[5001][0]["params"]["text"] and "снова работает" in got[5001][0]["params"]["text"],
+           f"iof check: «{node} снова работает» подписанным на узлы")
+    with open(f"/root/iof/state/{node}", "w", encoding="utf-8") as f:
+        f.write("проверка уведомлений\n")
+    t0 = time.time()
+    rc, out, err = run_iof("-n", node, "check", env={"IOF_TG_API": "http://127.0.0.1:9"})
+    outputs.append(out + err)
+    report(rc == 0 and "нет связи" in err and time.time() - t0 < 60 and open(f"/root/iof/state/{node}").read().strip() == "ok",
+           f"нет связи с Bot API: iof check всё равно завершился ({time.time() - t0:.0f} с), ошибка в stderr")
+
+    # Ежедневная часть iof check: доступ к РФ и новая версия iof. Клона нет — обновления не проверяются.
+    # «Недоступные» цели — 127.0.0.9 и 127.0.0.10: на 443/tcp там отказ. Адреса TEST-NET не годятся: TUN-прокси
+    # на машине разработки принимает соединение с любым адресом, и TCP «проходит»
+    env_with(env0, RU_TARGETS="127.0.0.9 127.0.0.10", IOF_SRC="/nonexistent")
+    before = mark()
+    rc, out, err = run_iof("-n", node, "check", "--daily")
+    outputs.append(out + err)
+    got = notes(before, RU)
+    text = got.get(5001, [{}])[0].get("params", {}).get("text", "")
+    report(rc == 0 and set(got) == {5001} and f"❌ {node}" in text and "отвечают 0 из 2" in text and "путь к РФ закрыт" in out,
+           f"российские серверы не отвечают с {node}, зарубежные отвечают: «РФ недоступна» подписанному на доступ к РФ")
+    before = mark()
+    run_iof("-n", node, "check", "--daily")
+    report(not notes(before, RU), "доступ к РФ: то же состояние — второго уведомления нет")
+    # Здесь «российский» — 1.1.1.1: он отвечает на TCP 443 и со стенда, и из CI (ping на узлах стенда нет)
+    env_with(env0, RU_TARGETS="1.1.1.1", IOF_SRC="/nonexistent")
+    before = mark()
+    rc, out, err = run_iof("-n", node, "check", "--daily")
+    got = notes(before, RU)
+    report(set(got) == {5001} and f"✅ {node}" in got[5001][0]["params"]["text"] and "снова отвечают (1 из 1)" in got[5001][0]["params"]["text"],
+           "российский сервер снова отвечает: уведомление «снова отвечают»")
+    env_with(env0, RU_TARGETS="127.0.0.9", RU_CONTROL="127.0.0.10", IOF_SRC="/nonexistent")
+    before = mark()
+    rc, out, err = run_iof("-n", node, "check", "--daily")
+    got = notes(before, RU)
+    report(set(got) == {5001} and "⚠️" in got[5001][0]["params"]["text"] and "ни российские" in got[5001][0]["params"]["text"],
+           "не отвечают и зарубежные: уведомление «нет интернета»")
+    daily = open("/root/iof/check.daily", encoding="utf-8").read()
+    report(f"ru_noinet={node}" in daily and "updates=" in daily, "check.daily: итог ежедневной части для панели")
+
+    shutil.rmtree(UPD, ignore_errors=True)
+    os.makedirs(UPD)
+    git("init", "-q", "--bare", "-b", "master", f"{UPD}/origin.git")
+    git("init", "-q", "-b", "master", f"{UPD}/work")
+    git("commit", "-q", "--allow-empty", "-m", "первая версия", cwd=f"{UPD}/work")
+    git("push", "-q", f"{UPD}/origin.git", "master", cwd=f"{UPD}/work")
+    git("clone", "-q", f"{UPD}/origin.git", f"{UPD}/src")
+    git("commit", "-q", "--allow-empty", "-m", "ci: новая версия для проверки уведомления", cwd=f"{UPD}/work")
+    git("push", "-q", f"{UPD}/origin.git", "master", cwd=f"{UPD}/work")
+    env_with(env0, RU_TARGETS="", IOF_SRC=f"{UPD}/src")
+    before = mark()
+    rc, out, err = run_iof("-n", node, "check", "--daily")
+    got = notes(before, UPDATES)
+    report(rc == 0 and set(got) == {5001} and "ci: новая версия для проверки уведомления" in got[5001][0]["params"]["text"]
+           and "новых коммитов: 1" in out, "новая версия iof (git fetch в клоне): уведомление подписанному на обновления")
+    before = mark()
+    run_iof("-n", node, "check", "--daily")
+    report(not notes(before, UPDATES), "та же новая версия: второго уведомления нет")
+    shutil.rmtree(UPD, ignore_errors=True)
+
+    # Бот выключен: старый путь, TG_TOKEN и TG_CHAT из iof.env, только узлы и аудит
+    iof("off")
+    env_with(env0, TG_TOKEN=old_token, TG_CHAT="5099")
+    before = mark()
+    rc, out, err = run_iof("notify", "nodes", "старый путь")
+    outputs.append(out + err)
+    got = [s for s in fake(f"/fake/sent?after={before}") if s["method"] == "sendMessage"]
+    report(rc == 0 and len(got) == 1 and got[0]["bot"] == 777001 and str(got[0]["params"].get("chat_id")) == "5099"
+           and got[0]["params"].get("text") == "старый путь" and "TG_CHAT" in out, "бот выключен: узлы уходят в TG_CHAT с TG_TOKEN из iof.env")
+    before = mark()
+    rc, out, err = run_iof("notify", "audit", "хуже")
+    got = [s for s in fake(f"/fake/sent?after={before}") if s["method"] == "sendMessage"]
+    report(len(got) == 1 and got[0]["params"].get("text", "").startswith("Аудит безопасности, стало хуже:"), "бот выключен: аудит в TG_CHAT, как раньше")
+    before = mark()
+    rc, out, err = run_iof("notify", "ru", "x")
+    report(rc == 0 and not fake(f"/fake/sent?after={before}") and "только узлы и аудит" in out, "бот выключен: доступа к РФ в TG_CHAT нет")
+    env_with(env0)
+    before = mark()
+    rc, out, err = run_iof("notify", "nodes", "некуда")
+    report(rc == 0 and not fake(f"/fake/sent?after={before}") and "не настроен" in out, "бот выключен и TG_TOKEN нет: уведомление не уходит, iof не падает")
+    iof("on")
+    report(polling(), "бот снова включён и опрашивает API")
+    iof("admin", "del", "5020")
+    iof("admin", "set", "5001", "notify", "off")
+
+    old_secret = old_token.split(":", 1)[1]
+    leaks = [o for o in outputs if secret in o or old_secret in o]
+    report(not leaks and secret not in journal() and old_secret not in journal(), "токенов бота и TG_TOKEN нет в выводе iof и журналах")
+
+
+def run():
+    for f in (BOT_JSON, BOT_TOKEN):
+        if os.path.exists(f):
+            os.remove(f)
+    fake("/fake/reset", {})
+
+    rc, out, err = iof("on")
+    report(rc != 0 and "токен" in err, "iof bot on без токена: отказ")
+    rc, out, err = iof("token", stdin="не токен\n")
+    report(rc != 0 and "не токен" in err, "iof bot token: не токен — отказ")
+    rc, out, err = iof("token", stdin=BAD_TOKEN + "\n")
+    report(rc != 0 and "не принял" in err and not os.path.exists(BOT_TOKEN), f"iof bot token: отозванный токен — отказ ({err.strip()[:80]})")
+    rc, out, err = iof("token", stdin=TOKEN + "\n")
+    report(rc == 0 and "@iof_stand_bot" in out, "iof bot token: getMe прошёл, бот @iof_stand_bot")
+    modes = {f: oct(os.stat(f).st_mode & 0o777) for f in (BOT_JSON, BOT_TOKEN)}
+    report(set(modes.values()) == {"0o600"}, f"bot.json и bot.token с правами 600 ({modes})")
+    report(cfg()["username"] == "iof_stand_bot" and not cfg()["enabled"], "в bot.json имя бота, бот ещё выключен")
+
+    rc, out, err = iof("on")
+    report(rc == 0 and polling(), "iof bot on: бот опрашивает Bot API")
+    menu = [c.get("command") for c in fake("/fake/state")["commands"]]
+    report(menu == ["status", "node", "audit", "service", "hy2", "check", "hy2add", "hy2refresh", "start", "help"],
+           f"меню команд: {', '.join(menu)}")
+
+    r = say(5001, "/start")
+    report(r == [], "чужому на /start бот не отвечает")
+    r = say(5001, "a" * 64)
+    report(len(r or []) == 1 and "не подошёл" in first(r), "неверный код приглашения: «не подошёл»")
+    report(in_journal("сообщение от чужого, без ответа: id 5001 @user5001"), "сообщение чужого записано в журнал (ID, username)")
+
+    rc, out, err = iof("invite", "regular")
+    code = code_of(out)
+    raw = open(BOT_JSON, encoding="utf-8").read()
+    report(rc == 0 and code and hashlib.sha256(code.encode()).hexdigest() in raw and code not in raw,
+           "iof bot invite regular: код из 64 знаков, в bot.json только хэш")
+    report(f"t.me/iof_stand_bot?start={code}" in out, "iof bot invite: ссылка t.me с кодом")
+    r = say(5001, code)
+    a = admin(5001)
+    report("ты админ" in first(r) and "обычный" in first(r), "код приглашения принят, ответ с ролью")
+    report(bool(a) and a["role"] == "regular" and a["username"] == "user5001" and not cfg()["invites"],
+           "админ добавлен с ролью «обычный», приглашение израсходовано")
+    r = say(5002, code)
+    report("не подошёл" in first(r) and admin(5002) is None, "тот же код второй раз не принят")
+
+    rc, out, err = iof("invite", "main")
+    code2 = code_of(out)
+    data = cfg()
+    data["invites"][0]["expires"] = int(time.time()) - 10
+    with open(BOT_JSON + ".t", "w", encoding="utf-8") as f:
+        json.dump(data, f)
+    os.chmod(BOT_JSON + ".t", 0o600)
+    os.replace(BOT_JSON + ".t", BOT_JSON)
+    r = say(5002, code2)
+    report("не подошёл" in first(r) and admin(5002) is None, "просроченный код не принят")
+
+    r = say(5001, "/start")
+    report("Привет" in first(r) and "обычный" in first(r), "/start админу: приветствие и роль")
+    r = say(5001, "/help")
+    report("/start" in first(r) and "/help" in first(r), "/help админу: список команд")
+    sent = fake("/fake/sent?after=0")
+    report(sent[-1]["params"].get("parse_mode") == "HTML" and sent[-1]["params"].get("chat_id") == 5001, "ответ в личный чат, parse_mode HTML")
+    r = say(5001, "что-то непонятное")
+    report("/help" in first(r), "непонятное от админа: подсказка /help")
+    r = say(5001, "/start", chat_type="group")
+    report(r == [], "в групповом чате бот не отвечает и админу")
+
+    rc, out, err = iof("invite", "main")
+    code3 = code_of(out)
+    r = say(5003, code3, chat_type="supergroup")
+    report(r == [] and admin(5003) is None and len(cfg()["invites"]) == 1, "код из группового чата не принят, приглашение цело")
+    r = say(5003, f"/start {code3}")
+    report("главный" in first(r) and (admin(5003) or {}).get("role") == "main", "код по ссылке (/start <код>): админ с ролью «главный»")
+
+    rc, out, err = iof("invite", "main")
+    code4 = code_of(out)
+    r = say(5004, code4, date=int(time.time()) - 3600)
+    report(r == [] and admin(5004) is None, "сообщение старше запуска бота на 5 минут пропущено")
+    h4 = hashlib.sha256(code4.encode()).hexdigest()
+    rc, out, err = iof("show")
+    report(rc == 0 and h4[:12] in out and code4 not in out and TOKEN not in out and "5003" in out,
+           "iof bot show: админы, хэш приглашения, без кода и токена")
+    rc, out, err = iof("invite", "del", h4[:8])
+    r = say(5004, code4)
+    report(rc == 0 and not cfg()["invites"] and "не подошёл" in first(r), "iof bot invite del: приглашение отозвано")
+
+    rc1, _, _ = iof("admin", "set", "5003", "role", "regular")
+    rc2, _, _ = iof("admin", "set", "5003", "sound", "on")
+    a = admin(5003) or {}
+    report(rc1 == 0 and rc2 == 0 and a.get("role") == "regular" and a.get("sound") is True, "admin set: роль и звук в тихие часы")
+    rc, _, err = iof("admin", "set", "9999", "role", "main")
+    report(rc != 0 and "нет" in err, "admin set: неизвестный ID — отказ")
+    rc, _, _ = iof("admin", "del", "5003")
+    r = say(5003, "/start")
+    report(rc == 0 and admin(5003) is None and r == [], "admin del: админ удалён, бот ему больше не отвечает")
+    ok = [iof("set", "actions", "on")[0], iof("set", "links", "off")[0], iof("set", "quiet", "23:00-8:00")[0]]
+    c = cfg()
+    report(ok == [0, 0, 0] and c["actions"] is True and c["hy2_links"] is False and c["quiet"] == {"from": "23:00", "to": "08:00"},
+           "iof bot set: действия, ссылки, тихие часы")
+    rc, _, _ = iof("set", "quiet", "25:00-08:00")
+    rc2, _, _ = iof("set", "quiet", "off")
+    report(rc != 0 and rc2 == 0 and cfg()["quiet"] is None, "тихие часы: неверное время — отказ, off — выключены")
+    check_page()
+    check_views()
+    check_actions(sys.argv[1])
+    check_notify()
+
+    # Второй опрос с тем же токеном: поддельный API, как Telegram, обрывает ждущий опрос бота ответом 409
+    polling()
+    try:
+        urllib.request.urlopen(urllib.request.Request(f"{FAKE}/bot{TOKEN}/getUpdates", data=b'{"timeout": 0}',
+                                                      headers={"Content-Type": "application/json"}), timeout=10).read()
+    except OSError:
+        pass
+    report(in_journal("опрашивает кто-то ещё (409)"), "409 (токен опрашивает кто-то ещё) записан в журнал панели")
+    r = say(5001, "/help")
+    report("/start" in first(r), "после 409 бот снова отвечает")
+
+    rc, out, err = iof("invite", "main")
+    code5 = code_of(out)
+    with open(MIGRATE, "w") as f:
+        f.write(f"role=source\nid=iof-test\npeer=root@192.0.2.1\nstarted={int(time.time())}\n")
+    rc, out, err = iof("invite", "main")
+    report(rc != 0 and "идёт перенос" in err, "при переносе отсюда: iof bot invite отказана")
+    rc, out, err = iof("show")
+    report(rc == 0 and "Перенос" in out, "при переносе: iof bot show работает")
+    code, data = panel("/api/bot", {"action": "set", "key": "actions", "on": True})
+    report(code == 400 and "перенос" in data.get("error", "") and cfg()["actions"] is False, "при переносе: панель не меняет настройки бота")
+    r = say(5005, code5)
+    report("перенос" in first(r) and admin(5005) is None and len(cfg()["invites"]) == 1, "при переносе: код не принят, бот отвечает, что идёт перенос")
+
+    with open(MIGRATE, "w") as f:
+        f.write(f"role=target\nid=iof-test\npeer=root@192.0.2.1\nstarted={int(time.time())}\n")
+    report(quiet(), "сервер принимает управление (role=target): бот не опрашивает API")
+    report(thread_state("migrate"), "role=target: /api/bot показывает, что бот ждёт конца переноса")
+    upd, before = say(5001, "/help", wait=False)
+    time.sleep(4)
+    report(fake("/fake/state")["offset"] <= upd and not fake(f"/fake/sent?after={before}"), "role=target: сообщение не обработано")
+    os.remove(MIGRATE)
+    r = replies(upd, before, 20)
+    report("/start" in first(r), "без переноса бот снова работает и отвечает на ждавшее сообщение")
+
+    rc, out, err = iof("off")
+    report(rc == 0 and quiet() and cfg()["enabled"] is False, "iof bot off: бот не опрашивает API")
+    rc, out, err = iof("on")
+    report(rc == 0 and polling(), "iof bot on: снова опрашивает")
+    rc, out, err = iof("token", stdin="\n")
+    report(rc == 0 and not os.path.exists(BOT_TOKEN) and cfg()["enabled"] is False and quiet(),
+           "пустой токен: токен удалён, бот выключен и не опрашивает API")
+
+    secret = TOKEN.split(":", 1)[1]
+    leaks = [name for name, text in (("журнал iof-web и fake-tg", journal()), ("bot.json", open(BOT_JSON).read()),
+                                     ("iof bot show", iof("show")[1])) if secret in text]
+    report(not leaks, "токена нет в журналах, bot.json и iof bot show" + (f": есть в {', '.join(leaks)}" if leaks else ""))
+
+
+try:
+    run()
+finally:
+    if os.path.exists(MIGRATE):
+        os.remove(MIGRATE)
+    remove_long()
+PY
+)"
+  rc=$?
+  tally "$out"
+  if (( rc != 0 )); then fail "проверка бота завершилась с кодом $rc"; fi
+  on "$M" rm -f /root/iof/migrate.conf
+  GUARD_LEFT=0
+  bot_restore
 }
 
 # Оценка проверки $2 на узле $1 из iof api audit: "статус значение", down — узел не ответил.
@@ -783,6 +1998,7 @@ import copy, json, sys
 s = json.load(open("/root/iof/audit/probe/session.json"))
 token = open("/root/iof/audit/probe/token").read().strip()
 first = sys.argv[1]
+PC = "172.30.0.99"  # адрес ПК: частный, но в отчёте remap, как со стенда
 
 
 def report(kind):
@@ -796,9 +2012,11 @@ def report(kind):
         t["tunnel"] = {"tested": False, "reason": "nohysteria"}
         if kind == "block" and name == first:
             t["conn"] = [{"tcp": None, "tls": None, "fp": "", "bytes": 0, "ms": 0, "src": "", "err": "tcp: timeout"}] * 3
-        if kind == "vpn":
-            for c in t["conn"]:
-                c["src"] = s["nodes"][first]["ip"]
+        # IP источника, как его видит мишень. В контроле это адрес управляющего сервера, а он бывает
+        # узлом (в CI так всегда): с ним отчёт значил бы «ПК ходил через VPN на этот узел»
+        for c in t["conn"]:
+            if c.get("src"):
+                c["src"] = s["nodes"][first]["ip"] if kind == "vpn" else PC
         targets.append(t)
     lists = [{"host": h, "list": "white", "ok": True, "err": ""} for h in s["lists"]["white"]]
     lists += [{"host": h, "list": "black", "ok": False, "err": "tls: timeout"} for h in s["lists"]["black"]]
@@ -881,6 +2099,42 @@ tally() {
   done <<<"$1"
 }
 
+# Импорт в одну секунду: последний результат в API/CLI и удаление старых отчётов.
+probe_order() {
+  on_in "$M" python3 - "$1" <<'PY'
+import contextlib, io, json, os, shutil, sys, tempfile, time
+from unittest.mock import patch
+
+with open("/usr/local/bin/iof", encoding="utf-8") as f:
+    source = f.read().split("AUDIT_PY=$(cat <<'EOF'\n", 1)[1].split("\nEOF\n", 1)[0]
+audit = {}
+exec(source.split("\nmode = sys.argv[1]\n", 1)[0], audit)
+first = sys.argv[1]
+now = int(time.time())
+stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(now))
+with tempfile.TemporaryDirectory(prefix="iof-test-probe-order-") as base:
+    for name in ("session.json", "token"):
+        shutil.copyfile("/root/iof/audit/probe/" + name, os.path.join(base, name))
+    with patch("time.time", return_value=now), patch("sys.stdin", io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+        audit["probe_import"](base, 5, "/root/iof-test-probe-block.json")
+        audit["probe_import"](base, 5, "/root/iof-test-probe-vpn.json")
+        last = audit["probe_api"](base)["last"]
+        assert (last["nodes"][first]["status"], last["confidence"]) == ("none", "low"), "API вернул предыдущий отчёт"
+        for _ in range(10):
+            audit["probe_import"](base, 5, "/root/iof-test-probe-vpn.json")
+    names = audit["results"](base)
+    assert names == [f"{stamp}-{i}.json" for i in range(8, 13)], f"неверный порядок или удалены новые отчёты: {names}"
+    last = audit["probe_api"](base)["last"]
+    with open(os.path.join(base, f"{stamp}-12.json"), encoding="utf-8") as f:
+        assert last == json.load(f), "API вернул не последний отчёт"
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        audit["probe_list"](base)
+    assert "уверенность низкая" in output.getvalue(), "CLI вернул предыдущий отчёт"
+print("ok    отчёты в одну секунду: последний в API/CLI, числовой порядок, сохранены пять последних из двенадцати")
+PY
+}
+
 # Проверка с ПК (iof audit probe). Мишени поднимаются на узлах с python3, узел без него получает
 # «не проверяется». На первом узле с python3, который не управляющий сервер, входящие запрещены
 # политикой DROP: мишень открывает свой порт правилом и снимает его. Мишени отвечают с токеном
@@ -930,6 +2184,7 @@ check_probe() {
   tally "$(probe_answers "$first")"
 
   probe_reports "$first"
+  if out="$(probe_order "$first" 2>&1)"; then tally "$out"; else fail "порядок отчётов в одну секунду"; details "$out"; fi
   if out="$(on "$M" bash -c 'iof audit probe import < /root/iof-test-probe-block.json' 2>&1)"; then ok "iof audit probe import"; else fail "iof audit probe import"; details "$out"; fi
   got="$(probe_result "$first")"
   if [[ "$got" == "crit high" ]]; then ok "отчёт: у $first с ПК не проходит TCP — проблема, уверенность высокая"; else fail "отчёт: $first — «$got», ожидалось «crit high»"; fi
@@ -1309,6 +2564,8 @@ step "Блок-лист сканеров"
 check_block
 step "Действия во время переноса"
 check_guard
+step "Телеграм-бот"
+check_bot
 step "Проверка с ПК"
 check_probe
 step "Веб-панель"
