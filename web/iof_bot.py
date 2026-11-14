@@ -464,6 +464,19 @@ def service_text(d, pending=False, now=None):
         lines.append(f"{MARK['warn']} Не запланирована: <code>sudo crontab -e</code>, строка "
                      f"<code>{esc('*/5 * * * * /usr/local/bin/iof check >/dev/null 2>&1')}</code>")
 
+    ru = (d.get("daily") or {}).get("ru")
+    if ru:
+        lines += ["", "<b>Доступ к российским серверам</b> (iof check раз в сутки)",
+                  f"Последняя: {stamp(ru['at'], now)}"]
+        if ru["cut"]:
+            lines.append(f"{MARK['crit']} РФ недоступна с узлов: {esc(', '.join(ru['cut']))}")
+        if ru["noinet"]:
+            lines.append(f"{MARK['warn']} нет интернета: {esc(', '.join(ru['noinet']))}")
+        if not ru["cut"] and not ru["noinet"]:
+            lines.append(f"{MARK['good']} отвечают со всех проверенных узлов: {ru['nodes']}")
+        if ru["down"]:
+            lines.append(f"{MARK['none']} не проверены, нет связи: {esc(', '.join(ru['down']))}")
+
     lines += ["", "<b>Ночное обслуживание</b>"]
     n, local = d.get("nightly"), d.get("nightly_local")
     if n:
@@ -1269,6 +1282,9 @@ class Bot:
                       "удаления группы. Каждое — после кнопки «Подтвердить». "
                   + ("Тебе они доступны." if deny is None else esc(deny)),
                   "Удаление узлов, перенос, обновление iof, блок-лист и смена портов — только в панели.",
+                  "", "Уведомления (проблемы узлов, аудит, ночное обслуживание, новая версия iof, доступ к РФ, "
+                      "новые админы) приходят тем, кому их отметили в панели на странице «Телеграм бот». "
+                      "В тихие часы — без звука.",
                   "", "Админов добавляют приглашением, а удаляют и меняют им роль только на сервере: "
                       "в панели iof-web или командой sudo iof bot."]
         return "\n".join(lines)

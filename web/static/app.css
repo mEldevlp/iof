@@ -663,7 +663,9 @@ table.admins { width: 100%; border-collapse: collapse; font-size: 13px; font-var
 .admins .sub-line { margin-top: 0; }
 .admins select { height: 28px; }
 .admins-note { margin: 0 16px 16px; }
-.sub-head { margin: 0; padding: 16px 16px 8px; font-size: 13px; font-weight: 600; color: var(--ink-2); }
+/* Уведомления: та же таблица, что у админов, галочки типов по центру колонок */
+.notify th:not(:first-child), .notify td:not(:first-child) { text-align: center; }
+.notify input[type="checkbox"] { width: 16px; height: 16px; margin: 0; vertical-align: middle; accent-color: var(--accent); }.sub-head { margin: 0; padding: 16px 16px 8px; font-size: 13px; font-weight: 600; color: var(--ink-2); }
 .invites { list-style: none; margin: 0; padding: 0 16px 8px; }
 .invites li { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding: 8px 0; border-top: 1px solid var(--grid); font-size: 13px; }
 .invite-when { flex: 1 1 220px; font-variant-numeric: tabular-nums; }

@@ -7,9 +7,19 @@
 
 const ROLES = { main: "главный", regular: "обычный" };
 const ROLE_HINTS = {
-  main: "Главный: просмотр, ссылки Hysteria2 и действия из бота, если они разрешены в настройках.",
-  regular: "Обычный: просмотр и ссылки Hysteria2, без действий.",
+  main: "Главный: просмотр, ссылки Hysteria2 и действия из бота, если они разрешены в настройках, все уведомления.",
+  regular: "Обычный: просмотр и ссылки Hysteria2, без действий; уведомления все, кроме новых админов.",
 };
+// Типы уведомлений: как NOTIFY в BOT_PY iof.sh (сверяет ci/lint.sh). [тип, колонка, когда приходит]
+const NOTIFY = [
+  ["nodes", "Узлы", "узел перестал работать или снова в порядке: <code>iof check</code> из cron"],
+  ["audit", "Аудит", "проверка из cron (<code>iof audit cron</code>) оказалась хуже прошлой"],
+  ["nightly", "Ночное обслуживание", "запущены обновление пакетов и перезагрузка (<code>iof-nightly</code>): на скольких узлах и где не вышло"],
+  ["updates", "Обновления iof", "на GitHub вышла новая версия iof, один раз на версию: <code>iof check</code> раз в сутки"],
+  ["ru", "Доступ к РФ", "с узла отвечает меньше половины российских серверов (RU_TARGETS), а зарубежные отвечают, и когда снова отвечают: <code>iof check</code> раз в сутки"],
+  ["admins", "Новые админы", "по приглашению добавился админ: утёкший код видно сразу. Только главным"],
+];
+const NOTIFY_MAIN = ["admins"];
 const TOKEN_RE = /^[0-9]{1,20}:[A-Za-z0-9_-]{20,100}$/;
 
 const bot = { data: null, busy: false, timer: null, shown: {} };
@@ -211,6 +221,40 @@ function renderAdmins(d) {
   }));
 }
 
+// Уведомления: галочки типов у каждого админа. У обычного нет «новых админов». notify = null (ещё не
+// настраивали) значит то же, что ничего не отмечено. Перерисовка, только когда поменялись данные
+function renderNotify(d) {
+  const c = d.config;
+  if (!c) return;
+  const key = JSON.stringify([c.admins, c.enabled, d.token]);
+  if (bot.shown.notify === key) return;
+  bot.shown.notify = key;
+  const admins = c.admins;
+  const allowed = (a, k) => a.role === "main" || !NOTIFY_MAIN.includes(k);
+  const anyone = admins.some((a) => (a.notify || []).length);
+  const hints = [];
+  if (!admins.length) hints.push("Уведомления получают админы бота: сначала добавь админа.");
+  else if (!anyone) hints.push("Пока никому ничего не приходит: отметь типы. Новому админу ничего не отмечено.");
+  else hints.push("Каждый админ получает отмеченные типы в личный чат с ботом. В тихие часы — без звука, кроме тех, у кого «со звуком».");
+  if (!c.enabled || !d.token) hints.push("Бот выключен: без него узлы и аудит уходят в <code>TG_CHAT</code> из <code>/root/iof/iof.env</code>, если он задан, остальное не уходит.");
+  $("#notify-hint").innerHTML = hints.join(" ");
+  $("#notify").innerHTML = admins.length ? `<table class="admins notify">
+    <thead><tr><th>Админ</th>${NOTIFY.map(([, title]) => `<th>${esc(title)}</th>`).join("")}</tr></thead>
+    <tbody>${admins.map((a) => `<tr>
+      <td class="cell-name"><span class="item-title">${esc(a.name || "без имени")}</span><span class="sub-line">${ROLES[a.role] || a.role}</span></td>
+      ${NOTIFY.map(([k, title]) => `<td data-label="${esc(title)}">${allowed(a, k)
+        ? `<input type="checkbox" data-notify="${a.id}" value="${k}" data-lock${(a.notify || []).includes(k) ? " checked" : ""}
+            aria-label="${esc(title)}: ${esc(a.name || a.id)}">`
+        : '<span class="muted" title="Только главным админам">—</span>'}</td>`).join("")}
+    </tr>`).join("")}</tbody></table>` : "";
+  $("#notify").querySelectorAll("[data-notify]").forEach((i) => i.addEventListener("change", () => {
+    const id = i.dataset.notify;
+    const kinds = [...$("#notify").querySelectorAll(`[data-notify="${id}"]:checked`)].map((x) => x.value);
+    act({ action: "admin_set", id: Number(id), notify: kinds });
+  }));
+  $("#notify-types").innerHTML = NOTIFY.map(([, title, about]) => `<dt>${esc(title)}</dt><dd>${about}</dd>`).join("");
+}
+
 // Пока идёт запрос, кнопки и выключатели заблокированы. При переносе отсюда iof всё равно откажет,
 // поэтому всё заблокировано сразу
 function lock() {
@@ -228,6 +272,7 @@ function render() {
   renderState(d);
   renderSettings(d);
   renderAdmins(d);
+  renderNotify(d);
   lock();
 }
 
@@ -370,8 +415,11 @@ function demoInit() {
       enabled: true, username: "island_of_freedom_bot", actions: false, hy2_links: true,
       quiet: { from: "23:00", to: "08:00" },
       admins: [
-        { id: 184467302, name: "Алексей", username: "alexey_k", role: "main", sound: true, added: now - 86400 * 12 },
-        { id: 529901144, name: "Марина", username: "", role: "regular", sound: false, added: now - 86400 * 3 },
+        { id: 184467302, name: "Алексей", username: "alexey_k", role: "main", sound: true, added: now - 86400 * 12,
+          notify: ["nodes", "audit", "updates", "ru", "admins"] },
+        { id: 529901144, name: "Марина", username: "", role: "regular", sound: false, added: now - 86400 * 3,
+          notify: ["nodes", "ru"] },
+        { id: 733015920, name: "Илья", username: "ilya_ops", role: "regular", sound: false, added: now - 3600 * 20, notify: null },
       ],
       invites: [{ hash: "4f1c9a07be52", role: "regular", created: now - 3600 * 5, expires: now + 3600 * 19 }],
     },
@@ -457,10 +505,17 @@ async function demoPost(b) {
   } else if (b.action === "invite_del") {
     c.invites = c.invites.filter((i) => !i.hash.startsWith(b.hash));
     message = `Приглашение ${b.hash}… отозвано`;
+  } else if (b.action === "admin_set" && b.notify) {
+    const a = admin();
+    a.notify = NOTIFY.map(([k]) => k).filter((k) => b.notify.includes(k) && (a.role === "main" || !NOTIFY_MAIN.includes(k)));
+    message = `Админ ${a.id}: уведомления — ${a.notify.length ? NOTIFY.filter(([k]) => a.notify.includes(k)).map(([, t]) => t.toLowerCase()).join(", ") : "нет"}`;
   } else if (b.action === "admin_set") {
     const a = admin();
-    if (b.role) a.role = b.role;
-    else a.sound = b.sound;
+    if (b.role) {
+      a.role = b.role;
+      // Как iof: типы, недоступные новой роли, снимаются
+      if (a.notify) a.notify = a.notify.filter((k) => a.role === "main" || !NOTIFY_MAIN.includes(k));
+    } else a.sound = b.sound;
     message = b.role ? `Админ ${a.id}: роль ${ROLES[a.role]}` : `Админ ${a.id}: уведомления в тихие часы ${a.sound ? "со звуком" : "без звука"}`;
   } else if (b.action === "admin_del") {
     const a = admin();

@@ -6,8 +6,8 @@
 # портов), аудит безопасности видит изменения на узле (в том числе расхождение конфига Hysteria2
 # с шаблоном в блоке dpi), блок-лист отбрасывает пакеты с адресов из списка и не трогает защищённые,
 # действия запрещены во время переноса, Telegram-бот панели через поддельный Bot API принимает коды
-# приглашений, молчит чужим, показывает состояние, выполняет действия после подтверждения и выдаёт
-# ссылки Hysteria2 с QR, мишени проверки с ПК отвечают только с токеном, готовый отчёт
+# приглашений, молчит чужим, показывает состояние, выполняет действия после подтверждения, выдаёт
+# ссылки Hysteria2 с QR и шлёт уведомления подписанным админам, мишени проверки с ПК отвечают только с токеном, готовый отчёт
 # даёт ожидаемые оценки, мишени исчезают по сроку; панель отвечает, отбивает чужие
 # запросы, выполняет задачи, выдаёт скрипт для ПК по билету и открывает терминал на каждый узел
 # (stand.sh setup включает его в web.env). Созданные группы ссылок и ретранслятор удаляются,
@@ -633,18 +633,24 @@ check_guard() {
   GUARD_LEFT=0
 }
 
-# Копии bot.json и bot.token до проверки бота, после неё всё возвращается как было
+# Копии bot.json и bot.token до проверки бота, после неё всё возвращается как было. Уведомления меняют
+# ещё iof.env (TG_TOKEN, RU_TARGETS, IOF_SRC), check.daily и состояние доступа к РФ в /root/iof/ru
 bot_save() {
   on "$M" bash -c 'rm -rf /root/.iof-test-bot && mkdir -m 700 /root/.iof-test-bot
-    for f in bot.json bot.token; do if [[ -f /root/iof/$f ]]; then cp -p /root/iof/$f /root/.iof-test-bot/; fi; done'
+    for f in bot.json bot.token iof.env check.daily check.last; do if [[ -f /root/iof/$f ]]; then cp -p /root/iof/$f /root/.iof-test-bot/; fi; done
+    if [[ -d /root/iof/state ]]; then cp -a /root/iof/state /root/.iof-test-bot/state; fi
+    if [[ -d /root/iof/ru ]]; then cp -a /root/iof/ru /root/.iof-test-bot/ru; fi'
   BOT_LEFT=1
 }
 
 bot_restore() {
-  on "$M" bash -c 'for f in bot.json bot.token; do
+  on "$M" bash -c 'for f in bot.json bot.token iof.env check.daily check.last; do
       rm -f /root/iof/$f
       if [[ -f /root/.iof-test-bot/$f ]]; then cp -p /root/.iof-test-bot/$f /root/iof/$f; fi
     done
+    rm -rf /root/iof/ru /root/iof-test-upd /root/iof/state
+    if [[ -d /root/.iof-test-bot/state ]]; then cp -a /root/.iof-test-bot/state /root/iof/state; fi
+    if [[ -d /root/.iof-test-bot/ru ]]; then cp -a /root/.iof-test-bot/ru /root/iof/ru; fi
     rm -rf /root/.iof-test-bot
     # Узел с длинным именем из проверки кнопок бота
     sed -i "/^ci-bot-long-/d" /root/iof/nodes.conf
@@ -674,7 +680,10 @@ bot_restore() {
 # подтверждение и отмена, повторное, чужое, истёкшее нажатие и после перезапуска панели, занятая очередь,
 # ход задачи правками одного сообщения, перенос (check разрешён), перезапуск Hysteria2 и проверка узла,
 # группа $BOT_GROUP создаётся и удаляется из бота, её ссылки с QR и без qrencode, выдача ссылок выключена;
-# паролей Hysteria2 нет в журнале и логах задач. Токен не попадает в журналы, bot.json и iof bot show
+# паролей Hysteria2 нет в журнале и логах задач. Уведомления: только подписанным и только типы роли, набор из
+# iof bot и из панели, тихие часы и звук, новый админ, iof check, доступ к РФ и новая версия iof из ежедневной
+# части iof check, нет связи с Bot API, старый путь TG_TOKEN без бота. Токен не попадает в журналы, bot.json
+# и iof bot show
 check_bot() {
   local out rc
   if on "$M" test -f /root/iof/migrate.conf; then echo "      идёт настоящий перенос, проверку бота пропускаю"; return 0; fi
@@ -1403,6 +1412,253 @@ def check_actions(label):
     iof("set", "actions", "off")
 
 
+ENV = "/root/iof/iof.env"
+UPD = "/root/iof-test-upd"   # git-репозитории для проверки уведомления о новой версии iof
+
+
+def run_iof(*args, stdin="", env=None, timeout=180):
+    p = subprocess.run(["iof", *args], input=stdin.encode(), capture_output=True, timeout=timeout,
+                       env=dict(os.environ, **(env or {})))
+    return p.returncode, p.stdout.decode("utf-8", "replace"), p.stderr.decode("utf-8", "replace")
+
+
+def env_with(base, **kv):
+    """iof.env = base без строк этих ключей плюс они сами (пустое значение — тоже строка)."""
+    lines = [s for s in base.splitlines() if not any(re.match(rf"\s*{k}=", s) for k in kv)]
+    lines += [f'{k}="{v}"' for k, v in kv.items()]
+    with open(ENV + ".t", "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    os.chmod(ENV + ".t", 0o600)
+    os.replace(ENV + ".t", ENV)
+
+
+def mark():
+    return fake("/fake/state")["sent"]
+
+
+def notes(before, title=None):
+    """Отправленные с номера before сообщения (sendMessage) -> {chat_id: [вызов]}, только с заголовком title."""
+    out = {}
+    for s in fake(f"/fake/sent?after={before}"):
+        if s["method"] == "sendMessage" and (title is None or f"<b>{title}</b>" in s["params"].get("text", "")):
+            out.setdefault(s["params"].get("chat_id"), []).append(s)
+    return out
+
+
+def hhmm(minutes):
+    t = time.localtime()
+    m = (t.tm_hour * 60 + t.tm_min + minutes) % 1440
+    return f"{m // 60:02d}:{m % 60:02d}"
+
+
+def git(*args, cwd=None):
+    subprocess.run(["git", "-c", "user.name=iof-test", "-c", "user.email=iof-test@example.invalid", *args],
+                   cwd=cwd, check=True, capture_output=True, timeout=60)
+
+
+def check_notify():
+    """Уведомления (этап 5): notify null — ничего, набор из iof bot и из панели, обычному недоступны новые админы,
+    уведомление только подписанным и только доступных роли типов, текст экранирован, тихие часы
+    (disable_notification, у админа со звуком без него), новый админ — главным, iof check (узел снова
+    работает), доступ к РФ (закрыт, снова открыт, нет интернета) и новая версия iof из ежедневной части
+    iof check, нет связи с Bot API — iof check всё равно завершается, бот выключен — старый путь TG_TOKEN
+    и TG_CHAT (только узлы и аудит) или ничего. Токенов нет в выводе. Бот включён, токен TOKEN, админ 5001."""
+    secret = TOKEN.split(":", 1)[1]
+    old_token = "777001:AAEstandOldPathTokenForIofTestsXX"
+    outputs = []
+    env0 = open(ENV, encoding="utf-8").read()
+    node = node_names()[0]
+    NODES, AUDIT, RU, UPDATES, ADMINS = ("Узлы", "Аудит безопасности: стало хуже", "Доступ к российским серверам",
+                                         "Вышла новая версия iof", "Новый админ")
+
+    iof("admin", "set", "5001", "role", "regular")
+    iof("admin", "set", "5001", "notify", "off")
+    rc, out, err = iof("invite", "main")
+    r = say(5020, code_of(out))
+    a = admin(5020) or {}
+    report("ты админ" in first(r) and a.get("role") == "main" and a.get("notify") is None, "новый админ: notify null")
+    before = mark()
+    rc, out, err = run_iof("notify", "nodes", "проверка: никому")
+    outputs.append(out + err)
+    report(rc == 0 and not notes(before) and "никто" in out, "notify null и off: уведомление никому не ушло")
+
+    rc, out, err = iof("admin", "set", "5001", "notify", "nodes,admins")
+    report(rc != 0 and "только главным" in err, "iof bot admin set notify: обычному «новые админы» — отказ")
+    rc, out, err = iof("admin", "set", "5001", "notify", "nodes,bogus")
+    report(rc != 0 and "bogus" in err, "iof bot admin set notify: неизвестный тип — отказ")
+    rc, out, err = iof("admin", "set", "5001", "notify", "all")
+    report(rc == 0 and (admin(5001) or {}).get("notify") == ["nodes", "audit", "nightly", "updates", "ru"],
+           "iof bot admin set notify all: обычному все типы, кроме новых админов")
+    code, data = panel("/api/bot", {"action": "admin_set", "id": 5020, "notify": ["admins", "nodes"]})
+    shown = next((x for x in ((data.get("bot") or {}).get("config") or {}).get("admins", []) if x["id"] == 5020), {})
+    report(code == 200 and (admin(5020) or {}).get("notify") == ["nodes", "admins"] and shown.get("notify") == ["nodes", "admins"],
+           f"панель: главному отмечены узлы и новые админы ({code})")
+    code, _ = panel("/api/bot", {"action": "admin_set", "id": 5020, "notify": ["nodes", "bogus"]})
+    report(code == 400 and (admin(5020) or {}).get("notify") == ["nodes", "admins"], f"панель: неизвестный тип не принят ({code})")
+    rc, out, err = iof("show")
+    report(rc == 0 and "nodes,admins" in out and "nodes,audit,nightly,updates,ru" in out, "iof bot show: уведомления админов")
+
+    before = mark()
+    rc, out, err = run_iof("notify", "nodes", "[ПРОБЛЕМА] node-x (192.0.2.7): <b>не тег</b> & ещё")
+    outputs.append(out + err)
+    got = notes(before, NODES)
+    text = got.get(5020, [{}])[0].get("params", {}).get("text", "")
+    report(rc == 0 and set(got) == {5001, 5020} and "отправлено 2 из 2" in out, "узлы: обоим подписанным админам")
+    report(text.startswith("<b>Узлы</b>\n❌ node-x") and "&lt;b&gt;не тег&lt;/b&gt; &amp; ещё" in text
+           and got[5020][0]["params"].get("parse_mode") == "HTML" and "disable_notification" not in got[5020][0]["params"],
+           "текст уведомления: заголовок, значок вместо метки, HTML экранирован, со звуком вне тихих часов")
+    before = mark()
+    rc, out, err = run_iof("notify", "audit", stdin="server: вход по паролю\n")
+    report(rc == 0 and set(notes(before, AUDIT)) == {5001}, "аудит (текст со stdin): только тому, кто подписан")
+    before = mark()
+    long_text = "<&😀>" * 2000
+    rc, out, err = run_iof("notify", "nightly", stdin=long_text)
+    got = notes(before, "Ночное обслуживание")
+    texts = [s["params"]["text"] for s in got.get(5001, [])]
+    report(rc == 0 and set(got) == {5001} and len(texts) > 1
+           and all(len(t.encode("utf-16-le")) // 2 <= 4096 for t in texts)
+           and "".join(t.split("\n", 1)[1] for t in texts) == escape(long_text),
+           "ночное обслуживание: только подписанному, длинный HTML и emoji разбиты без потерь")
+
+    data = cfg()
+    next(x for x in data["admins"] if x["id"] == 5001)["notify"] = ["nodes", "admins"]
+    with open(BOT_JSON + ".t", "w", encoding="utf-8") as f:
+        json.dump(data, f)
+    os.chmod(BOT_JSON + ".t", 0o600)
+    os.replace(BOT_JSON + ".t", BOT_JSON)
+    before = mark()
+    rc, out, err = run_iof("notify", "admins", "проверка")
+    shown = next((x for x in (panel("/api/bot")[1].get("config") or {}).get("admins", []) if x["id"] == 5001), {})
+    report(rc == 0 and set(notes(before, ADMINS)) == {5020} and shown.get("notify") == ["nodes"],
+           "новые админы у обычного в bot.json: ему не приходят, панель их не показывает")
+    iof("admin", "set", "5020", "role", "regular")
+    report((admin(5020) or {}).get("notify") == ["nodes"], "смена роли на обычного снимает «новые админы»")
+    iof("admin", "set", "5020", "role", "main")
+    iof("admin", "set", "5020", "notify", "nodes,admins")
+    iof("admin", "set", "5001", "notify", "all")
+
+    before = mark()
+    rc, out, err = iof("invite", "main")
+    r = say(5021, code_of(out))
+    got = notes(before, ADMINS)
+    text = got.get(5020, [{}])[0].get("params", {}).get("text", "")
+    report(any("ты админ" in t for t in r or []) and set(got) == {5020} and "ID 5021" in text and "главный" in text and "admin del 5021" in text,
+           "по приглашению добавился главный админ: уведомление главному, подписанному на новых админов")
+    iof("admin", "del", "5021")
+
+    iof("admin", "set", "5020", "sound", "on")
+    rc, _, _ = iof("set", "quiet", f"{hhmm(-60)}-{hhmm(60)}")
+    before = mark()
+    rc2, out, err = run_iof("notify", "nodes", "в тихие часы")
+    got = notes(before, NODES)
+    report(rc == 0 and rc2 == 0 and set(got) == {5001, 5020} and got[5001][0]["params"].get("disable_notification") is True
+           and "disable_notification" not in got[5020][0]["params"] and "тихие часы" in out,
+           "тихие часы вокруг текущего времени: без звука, у админа со звуком — со звуком")
+    iof("set", "quiet", f"{hhmm(60)}-{hhmm(120)}")
+    before = mark()
+    run_iof("notify", "nodes", "вне тихих часов")
+    got = notes(before, NODES)
+    report(set(got) == {5001, 5020} and "disable_notification" not in got[5001][0]["params"], "вне тихих часов: со звуком у всех")
+    iof("set", "quiet", "off")
+    iof("admin", "set", "5020", "sound", "off")
+
+    # iof check: узел был с проблемой, теперь в порядке — «снова работает»
+    with open(f"/root/iof/state/{node}", "w", encoding="utf-8") as f:
+        f.write("проверка уведомлений\n")
+    before = mark()
+    rc, out, err = run_iof("-n", node, "check")
+    outputs.append(out + err)
+    got = notes(before, NODES)
+    report(rc == 0 and set(got) == {5001, 5020} and f"✅ {node}" in got[5001][0]["params"]["text"] and "снова работает" in got[5001][0]["params"]["text"],
+           f"iof check: «{node} снова работает» подписанным на узлы")
+    with open(f"/root/iof/state/{node}", "w", encoding="utf-8") as f:
+        f.write("проверка уведомлений\n")
+    t0 = time.time()
+    rc, out, err = run_iof("-n", node, "check", env={"IOF_TG_API": "http://127.0.0.1:9"})
+    outputs.append(out + err)
+    report(rc == 0 and "нет связи" in err and time.time() - t0 < 60 and open(f"/root/iof/state/{node}").read().strip() == "ok",
+           f"нет связи с Bot API: iof check всё равно завершился ({time.time() - t0:.0f} с), ошибка в stderr")
+
+    # Ежедневная часть iof check: доступ к РФ и новая версия iof. Клона нет — обновления не проверяются.
+    # «Недоступные» цели — 127.0.0.9 и 127.0.0.10: на 443/tcp там отказ. Адреса TEST-NET не годятся: TUN-прокси
+    # на машине разработки принимает соединение с любым адресом, и TCP «проходит»
+    env_with(env0, RU_TARGETS="127.0.0.9 127.0.0.10", IOF_SRC="/nonexistent")
+    before = mark()
+    rc, out, err = run_iof("-n", node, "check", "--daily")
+    outputs.append(out + err)
+    got = notes(before, RU)
+    text = got.get(5001, [{}])[0].get("params", {}).get("text", "")
+    report(rc == 0 and set(got) == {5001} and f"❌ {node}" in text and "отвечают 0 из 2" in text and "путь к РФ закрыт" in out,
+           f"российские серверы не отвечают с {node}, зарубежные отвечают: «РФ недоступна» подписанному на доступ к РФ")
+    before = mark()
+    run_iof("-n", node, "check", "--daily")
+    report(not notes(before, RU), "доступ к РФ: то же состояние — второго уведомления нет")
+    # Здесь «российский» — 1.1.1.1: он отвечает на TCP 443 и со стенда, и из CI (ping на узлах стенда нет)
+    env_with(env0, RU_TARGETS="1.1.1.1", IOF_SRC="/nonexistent")
+    before = mark()
+    rc, out, err = run_iof("-n", node, "check", "--daily")
+    got = notes(before, RU)
+    report(set(got) == {5001} and f"✅ {node}" in got[5001][0]["params"]["text"] and "снова отвечают (1 из 1)" in got[5001][0]["params"]["text"],
+           "российский сервер снова отвечает: уведомление «снова отвечают»")
+    env_with(env0, RU_TARGETS="127.0.0.9", RU_CONTROL="127.0.0.10", IOF_SRC="/nonexistent")
+    before = mark()
+    rc, out, err = run_iof("-n", node, "check", "--daily")
+    got = notes(before, RU)
+    report(set(got) == {5001} and "⚠️" in got[5001][0]["params"]["text"] and "ни российские" in got[5001][0]["params"]["text"],
+           "не отвечают и зарубежные: уведомление «нет интернета»")
+    daily = open("/root/iof/check.daily", encoding="utf-8").read()
+    report(f"ru_noinet={node}" in daily and "updates=" in daily, "check.daily: итог ежедневной части для панели")
+
+    shutil.rmtree(UPD, ignore_errors=True)
+    os.makedirs(UPD)
+    git("init", "-q", "--bare", "-b", "master", f"{UPD}/origin.git")
+    git("init", "-q", "-b", "master", f"{UPD}/work")
+    git("commit", "-q", "--allow-empty", "-m", "первая версия", cwd=f"{UPD}/work")
+    git("push", "-q", f"{UPD}/origin.git", "master", cwd=f"{UPD}/work")
+    git("clone", "-q", f"{UPD}/origin.git", f"{UPD}/src")
+    git("commit", "-q", "--allow-empty", "-m", "ci: новая версия для проверки уведомления", cwd=f"{UPD}/work")
+    git("push", "-q", f"{UPD}/origin.git", "master", cwd=f"{UPD}/work")
+    env_with(env0, RU_TARGETS="", IOF_SRC=f"{UPD}/src")
+    before = mark()
+    rc, out, err = run_iof("-n", node, "check", "--daily")
+    got = notes(before, UPDATES)
+    report(rc == 0 and set(got) == {5001} and "ci: новая версия для проверки уведомления" in got[5001][0]["params"]["text"]
+           and "новых коммитов: 1" in out, "новая версия iof (git fetch в клоне): уведомление подписанному на обновления")
+    before = mark()
+    run_iof("-n", node, "check", "--daily")
+    report(not notes(before, UPDATES), "та же новая версия: второго уведомления нет")
+    shutil.rmtree(UPD, ignore_errors=True)
+
+    # Бот выключен: старый путь, TG_TOKEN и TG_CHAT из iof.env, только узлы и аудит
+    iof("off")
+    env_with(env0, TG_TOKEN=old_token, TG_CHAT="5099")
+    before = mark()
+    rc, out, err = run_iof("notify", "nodes", "старый путь")
+    outputs.append(out + err)
+    got = [s for s in fake(f"/fake/sent?after={before}") if s["method"] == "sendMessage"]
+    report(rc == 0 and len(got) == 1 and got[0]["bot"] == 777001 and str(got[0]["params"].get("chat_id")) == "5099"
+           and got[0]["params"].get("text") == "старый путь" and "TG_CHAT" in out, "бот выключен: узлы уходят в TG_CHAT с TG_TOKEN из iof.env")
+    before = mark()
+    rc, out, err = run_iof("notify", "audit", "хуже")
+    got = [s for s in fake(f"/fake/sent?after={before}") if s["method"] == "sendMessage"]
+    report(len(got) == 1 and got[0]["params"].get("text", "").startswith("Аудит безопасности, стало хуже:"), "бот выключен: аудит в TG_CHAT, как раньше")
+    before = mark()
+    rc, out, err = run_iof("notify", "ru", "x")
+    report(rc == 0 and not fake(f"/fake/sent?after={before}") and "только узлы и аудит" in out, "бот выключен: доступа к РФ в TG_CHAT нет")
+    env_with(env0)
+    before = mark()
+    rc, out, err = run_iof("notify", "nodes", "некуда")
+    report(rc == 0 and not fake(f"/fake/sent?after={before}") and "не настроен" in out, "бот выключен и TG_TOKEN нет: уведомление не уходит, iof не падает")
+    iof("on")
+    report(polling(), "бот снова включён и опрашивает API")
+    iof("admin", "del", "5020")
+    iof("admin", "set", "5001", "notify", "off")
+
+    old_secret = old_token.split(":", 1)[1]
+    leaks = [o for o in outputs if secret in o or old_secret in o]
+    report(not leaks and secret not in journal() and old_secret not in journal(), "токенов бота и TG_TOKEN нет в выводе iof и журналах")
+
+
 def run():
     for f in (BOT_JSON, BOT_TOKEN):
         if os.path.exists(f):
@@ -1507,6 +1763,7 @@ def run():
     check_page()
     check_views()
     check_actions(sys.argv[1])
+    check_notify()
 
     # Второй опрос с тем же токеном: поддельный API, как Telegram, обрывает ждущий опрос бота ответом 409
     polling()

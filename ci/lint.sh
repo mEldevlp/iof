@@ -188,6 +188,8 @@ check_probe() {
   if command -v pwsh >/dev/null 2>&1; then
     ps=pwsh
     path="$ROOT/$f"
+    # PowerShell 7 в Git Bash тоже Windows-программа: путь внутри -Command MSYS не переводит
+    if command -v cygpath >/dev/null 2>&1; then path="$(cygpath -w "$path")"; fi
   elif command -v powershell.exe >/dev/null 2>&1 && command -v cygpath >/dev/null 2>&1; then
     ps=powershell.exe
     path="$(cygpath -w "$ROOT/$f")"
@@ -202,6 +204,22 @@ check_probe() {
   else
     fail "probe.ps1: ошибки разбора ($ps)"
     details "$out"
+  fi
+}
+
+# Типы уведомлений записаны в четырёх местах: NOTIFY_KINDS и NOTIFY в BOT_PY (iof.sh), BOT_NOTIFY (панель)
+# и NOTIFY (страница «Телеграм бот»). Новый тип, добавленный не везде, iof не отправит или страница не покажет
+check_notify() {
+  local sh py web js
+  sh="$(sed -n 's/^NOTIFY_KINDS="\(.*\)"$/\1/p' iof.sh)"
+  py="$(sed -n '/^NOTIFY = {/,/^}/p' iof.sh | grep -oE '^    "[a-z]+"' | tr -d ' "' | tr '\n' ' ' | sed 's/ $//')"
+  web="$(grep -E '^BOT_NOTIFY = \(' web/iof-web.py | grep -oE '"[a-z]+"' | tr -d '"' | tr '\n' ' ' | sed 's/ $//')"
+  js="$(sed -n '/^const NOTIFY = \[/,/^\];/p' web/static/bot.js | grep -oE '^  \["[a-z]+"' | tr -d ' ["' | tr '\n' ' ' | sed 's/ $//')"
+  if [[ -n "$sh" && "$sh" == "$py" && "$sh" == "$web" && "$sh" == "$js" ]]; then
+    ok "типы уведомлений одинаковы в iof.sh, iof-web.py и bot.js: $sh"
+  else
+    fail "типы уведомлений расходятся"
+    details "NOTIFY_KINDS: $sh"$'\n'"NOTIFY (BOT_PY): $py"$'\n'"BOT_NOTIFY: $web"$'\n'"NOTIFY (bot.js): $js"
   fi
 }
 
@@ -223,6 +241,7 @@ check_csp
 check_menu
 check_vendor
 check_probe
+check_notify
 check_eol
 
 echo

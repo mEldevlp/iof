@@ -1,9 +1,9 @@
-# iof (Island of Freedom): контекст проекта для Claude
+# iof (Island of Freedom): контекст проекта для Codex
 
-Этот файл Claude Code читает в начале каждого чата в репозитории.
+Этот файл Codex читает в начале каждого чата в репозитории.
 
 **Правило:** при любом изменении проекта (новая команда, файл, формат данных, эндпоинт панели,
-путь на сервере, конвенция) Claude обновляет этот файл в том же изменении. Описанное здесь
+путь на сервере, конвенция) Codex обновляет этот файл в том же изменении. Описанное здесь
 должно совпадать с кодом. Если код и файл расходятся, прав код: исправь файл.
 
 ## Что это
@@ -35,7 +35,7 @@ Docker Desktop там не запускается: Kaspersky Standard не да�
 | `web/static/xterm.js`, `xterm-fit.js`, `xterm.css` | сторонний код для терминала: `@xterm/xterm` 6.0.0 и `@xterm/addon-fit` 0.11.0 из npm, см. «Терминал» | `/opt/iof-web/static/` |
 | `web/probe.ps1` | скрипт проверки с ПК (Windows PowerShell 5.1 и 7), только ASCII; не статика: панель отдаёт его по билету, вписав данные проверки вместо `__IOF_PROBE_CONFIG__` | `/opt/iof-web/probe.ps1` |
 | `web/design.md` | цвета, шрифты, размеры, брейкпоинты и классы панели | не ставится |
-| `docs/panel-*.png` | скриншоты панели для README в тёмной теме: два на виду, четыре под спойлером; сняты в демо-режиме (см. «Проверка изменений») | не ставится |
+| `docs/panel-*.png` | скриншоты панели для README в тёмной теме: два на виду, пять под спойлером; сняты в демо-режиме (см. «Проверка изменений») | не ставится |
 | `README.md` | инструкция для пользователя | — |
 | `stand/` | тестовый стенд на Docker: `Dockerfile` (Ubuntu 24.04 с systemd и SSH), `compose.yml` (old, node1, node2, new), `stand.sh`, `test.sh` (проверка iof на стенде), `hy2-template.yaml`, `fake-tg.py` (поддельный Bot API для бота) | не ставится; попадает в `/opt/iof` как часть клона |
 | `ci/lint.sh` | статические проверки: `bash -n`, shellcheck, разбор и pyflakes для `iof-web.py`, `iof_bot.py` и `stand/fake-tg.py`, `node --check`, правила проекта (NODE_FUNCS, STATIC_FILES, CSP, одинаковое меню во всех html, `probe.ps1`: только ASCII, одна метка, разбор парсером PowerShell, если он есть, LF) | не ставится |
@@ -52,7 +52,7 @@ Docker Desktop там не запускается: Kaspersky Standard не да�
   и конфигах AWG. Управляющий сервер в трафике клиентов не участвует.
 - Управляющий сервер хранит SSH-ключ к узлам и данные в `/root/iof`, а сам ходит на узлы по SSH.
 - Сам управляющий сервер обычно тоже узел: в `nodes.conf` у него ssh = `local`, и команды
-  выполняются локально через `bash -c`.
+  выполняются локально через `bash <(…)` (см. `run_on` ниже).
 - `iof hy2 install` берёт шаблон конфига Hysteria2 с управляющего сервера
   (`/etc/hysteria/config.yaml` или `$HY2_TEMPLATE`), а CN сертификата — из его сертификата.
 
@@ -62,9 +62,9 @@ Docker Desktop там не запускается: Kaspersky Standard не да�
 |---|---|
 | `nodes.conf` | `имя \| адрес для клиентов \| ssh (local или user@host[:port]) \| подпись`, `#` = комментарий |
 | `relays.conf` | `узел \| через узел \| hy2 порт ретранслятора \| hy2 порт узла \| awg порт ретранслятора \| awg порт узла`, `-` = протокол не ретранслируется |
-| `iof.env` | bash, читается через `source`: `TG_TOKEN`, `TG_CHAT`, `PARALLEL`, `IOF_SRC`, `HY2_TEMPLATE`, `HY2_CN` (CN сертификата для `hy2 install`, если сертификата из шаблона здесь нет), `AUDIT_KEEP`, `BLOCKLIST_URL` и `REGISTRY_URL` (списки для блока dpi и `iof block`: текст, IP или CIDR в строке, `#` — комментарий; по умолчанию пусто), `BLOCK_ALLOW` (адреса и сети через пробел, которые блок-лист не блокирует никогда), `HY2_HOP` (диапазон смены портов для `hy2 hop on`, по умолчанию `10000-19999`: ниже портов, которые iof сам выбирает для ретрансляторов и мишеней), `PROBE_TTL` (сколько секунд живут мишени проверки с ПК, 900, допустимо 20–3600) и `PROBE_PORTS` (порт мишеней: пусто — случайный свободный 20000–60000, `a-b` — из диапазона, `N` — этот порт; одинаково для всех узлов) |
+| `iof.env` | bash, читается через `source`: `TG_TOKEN`, `TG_CHAT`, `PARALLEL`, `IOF_SRC`, `RU_TARGETS` (по умолчанию `ya.ru vk.com mail.ru ozon.ru wildberries.ru rt.ru`, пусто — не проверять), `RU_CONTROL` (`1.1.1.1 8.8.8.8`), `HY2_TEMPLATE`, `HY2_CN` (CN сертификата для `hy2 install`, если сертификата из шаблона здесь нет), `AUDIT_KEEP`, `BLOCKLIST_URL` и `REGISTRY_URL` (списки для блока dpi и `iof block`: текст, IP или CIDR в строке, `#` — комментарий; по умолчанию пусто), `BLOCK_ALLOW` (адреса и сети через пробел, которые блок-лист не блокирует никогда), `HY2_HOP` (диапазон смены портов для `hy2 hop on`, по умолчанию `10000-19999`: ниже портов, которые iof сам выбирает для ретрансляторов и мишеней), `PROBE_TTL` (сколько секунд живут мишени проверки с ПК, 900, допустимо 20–3600) и `PROBE_PORTS` (порт мишеней: пусто — случайный свободный 20000–60000, `a-b` — из диапазона, `N` — этот порт; одинаково для всех узлов) |
 | `web.env` | EnvironmentFile панели: `IOF_WEB_PASSWORD`, `IOF_WEB_HOSTS`, `IOF_WEB_TTL`, `IOF_WEB_TERMINAL` (`1` включает терминал), а также `HY2_TEMPLATE`, `IOF_BIN`, `IOF_BASE`, `IOF_SSH_KEY`, `IOF_TG_API` (адрес Bot API, только для стенда и CI; его же берёт `iof bot`) |
-| `bot.json` | Telegram-бот (600), пишет только `iof bot`: `enabled`, `username` (по `getMe`), `actions` (действия из бота, по умолчанию `false`), `hy2_links` (`true`), `quiet` (`{"from": "23:00", "to": "08:00"}` или `null`), `admins`: [{`id`, `name`, `username`, `role` (`main` или `regular`), `sound`, `notify` (`null` — по умолчанию, этап 5), `added`}], `invites`: [{`hash` (sha256 от кода), `role`, `created`, `expires`}]. Время — unix |
+| `bot.json` | Telegram-бот (600), пишет только `iof bot`: `enabled`, `username` (по `getMe`), `actions` (действия из бота, по умолчанию `false`), `hy2_links` (`true`), `quiet` (`{"from": "23:00", "to": "08:00"}` или `null`), `admins`: [{`id`, `name`, `username`, `role` (`main` или `regular`), `sound`, `notify` (список `nodes`, `audit`, `nightly`, `updates`, `ru`, `admins`; `null` и `[]` — ничего), `added`}], `invites`: [{`hash` (sha256 от кода), `role`, `created`, `expires`}]. Время — unix |
 | `bot.token` | токен бота (600), одной строкой; `bot.lock` — `flock` для `iof bot` |
 | `state/<узел>` | последнее состояние для `iof check`: `ok` или текст проблем |
 | `hy2/index.tsv` | `логин<TAB>подпись<TAB>создан` |
@@ -75,6 +75,8 @@ Docker Desktop там не запускается: Kaspersky Standard не да�
 | `awg/<логин>/<Подпись>.pub` | `публичный_ключ контейнер` |
 | `awg/<логин>/*_via_*.conf`, `keys.txt` | пересобираются при каждом `awg keys`/`refresh` |
 | `check.last` | итог последнего `iof check` для панели: `time`, `total`, `bad`, `problems` (имена через пробел), `changes` |
+| `check.daily` | итог ежедневной части: `time` (unix), `updates` (число коммитов или пусто), `updates_head` (последняя сообщённая вершина upstream), `ru_time`, `ru_off`, `ru_nodes`, `ru_cut`, `ru_noinet`, `ru_down` (списки имён через пробел) |
+| `ru/<узел>` | последнее изменившееся состояние доступа к российским серверам: `ok`, `cut`, `noinet`; отсутствие файла означает `ok` |
 | `audit/server.json`, `audit/dpi.json` | последняя проверка блока `iof audit` по узлам: `{"nodes": {имя: {addr, reachable, at, checked, error, checks: [{id, status, value, detail, hint, cmd}]}}}`. Проверка одного узла заменяет только его запись |
 | `audit/history.jsonl` | строка JSON на запуск `iof audit run`: `at`, `block` (`server`, `dpi` или `all`), `nodes`, `counts`, `down`, `worse`; хранится `AUDIT_KEEP` последних (по умолчанию 30, задаётся в `iof.env`) |
 | `audit/cache/` | для блока dpi: `blocklist.txt` и `registry.txt` (списки по `BLOCKLIST_URL` и `REGISTRY_URL`, рядом `.url` — откуда скачан, `.err` — последняя загрузка не удалась) и `whois-<адрес>.txt` (`состояние\|AS\|организация\|страна`). Всё обновляется не чаще раза в сутки |
@@ -164,7 +166,7 @@ sha1-хэш. Повторный запуск с той же подписью д�
 
 - **Telegram-бот** (`iof bot`, план и решения в `bot-plan.md`). Сам бот — поток панели (`web/iof_bot.py`),
   он только читает `bot.json` и `bot.token`, а меняет их `iof bot` (из консоли, из панели и из бота).
-  JSON ведёт встроенный python `BOT_PY` (режимы `getme`, `edit <операция>`, `show`), пишет новым файлом
+  JSON ведёт встроенный python `BOT_PY` (режимы `getme`, `edit <операция>`, `show`, `notify`), пишет новым файлом
   через `os.replace` с правами 600. Меняющие подкоманды берут `flock` на `bot.lock` (`bot_lock`, fd 9).
   - `bot token`: токен со stdin (в терминале `read -s`), проверка формата и `getMe` (python, токен через
     stdin), затем `bot.token` и `username`. Пустой ввод удаляет токен и выключает бота. Адрес Bot API —
@@ -175,8 +177,42 @@ sha1-хэш. Повторный запуск с той же подписью д�
   - `bot redeem` вызывает поток бота: со stdin код, ID, имя, username. Печатает `result=added|already|bad`
     и `role`. Истёкшие приглашения выбрасываются при любой записи, поэтому истёкший код — тоже `bad`.
     Уже админ — `already`, приглашение не тратится.
-  - `bot set actions|links on|off`, `set quiet ЧЧ:ММ-ЧЧ:ММ|off`, `admin set <ID> role|sound`, `admin del`, `show`
+  - `bot set actions|links on|off`, `set quiet ЧЧ:ММ-ЧЧ:ММ|off`, `admin set <ID> role|sound|notify`, `admin del`, `show`
     (без кодов и токена; показывает, работает ли панель, `IOF_TG_API` и перенос).
+
+
+- **Уведомления**: `tg_send <тип> <текст>` и `iof notify тип [текст]` (без текста — stdin).
+  Типы: `nodes` (изменения узлов), `audit` (ухудшения аудита), `nightly` (итог запуска обслуживания,
+  не итог apt), `updates` (новые коммиты upstream), `ru` (доступ с узлов к РФ), `admins` (новый админ).
+  Все доступны обеим ролям, кроме `admins` — только главной. `notify: null` и пустой список — ничего.
+  `iof bot admin set ID notify nodes,audit|all|off` меняет набор под `migrate_guard` и `bot.lock`;
+  `all` сохраняет текущие доступные типы списком. При понижении роли закрытые типы снимаются.
+  Отправка повторно фильтрует типы по роли. Списки типов в bash, BOT_PY, панели и JS сверяет lint.
+  - Бот включён и токен есть: `BOT_PY notify` читает токен из файла и шлёт через `bot_api` каждому
+    подписанному админу. Никто не подписан — старый путь не используется. Выключен или токена нет —
+    только `nodes` и `audit` в прежние `TG_TOKEN/TG_CHAT`, curl получает URL с токеном через stdin.
+    При `role=target` рассылка через бота тоже не используется. Ошибка отправки не меняет итог check/cron.
+  - Текст HTML экранируется; длинные сообщения режутся без разрыва сущностей и Unicode, с запасом
+    под заголовок и с учётом UTF-16. Токен не попадает в argv и сообщения об ошибках.
+  - Тихие часы — по времени сервера, интервал включает начало и не включает конец, через полночь
+    поддерживается. `disable_notification: true`, кроме админа с `sound`. Вне интервала параметра нет.
+  - `bot_redeem` после записи и снятия блокировки сообщает подписанным главным имя, username, ID и роль
+    нового админа. `iof-nightly` сообщает, где юнит запущен, где не вышло; подробности apt остаются в логе.
+  - `iof check` раз в сутки (86100 с, с допуском одного пятиминутного cron) вызывает `check_daily`.
+    С `-n` автоматической ежедневной части нет; `--daily` запускает её немедленно и обновляет общую метку.
+    `check_updates`: git fetch с timeout 60, сообщение один раз на вершину upstream.
+    `n_ru_reach/n_ru_target`: с каждого выбранного узла параллельно TCP 443, при неудаче ping;
+    DNS через getent (первый IPv4), таймауты 5/4/3 с. Меньше половины целей РФ отвечает, контроль
+    отвечает — `cut`; контроль тоже молчит — `noinet`; иначе `ok`. При потере SSH состояние не меняется.
+    Уведомление только при смене состояния. Это косвенная диагностика пути, не доказательство блокировки
+    и не замена проверки с ПК: возможны ограничения сайтов, сбои DNS и ответы CDN вне РФ.
+  - Панель: `bot_notify` добавляет `bot: {username, subs}` в service/security (число подписчиков по типам),
+    `read_daily` добавляет `daily` в service. В `/api/bot` у админов `notify` с фильтрацией по роли.
+    На странице бота отдельная таблица галочек; у обычного нет галочки новых админов. Демо поддерживается.
+  - Стенд: `check_notify` проверяет роли, null/off/all, панель и CLI, приглашение, HTML и длинные emoji,
+    тихие часы вокруг текущего времени, sound, старый путь, недоступный API, смену доступа к РФ и новую
+    версию через временные git-клоны. Cleanup восстанавливает bot.json/token, iof.env, check.daily/last,
+    state и ru, удаляет временные клоны. test.sh нельзя менять, пока он выполняется.
 
 - **Аудит безопасности** (`iof audit`, этапы 1–4 плана «Безопасности»; план выполнен, его файл удалён). Блоков два:
   `server` («Аудит сервера») и `dpi` («Защита от РКН (ТСПУ)»). `iof audit run [server|dpi|all]`,
@@ -303,7 +339,7 @@ sha1-хэш. Повторный запуск с той же подписью д�
   проверен переход на iptables), ссылки со списком портов в настоящем Hiddify и v2rayN (формат взят из
   их исходников), блок-лист с Docker и `ufw` на узле.
 
-Команды: `status`, `check` (для cron, Telegram, пишет `check.last`), `exec`, `refresh`, `init`,
+Команды: `status`, `check [--daily]` (для cron, Telegram, пишет `check.last` и раз в сутки `check.daily`), `notify тип [текст]`, `exec`, `refresh`, `init`,
 `api status|service|updates|audit` (audit — JSON), `audit run [server|dpi|all]|show|cron`,
 `audit probe start [--ttl с]|stop|import|list`, `update`, `version` (версию подставляет `install.sh` в `IOF_VERSION`),
 `node add|import|del|list`, `hy2 install|add [--hop|--no-hop]|del|list|show|refresh|status|restart|hop on|off|upgrade`,
@@ -383,8 +419,8 @@ sha1-хэш. Повторный запуск с той же подписью д�
   `thread_error` (`srv.bot_error`: модуль не загрузился или `Bot` упал); `config_error`, `tz` — смещение
   времени сервера для тихих часов, `migrate`) и `POST /api/bot` (`action`: `token` {`token`} или {`delete: true`},
   `enable` {`on`}, `set` {`key`: actions|links, `on`} или {`key`: quiet, `value`: `ЧЧ:ММ-ЧЧ:ММ`|off}, `invite`
-  {`role`}, `invite_del` {`hash`}, `admin_set` {`id`, `role` или `sound`}, `admin_del` {`id`}): `bot_args` проверяет
-  поля, `iof_bot_cmd` запускает `iof bot` сразу, токен — только stdin. Ответ — `message` (первая строка вывода
+  {`role`}, `invite_del` {`hash`}, `admin_set` {`id`, `role`, `sound` или `notify` (список типов)}, `admin_del` {`id`}): `bot_args` проверяет
+  поля (роль ещё раз проверяет iof), `iof_bot_cmd` запускает `iof bot` сразу, токен — только stdin. Ответ — `message` (первая строка вывода
   iof) и свежий `bot`, на `invite` ещё `invite` {`code`, `link`, `role`, `hash`, `expires`}: код страница видит
   один раз. При ошибке — 400 с `error` и `bot`. В журнал пишется только команда (`бот: из панели iof bot …`).
   При переносе (`role=source`) отказ ещё до iof (`not_migrating`).
@@ -418,7 +454,7 @@ sha1-хэш. Повторный запуск с той же подписью д�
     `lib/xterm.js` → `xterm.js`, `lib/addon-fit.js` → `xterm-fit.js`, `css/xterm.css` → `xterm.css`;
     в начало — комментарий с пакетом, версией и текстом лицензии MIT, строка `sourceMappingURL` убирается.
     `ci/lint.sh` не проверяет их по правилам CSP (массив `VENDOR`), но требует первую строку с пакетом и версией.
-- **Телеграм-бот** (`iof_bot.py`, класс `Bot`, поток `iof-bot`; план — `bot-plan.md`, сделаны этапы 1–4):
+- **Телеграм-бот** (`iof_bot.py`, класс `Bot`, поток `iof-bot`; план — `bot-plan.md`, этапы 1–5 сделаны, итоги проверок в плане):
   - `iof-web.py` импортирует модуль в `try`: если он не загрузился или `Bot` упал при создании, панель
     работает без бота, пишет причину в журнал и в `srv.bot_error` (её показывает страница). В `Bot` передаются
     `Jobs`, `StatusCache` (`cache`), `BotViews` (`views`), `BotActions` (`actions`), путь к `iof` и `IOF_TG_API`.
@@ -546,7 +582,7 @@ bash ci/lint.sh
 
 На машине разработки нет shellcheck и Python, эти проверки там пропускаются (`skip`), в CI они
 обязательны. Полностью, как в CI, `lint.sh` можно прогнать в контейнере Ubuntu 24.04 в WSL с
-`apt install shellcheck pyflakes3 nodejs git` и `CI=true`.
+`apt install shellcheck pyflakes3 nodejs git` и `CI=true`. В Git Bash путь к `probe.ps1` переводится через `cygpath -w` и для Windows PowerShell, и для pwsh (PowerShell 7).
 
 **CI** (`.github/workflows/ci.yml`, GitHub Actions) запускается на push в master, на PR и вручную.
 Задача `lint` выполняет `ci/lint.sh` (shellcheck с `--severity=warning`, pyflakes ставится через
@@ -624,7 +660,7 @@ JSON: TCP не проходит — `crit` с высокой увереннос�
 
 Скриншоты для README все в тёмной теме. На виду `docs/panel-overview.png` (`index.html?demo`) и
 `docs/panel-node.png` (`node.html?demo#n=node-4`), под спойлером `<details>` — `panel-hy2.png`
-(`hy2.html?demo`), `panel-security.png` (`security.html?demo`), `panel-terminal.png` и `panel-add.png` (`add.html?demo`). Снимаются Chrome без окна
+(`hy2.html?demo`), `panel-security.png` (`security.html?demo`), `panel-terminal.png`, `panel-add.png` (`add.html?demo`) и `panel-bot.png` (`bot.html?demo`). Снимаются Chrome без окна
 с демо-страниц, раздаваемых статическим сервером. Окно 1360×860 (так таблица узлов ещё не превращается
 в карточки), масштаб 1.5, тёмную тему задаёт `--force-dark-mode`, а `--virtual-time-budget` даёт
 демо-данным загрузиться:
@@ -632,6 +668,8 @@ JSON: TCP не проходит — `crit` с высокой увереннос�
 ```bash
 chrome --headless=new --hide-scrollbars --window-size=1360,860 --force-device-scale-factor=1.5 --virtual-time-budget=5000 --force-dark-mode --screenshot=docs/panel-overview.png "http://localhost:8099/index.html?demo"
 ```
+
+Для `panel-bot.png` с теми же окном и масштабом снимается полная страница через CDP (`Page.captureScreenshot`, `captureBeyondViewport`): так в кадре видна таблица подписок.
 
 Терминал так не снять: его надо открыть и набрать команды. Для `panel-terminal.png` Chrome запускается
 с `--remote-debugging-port`, и через DevTools Protocol на `node.html?demo#n=node-2` с теми же размером
@@ -673,7 +711,7 @@ bash stand/stand.sh down
   раскроется в WSL, а не в контейнере. Скрипты для контейнера передавай через stdin
   (`docker compose exec -T old bash -s <<'EOF'`).
 - Туннели (`stand.sh tunnel`) поднимаются в WSL, порты 8081/8082 видны и из Windows: встроенный
-  браузер открывает их через записи `stand-old-panel` и `stand-new-panel` в `.claude/launch.json`.
+  браузер открывает их через записи `stand-old-panel` и `stand-new-panel` в `.Codex/launch.json`.
 - `machine-id` во всех контейнерах одинаковый, как у VPS из одного образа. iof на него не опирается.
 - Hysteria2 ставится официальным установщиком, поэтому `setup` нужен интернет. `test` тоже:
   через туннели открывается `PROBE_URL` (по умолчанию `generate_204` от Google). AmneziaWG на стенде

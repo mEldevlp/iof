@@ -140,10 +140,15 @@ function demoService(fetch) {
     version: demoState.version,
     src: "/opt/iof",
     src_version: demoState.version,
-    tg: true,
+    tg: false,
+    bot: { username: "island_of_freedom_bot", subs: { nodes: 2, audit: 1, nightly: 0, updates: 1, ru: 2, admins: 1 } },
     cron: ["0 4 * * * /usr/local/sbin/iof-nightly", "*/5 * * * * /usr/local/bin/iof check >/dev/null 2>&1"],
     error: null,
     check: { at: Date.now() / 1000 - 180, total: 6, bad: 2, problems: ["node-4", "node-5"], changes: 0 },
+    daily: {
+      at: Date.now() / 1000 - 3600 * 9, updates: 0, ru_off: false,
+      ru: { at: Date.now() / 1000 - 3600 * 9, nodes: 5, cut: ["node-3"], noinet: [], down: ["node-5"] },
+    },
     nightly: {
       started: "2026-11-01 04:00:01", summary: "Выполнено на 6 узлах, с ошибкой: 1",
       log: ["== main", "Running as unit: iof-nightly.service", "== node-1", "Running as unit: iof-nightly.service",

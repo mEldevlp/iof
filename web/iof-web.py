@@ -1025,16 +1025,27 @@ BOT_TOKEN = re.compile(r"^[0-9]{1,20}:[A-Za-z0-9_-]{20,100}$")
 BOT_CLOCK = re.compile(r"^([01][0-9]|2[0-3]):[0-5][0-9]$")
 BOT_CODE = re.compile(r"^[0-9a-f]{64}$", re.M)
 BOT_HASH = 12  # знаков хэша приглашения на странице, как в iof bot show: по ним приглашение и отзывают
+# Типы уведомлений, как NOTIFY в BOT_PY iof.sh (сверяет ci/lint.sh); admins — только главным
+BOT_NOTIFY = ("nodes", "audit", "nightly", "updates", "ru", "admins")
+BOT_NOTIFY_MAIN = ("admins",)
+
+
+def bot_kinds(role):
+    return [k for k in BOT_NOTIFY if role == "main" or k not in BOT_NOTIFY_MAIN]
 
 
 def bot_admin(a):
     username = a.get("username")
+    role = a.get("role") if a.get("role") in BOT_ROLES else "regular"
+    notify = a.get("notify")
     return {
         "id": a["id"],
         "name": a.get("name") if isinstance(a.get("name"), str) else "",
         "username": username if isinstance(username, str) and re.match(r"^[A-Za-z0-9_]{1,32}$", username) else "",
-        "role": a.get("role") if a.get("role") in BOT_ROLES else "regular",
+        "role": role,
         "sound": a.get("sound") is True,
+        # null — по умолчанию, то есть ничего; типы, недоступные роли, не приходят и не показываются
+        "notify": [k for k in bot_kinds(role) if k in notify] if isinstance(notify, list) else None,
         "added": a.get("added") if isinstance(a.get("added"), (int, float)) else None,
     }
 
@@ -1132,10 +1143,48 @@ def bot_args(body):
             if body["role"] not in BOT_ROLES:
                 raise ValueError("роль: main или regular")
             return ["admin", "set", uid, "role", body["role"]], None, ""
+        if "notify" in body:
+            kinds = body["notify"]
+            if not isinstance(kinds, list) or not all(k in BOT_NOTIFY for k in kinds):
+                raise ValueError("уведомления: список типов из " + ", ".join(BOT_NOTIFY))
+            return ["admin", "set", uid, "notify", ",".join(k for k in BOT_NOTIFY if k in kinds) or "off"], None, ""
         return ["admin", "set", uid, "sound", bot_flag(body, "sound")], None, ""
     if action == "admin_del":
         return ["admin", "del", bot_admin_id(body)], None, ""
     raise ValueError("неизвестное действие")
+
+
+def bot_notify(base):
+    """Куда идут уведомления iof для страниц «Сервис» и «Безопасность»: через бота (включён, есть токен,
+    сервер не принимает управление при переносе) — {username, subs: {тип: сколько админов подписано}},
+    иначе None, и iof шлёт узлы и аудит в TG_CHAT из iof.env, если он задан."""
+    cfg, _ = read_bot(base)
+    try:
+        token = (base / "bot.token").stat().st_size > 0
+    except OSError:
+        token = False
+    if not cfg or not cfg["enabled"] or not token or (read_migrate(base) or {}).get("role") == "target":
+        return None
+    return {"username": cfg["username"],
+            "subs": {k: sum(1 for a in cfg["admins"] if k in (a["notify"] or [])) for k in BOT_NOTIFY}}
+
+
+def read_daily(base):
+    """check.daily (раз в сутки из iof check, key=value) -> {at, updates, ru} или None. updates — сколько
+    коммитов принесёт iof update, None — не проверено; ru — доступ к российским серверам с узлов или None."""
+    try:
+        lines = (base / "check.daily").read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    kv = dict(line.split("=", 1) for line in lines if "=" in line)
+    if not kv.get("time", "").isdigit():
+        return None
+    ru = None
+    if kv.get("ru_time", "").isdigit() and not kv.get("ru_off"):
+        ru = {"at": int(kv["ru_time"]), "nodes": to_int(kv.get("ru_nodes")), "cut": kv.get("ru_cut", "").split(),
+              "noinet": kv.get("ru_noinet", "").split(), "down": kv.get("ru_down", "").split()}
+    return {"at": int(kv["time"]), "updates": to_int(kv["updates"]) if kv.get("updates", "").isdigit() else None,
+            "ru": ru, "ru_off": bool(kv.get("ru_off"))}
 
 
 def iof_bot_cmd(iof, args, stdin):
@@ -1492,9 +1541,11 @@ def service_view(srv, fetch):
         "src": info.get("src", ""),
         "src_version": info.get("src_version", ""),
         "tg": info.get("tg") == "yes",
+        "bot": bot_notify(base),
         "cron": info.get("cron", []),
         "error": error,
         "check": read_check(base),
+        "daily": read_daily(base),
         "nightly": read_nightly_run(NIGHTLY_RUN_LOG),
         "nightly_local": read_nightly_local(NIGHTLY_LOG),
         "update_log": read_update_log(UPDATE_LOG),
@@ -1520,6 +1571,7 @@ def security_view(srv):
         "busy": srv.jobs.busy(),
         "migrate": read_migrate(srv.base),
         "probe_state": srv.probes.state(),
+        "bot": bot_notify(srv.base),
     })
     return data
 

@@ -169,12 +169,22 @@
         </section>
 
         <section class="card">
+          <div class="card-head"><h2>Уведомления</h2></div>
+          <p id="notify-hint" class="hint pad"></p>
+          <div id="notify" class="table-wrap"></div>
+          <h3 class="sub-head">Когда приходят</h3>
+          <dl id="notify-types" class="cmds"></dl>
+        </section>
+
+        <section class="card">
           <div class="card-head"><h2>Команды на сервере</h2></div>
           <dl class="cmds">
             <dt><code>sudo iof bot show</code></dt><dd>включён ли бот, админы и неиспользованные приглашения</dd>
             <dt><code>sudo iof bot token</code></dt><dd>задать токен: спросит, не показывая; пустой ввод удаляет токен и выключает бота</dd>
             <dt><code>sudo iof bot on</code>, <code>off</code></dt><dd>включить или выключить бота</dd>
             <dt><code>sudo iof bot invite main</code></dt><dd>код приглашения главного админа (<code>regular</code> — обычного)</dd>
+            <dt><code>sudo iof bot admin set ID notify nodes,audit</code></dt><dd>какие уведомления получает админ: типы через запятую, <code>all</code> или <code>off</code></dd>
+            <dt><code>sudo iof notify nodes проверка</code></dt><dd>пробное уведомление: придёт тем, у кого отмечен этот тип</dd>
             <dt><code>sudo iof bot admin del ID</code></dt><dd>удалить админа: бот перестанет ему отвечать</dd>
           </dl>
         </section>
