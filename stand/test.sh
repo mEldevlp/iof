@@ -2099,6 +2099,42 @@ tally() {
   done <<<"$1"
 }
 
+# Импорт в одну секунду: последний результат в API/CLI и удаление старых отчётов.
+probe_order() {
+  on_in "$M" python3 - "$1" <<'PY'
+import contextlib, io, json, os, shutil, sys, tempfile, time
+from unittest.mock import patch
+
+with open("/usr/local/bin/iof", encoding="utf-8") as f:
+    source = f.read().split("AUDIT_PY=$(cat <<'EOF'\n", 1)[1].split("\nEOF\n", 1)[0]
+audit = {}
+exec(source.split("\nmode = sys.argv[1]\n", 1)[0], audit)
+first = sys.argv[1]
+now = int(time.time())
+stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(now))
+with tempfile.TemporaryDirectory(prefix="iof-test-probe-order-") as base:
+    for name in ("session.json", "token"):
+        shutil.copyfile("/root/iof/audit/probe/" + name, os.path.join(base, name))
+    with patch("time.time", return_value=now), patch("sys.stdin", io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+        audit["probe_import"](base, 5, "/root/iof-test-probe-block.json")
+        audit["probe_import"](base, 5, "/root/iof-test-probe-vpn.json")
+        last = audit["probe_api"](base)["last"]
+        assert (last["nodes"][first]["status"], last["confidence"]) == ("none", "low"), "API вернул предыдущий отчёт"
+        for _ in range(10):
+            audit["probe_import"](base, 5, "/root/iof-test-probe-vpn.json")
+    names = audit["results"](base)
+    assert names == [f"{stamp}-{i}.json" for i in range(8, 13)], f"неверный порядок или удалены новые отчёты: {names}"
+    last = audit["probe_api"](base)["last"]
+    with open(os.path.join(base, f"{stamp}-12.json"), encoding="utf-8") as f:
+        assert last == json.load(f), "API вернул не последний отчёт"
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        audit["probe_list"](base)
+    assert "уверенность низкая" in output.getvalue(), "CLI вернул предыдущий отчёт"
+print("ok    отчёты в одну секунду: последний в API/CLI, числовой порядок, сохранены пять последних из двенадцати")
+PY
+}
+
 # Проверка с ПК (iof audit probe). Мишени поднимаются на узлах с python3, узел без него получает
 # «не проверяется». На первом узле с python3, который не управляющий сервер, входящие запрещены
 # политикой DROP: мишень открывает свой порт правилом и снимает его. Мишени отвечают с токеном
@@ -2148,6 +2184,7 @@ check_probe() {
   tally "$(probe_answers "$first")"
 
   probe_reports "$first"
+  if out="$(probe_order "$first" 2>&1)"; then tally "$out"; else fail "порядок отчётов в одну секунду"; details "$out"; fi
   if out="$(on "$M" bash -c 'iof audit probe import < /root/iof-test-probe-block.json' 2>&1)"; then ok "iof audit probe import"; else fail "iof audit probe import"; details "$out"; fi
   got="$(probe_result "$first")"
   if [[ "$got" == "crit high" ]]; then ok "отчёт: у $first с ПК не проходит TCP — проблема, уверенность высокая"; else fail "отчёт: $first — «$got», ожидалось «crit high»"; fi

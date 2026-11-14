@@ -6633,8 +6633,11 @@ def probe_src(path):
 
 
 def results(base):
-    names = sorted(f for f in os.listdir(base) if re.match(r"^\d{8}-\d{6}(-\d+)?\.json$", f)) if os.path.isdir(base) else []
-    return names
+    if not os.path.isdir(base):
+        return []
+    names = [f for f in os.listdir(base) if re.fullmatch(r"\d{8}-\d{6}(-\d+)?\.json", f)]
+    # В одну секунду первый отчёт без суффикса, остальные — -2, -3, ... -10.
+    return sorted(names, key=lambda f: (f[:15], int(f[16:-5] or 1)))
 
 
 def probe_import(base, keep, path):
@@ -6669,11 +6672,10 @@ def probe_import(base, keep, path):
         out["nodes"][name] = r
         out["counts"][r["status"]] += 1
     os.makedirs(base, exist_ok=True)
-    stamp, i = time.strftime("%Y%m%d-%H%M%S", time.localtime(out["at"])), 1
-    name = stamp + ".json"
-    while os.path.exists(os.path.join(base, name)):
-        i += 1
-        name = f"{stamp}-{i}.json"
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(out["at"]))
+    # После удаления старых отчётов не используем их номера повторно.
+    i = max((int(f[16:-5] or 1) for f in results(base) if f[:15] == stamp), default=0) + 1
+    name = f"{stamp}-{i}.json" if i > 1 else stamp + ".json"
     write(os.path.join(base, name), json.dumps(out, ensure_ascii=False))
     for old in results(base)[:-max(keep, 1)]:
         os.remove(os.path.join(base, old))
