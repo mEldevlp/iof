@@ -30,6 +30,8 @@ jobs:
           pipx install pyflakes==3.2.0
       - name: bash ci/lint.sh
         run: bash ci/lint.sh
+      - name: Проверить ссылки бота и переименование узла
+        run: python3 ci/test-panel.py
 
   stand:
     name: Стенд из двух серверов

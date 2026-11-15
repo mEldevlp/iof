@@ -42,6 +42,7 @@ Docker Desktop там не запускается: Kaspersky Standard не да�
 | `stand/` | тестовый стенд на Docker: `Dockerfile` (Ubuntu 24.04 с systemd и SSH), `compose.yml` (old, node1, node2, new), `stand.sh`, `test.sh` (проверка iof на стенде), `hy2-template.yaml`, `fake-tg.py` (поддельный Bot API для бота) | не ставится; попадает в `/opt/iof` как часть клона |
 | `ci/lint.sh` | статические проверки: `bash -n`, shellcheck, разбор и pyflakes для `iof-web.py`, `iof_bot.py` и `stand/fake-tg.py`, `node --check`, правила проекта (NODE_FUNCS, STATIC_FILES, CSP, одинаковое меню во всех html, `probe.ps1`: только ASCII, одна метка, разбор парсером PowerShell, если он есть, LF) | не ставится |
 | `ci/test-build.sh` | проверка автономности сборки и совпадения функций и встроенных программ; отказ при отсутствующем, лишнем, повторном или сломанном модуле | не ставится |
+| `ci/test-panel.py` | регрессионные тесты выдачи группы Hysteria2 ботом и переименования узла на временных данных, без SSH и Telegram | не ставится |
 | `.github/workflows/ci.yml` | CI в GitHub Actions, см. «Проверка изменений» | не ставится |
 | `.shellcheckrc` | настройки shellcheck: отключены SC2178 и SC2128, ложные срабатывания на local-переменные разных функций | не ставится |
 
@@ -82,7 +83,7 @@ Docker Desktop там не запускается: Kaspersky Standard не да�
 | `awg/<логин>/<Подпись>.pub` | `публичный_ключ контейнер` |
 | `awg/<логин>/*_via_*.conf`, `keys.txt` | пересобираются при каждом `awg keys`/`refresh` |
 | `check.last` | итог последнего `iof check` для панели: `time`, `total`, `bad`, `problems` (имена через пробел), `changes` |
-| `check.daily` | итог ежедневной части: `time` (unix), `updates` (число коммитов или пусто), `updates_head` (последняя сообщённая вершина upstream), `ru_time`, `ru_off`, `ru_nodes`, `ru_cut`, `ru_noinet`, `ru_down` (списки имён через пробел) |
+| `check.daily` | итог ежедневной части: `time` (unix), `updates` (число коммитов или пусто), `updates_head` (последняя сообщённая вершина upstream), `ru_time`, `ru_off`, `ru_nodes` (число опрошенных узлов), `ru_cut`, `ru_noinet`, `ru_down` (списки имён через пробел) |
 | `ru/<узел>` | последнее изменившееся состояние доступа к российским серверам: `ok`, `cut`, `noinet`; отсутствие файла означает `ok` |
 | `audit/server.json`, `audit/dpi.json` | последняя проверка блока `iof audit` по узлам: `{"nodes": {имя: {addr, reachable, at, checked, error, checks: [{id, status, value, detail, hint, cmd}]}}}`. Проверка одного узла заменяет только его запись |
 | `audit/history.jsonl` | строка JSON на запуск `iof audit run`: `at`, `block` (`server`, `dpi` или `all`), `nodes`, `counts`, `down`, `worse`; хранится `AUDIT_KEEP` последних (по умолчанию 30, задаётся в `iof.env`) |
@@ -172,6 +173,14 @@ sha1-хэш. Повторный запуск с той же подписью д�
   `ensure_ssh_key`, sshpass ставит `ensure_sshpass`. Всё это общее для `node add` и `migrate start`.
 - `index_set` добавляет, обновляет на месте или удаляет строку в `index.tsv`. Дата создания
   у существующей группы не меняется: `hy2 add` той же подписи и `refresh` её сохраняют.
+- `node rename <имя> <новое имя>` меняет имя в `nodes.conf`, обе стороны в `relays.conf`,
+  файлы `state/` и `ru/`, текущие `audit/server.json`, `dpi.json`, `probe/session.json` и списки
+  узлов в `check.last`/`check.daily`. История аудита и отчёты прошлых проверок сохраняют прежние имена.
+  Подпись в VPN-клиентах сохраняется (пустая становится прежним именем); если меняется имя файла AWG,
+  существующие `.conf` и `.pub` перемещаются вместе, приватные ключи сохраняются. Сам сервер, hostname,
+  адреса, ссылки и сетевые правила не меняются. Новое имя: до 40 знаков `[A-Za-z0-9._-]`, кроме `.`, `..`,
+  `all`; дубликат запрещён. Перед записью готовятся все изменённые файлы; при ошибке замены — откат.
+  Во время активной проверки с ПК переименование запрещено. Команда под `migrate_guard`.
 - **Перенос управляющего сервера** (`iof migrate`). `start` на старом сервере: кладёт ключ на новый,
   проверяет его (`n_migrate_check`: не этот же сервер, есть apt, нет своих узлов), пишет `migrate.conf`
   (role=source), собирает архив (`migrate_bundle`) и через `n_migrate_receive` ставит на новом iof
@@ -368,7 +377,7 @@ sha1-хэш. Повторный запуск с той же подписью д�
 Команды: `status`, `check [--daily]` (для cron, Telegram, пишет `check.last` и раз в сутки `check.daily`), `notify тип [текст]`, `exec`, `refresh`, `init`,
 `api status|service|updates|audit` (audit — JSON), `audit run [server|dpi|all]|show|cron`,
 `audit probe start [--ttl с]|stop|import|list`, `update`, `version` (версию подставляет `install.sh` в `IOF_VERSION`),
-`node add|import|del|list`, `hy2 install|add [--hop|--no-hop]|del|list|show|refresh|status|restart|hop on|off|upgrade`,
+`node add|import|del|rename|list`, `hy2 install|add [--hop|--no-hop]|del|list|show|refresh|status|restart|hop on|off|upgrade`,
 `block on|update|off`,
 `bot show|token|on|off|set|invite|redeem|admin`,
 `awg add|keys|del|show|export|list|clients|refresh|status`, `relay add|del|list|apply`,
@@ -376,6 +385,9 @@ sha1-хэш. Повторный запуск с той же подписью д�
 
 ## Веб-панель `iof-web`
 
+- На странице узла справа от имени появляется карандаш при наведении или фокусе с клавиатуры;
+  на сенсорном экране виден всегда. Он открывает поле имени с «Сохранить»/«Отмена» (Enter/Escape).
+  После успешной задачи `node rename` меняется и адрес страницы. Демо поддерживает переименование.
 - `ThreadingHTTPServer` на `127.0.0.1:8088`, работает от root. Открывается через SSH-туннель.
   Слушать не на loopback без `IOF_WEB_PASSWORD` откажется (HTTP Basic, имя пользователя любое).
 - **Читает** файлы `/root/iof` напрямую. **Меняет** что-либо только через команды `iof`
@@ -409,7 +421,8 @@ sha1-хэш. Повторный запуск с той же подписью д�
   `iof hy2 install`), `POST /api/migrate` (`action`: start, finish или cancel), `POST /api/hy2`
   (`add|del|refresh`; у `add` необязательный `hop: true|false` → `hy2 add --hop|--no-hop`, кнопка
   «Список портов» группы с диалогом `#hop-dialog`; в группах `hop`, у ссылок `hop` и `port` строкой),
-  `POST /api/node` (`restart_hy2|install_hy2|delete`, удаление = `node del` + `refresh`),
+  `POST /api/node` (`restart_hy2|install_hy2|delete|rename`, удаление = `node del` + `refresh`;
+  переименование = `{action: "rename", name, new_name}` → `node rename`, задача вида `node:<старое имя>`),
   `POST /api/term` (`{name, cols, rows}` → одноразовый билет терминала),
   `GET /api/security` (вывод `iof api audit` плюс `error`, `busy`, `migrate`, `probe_state`; узлы не опрашивает;
   в `settings` ещё `hop` — диапазон `HY2_HOP`, `block_cron`, `blocklist`) и
@@ -539,10 +552,13 @@ sha1-хэш. Повторный запуск с той же подписью д�
     словами `JOB_STATES` из `common.js`; у `check` warn — «на узлах есть проблемы»). После `hy2 add` под итогом
     кнопка ссылок группы. Бота выключили или сменили токен — сообщение больше не правится.
   - Ссылки: если `hy2_links`, в `/hy2` у группы кнопка `g:<логин>` (`#` и хэш, если не влезает в 64 байта;
-    логин iof не длиннее 41 знака, так что на деле не бывает). `view_links` шлёт на каждую ссылку `sendPhoto`
-    (PNG от `qr_png`, multipart — функция `multipart` модуля) с подписью «узел · группа» и ссылкой в `<pre>`;
-    подпись длиннее 1024 знаков — ссылка отдельным сообщением; без qrencode или если фото не принято — только
-    текст. `hy2_links: false` — кнопок ссылок нет, старая кнопка отказывает «выдача выключена в панели».
+    логин iof не длиннее 41 знака, так что на деле не бывает). `view_links` шлёт все ссылки через перевод
+    строки одним сообщением в общем `<pre>` (эквивалент блока с тройными обратными кавычками).
+    Лимит 4096 считается по UTF-16 после разбора HTML; слишком большая группа идёт целиком файлом
+    `hysteria2.txt` через `sendDocument`. Затем один `sendPhoto` с общим QR группы (PNG от `qr_png`,
+    уровень L, как в панели; multipart — функция `multipart`). Без qrencode, при переполнении QR или
+    отказе Telegram принять фото остаются ссылки. `hy2_links: false` — кнопок ссылок нет, старая кнопка
+    отказывает «выдача выключена в панели».
   - Клиент Bot API (`Api`) на urllib без прокси, JSON в теле, с файлами (`files`) — multipart/form-data.
     Ошибки: `ApiError` (код, текст, `retry_after`) и `NetError` (нет связи); текст без токена.
 - Пароли и ключи из формы передаются в `iof` через stdin (`--password-stdin`, `--key-stdin`),
@@ -599,6 +615,10 @@ sha1-хэш. Повторный запуск с той же подписью д�
 - Коммиты: на русском, в формате `компонент: что сделано` (`iof-web: добавление сервера из панели`).
 
 ## Проверка изменений
+
+`python3 ci/test-panel.py` проверяет единый блок ссылок и QR, выдачу без QR, длинную группу файлом,
+отказ Telegram принять фото, переименование со связанными записями и ключами AWG, отказы без частичной
+записи, активную проверку с ПК и валидацию API. В CI запускается после lint.
 
 Минимум после правок — статические проверки (работают и в Git Bash):
 
@@ -668,7 +688,8 @@ ID и username; неверный, повторный, просроченный �
 нажатие «Подтвердить» — «устарело», занятая очередь (задача панели) и то же «Подтвердить» после неё, ход задачи
 правками одного сообщения до итога, перенос (`/hy2add` отказан сразу, полученное до него подтверждение — тоже,
 `/check` разрешён), перезапуск Hysteria2 и аудит узла кнопками, группа `CI бот` из бота (подтверждение, задача,
-кнопка ссылок под итогом), её ссылки — `sendPhoto` с PNG на каждую и без qrencode только текстом, `hy2_links`
+кнопка ссылок под итогом), её ссылки — одним сообщением с общим `<pre>` и одним PNG QR группы,
+без qrencode — одним текстовым сообщением, `hy2_links`
 выключено, удаление группы (её нет в `index.tsv`, кнопка ссылок — «группы больше нет»); паролей Hysteria2 нет
 в журнале и логах задач, но они есть в ответах админу; 409 от второго опроса в журнале, бот продолжает; при `role=source`
 изменения (и из панели) и коды отказаны, при `role=target` бот не опрашивает API и `/api/bot` показывает

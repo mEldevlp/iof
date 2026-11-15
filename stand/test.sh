@@ -1368,25 +1368,26 @@ def check_actions(label):
     report(btn == ref("g", login), f"под итогом — кнопка ссылок группы ({btn})")
     secrets = {p for link in links for p in (link[6:link.rindex("@")], link[6:link.rindex("@")].split(":", 1)[-1]) if len(p) >= 8}
     mid = msg_id(fin) if fin else 0
-    got, a = tap(5001, mid, btn, lambda g: sum(x["method"] == "sendPhoto" for x in g) >= len(links))
+    got, a = tap(5001, mid, btn, lambda g: any(x["method"] == "sendPhoto" for x in g))
     photos = [x for x in got if x["method"] == "sendPhoto"]
-    caps = [str(x["params"].get("caption", "")) for x in photos]
-    report(len(photos) == len(links) and all((x["params"].get("photo") or {}).get("filename") == "qr.png"
+    texts = [text_of(x) for x in got if x["method"] == "sendMessage"]
+    block = "<pre>" + escape("\n".join(links), quote=False) + "</pre>"
+    report(len(photos) == 1 and all((x["params"].get("photo") or {}).get("filename") == "qr.png"
                                               and (x["params"].get("photo") or {}).get("size", 0) > 100 for x in photos)
-           and all(any(escape(link, quote=False) in cap for cap in caps) for link in links) and all("<pre>hy2://" in cap for cap in caps),
-           f"ссылки группы: {len(photos)} фото QR (PNG), в подписи узел и ссылка в <pre>")
+           and len(texts) == 1 and block in texts[0] and texts[0].count("<pre>") == 1,
+           "ссылки группы: одно сообщение с общим <pre> и один QR группы (PNG)")
     qr = shutil.which("qrencode")
     if qr:
         os.rename(qr, qr + ".iof-test")
     try:
-        got, a = tap(5001, mid, btn, lambda g: sum(x["method"] == "sendMessage" for x in g) >= len(links))
+        got, a = tap(5001, mid, btn, lambda g: any(x["method"] == "sendMessage" for x in g))
     finally:
         if qr:
             os.rename(qr + ".iof-test", qr)
     texts = [text_of(x) for x in got if x["method"] == "sendMessage"]
-    report(qr and len(texts) == len(links) and not any(x["method"] == "sendPhoto" for x in got)
-           and all(any(escape(link, quote=False) in t for t in texts) for link in links),
-           "без qrencode: ссылки только текстом")
+    report(qr and len(texts) == 1 and not any(x["method"] == "sendPhoto" for x in got)
+           and block in texts[0] and texts[0].count("<pre>") == 1,
+           "без qrencode: все ссылки одним блоком в одном сообщении")
     iof("set", "links", "off")
     got, c = ask(5001, "/hy2", "Группы ссылок")
     report(c is not None and "выключена" in text_of(c) and not any(k.startswith(("g:", "g#")) for k in keys(c)) and ref("gd", login) in keys(c),

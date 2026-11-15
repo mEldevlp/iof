@@ -2,7 +2,7 @@
 
 
 
-# Узлы: iof node add | import | del | list
+# Узлы: iof node add | import | del | rename | list
 
 # Раздача ключа iof на узел с индексом $1 в массивах IM_*: вход по паролю (sshpass) или ключом
 push_key_job() {
@@ -251,6 +251,137 @@ cmd_node_del() {
   echo "Чтобы убрать его из ссылок и ключей: sudo iof refresh"
 }
 
+# Меняет только локальные записи iof. Подпись в VPN-клиентах и hostname сервера сохраняются.
+cmd_node_rename() {
+  [[ $# == 2 ]] || die "используй: iof node rename <имя> <новое имя>"
+  python3 - "$BASE" "$1" "$2" <<'PY'
+import json
+import os
+from pathlib import Path
+import re
+import sys
+import tempfile
+import time
+
+base, old, new = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+
+def fail(message):
+    sys.exit("Ошибка: " + message)
+
+if not re.fullmatch(r"[A-Za-z0-9._-]{1,40}", new) or new in (".", "..", "all"):
+    fail("имя: до 40 знаков, латиница, цифры, точка, дефис, подчёркивание; ., .. и all запрещены")
+if not re.fullmatch(r"[A-Za-z0-9._-]+", old) or old in (".", ".."):
+    fail("недопустимое исходное имя узла")
+nodes = base / "nodes.conf"
+rows = nodes.read_text().splitlines()
+names = {line.split("|", 1)[0].strip() for line in rows if line.strip() and not line.lstrip().startswith("#")}
+if old not in names:
+    fail(f"узла '{old}' нет")
+if old == new:
+    print("Имя узла не изменилось")
+    sys.exit(0)
+if new in names:
+    fail(f"узел '{new}' уже есть")
+
+changes = {}
+old_title = ""
+for i, line in enumerate(rows):
+    fields = [s.strip() for s in line.split("|")]
+    if fields[0] == old:
+        fields += [""] * (4 - len(fields))
+        old_title = fields[3]
+        fields[0] = new
+        # Без явной подписи AWG использует имя узла для поиска приватных ключей.
+        fields[3] = fields[3] or old
+        rows[i] = " | ".join(fields)
+changes[nodes] = "\n".join(rows) + "\n"
+relays = base / "relays.conf"
+if relays.exists():
+    rows = relays.read_text().splitlines()
+    for i, line in enumerate(rows):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        fields = [s.strip() for s in line.split("|")]
+        if old in fields[:2]:
+            fields[:2] = [new if s == old else s for s in fields[:2]]
+            rows[i] = " | ".join(fields)
+    changes[relays] = "\n".join(rows) + "\n"
+
+for filename in ("audit/server.json", "audit/dpi.json", "audit/probe/session.json"):
+    path = base / filename
+    if path.exists():
+        data = json.loads(path.read_text())
+        if filename == "audit/probe/session.json" and not data.get("stopped") and data.get("expires", 0) > time.time():
+            fail("сначала заверши проверку с ПК: iof audit probe stop")
+        if old in data.get("nodes", {}):
+            if new in data["nodes"]:
+                fail(f"в {filename} уже есть запись '{new}'")
+            data["nodes"][new] = data["nodes"].pop(old)
+            changes[path] = json.dumps(data, ensure_ascii=False) + "\n"
+
+for filename, keys in (("check.last", {"problems"}),
+                       ("check.daily", {"ru_cut", "ru_noinet", "ru_down"})):
+    path = base / filename
+    if path.exists():
+        rows = path.read_text().splitlines()
+        for i, line in enumerate(rows):
+            key, sep, value = line.partition("=")
+            if sep and key in keys:
+                rows[i] = key + "=" + " ".join(new if s == old else s for s in value.split())
+        changes[path] = "\n".join(rows) + "\n"
+
+moves = []
+def slug(title):
+    return re.sub(r"[^A-Za-z0-9]+", "_", title).strip("_")[:32]
+
+old_file = slug(old_title) or old
+new_file = slug(old_title or old) or new
+if old_file != new_file:
+    for group in (base / "awg").glob("*"):
+        if not group.is_dir():
+            continue
+        for suffix in (".conf", ".pub"):
+            src, dst = group / (old_file + suffix), group / (new_file + suffix)
+            if dst.exists():
+                fail(f"уже существует {dst}, переименование затронет ключи другого узла")
+            if src.exists():
+                moves.append((src, dst))
+for folder in ("state", "ru"):
+    src, dst = base / folder / old, base / folder / new
+    if dst.exists():
+        fail(f"уже существует {dst}, сначала проверь старые данные узла")
+    if src.exists():
+        moves.append((src, dst))
+
+# Сначала готовим все файлы: ошибка разбора или записи не оставит частичных изменений.
+originals = {path: path.read_bytes() for path in changes}
+staged, written, moved = {}, [], []
+try:
+    for path, text in changes.items():
+        fd, tmp = tempfile.mkstemp(prefix=".rename-", dir=path.parent)
+        staged[path] = Path(tmp)
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            out.write(text)
+        os.chmod(tmp, path.stat().st_mode & 0o777)
+    for path, tmp in staged.items():
+        os.replace(tmp, path)
+        written.append(path)
+    for src, dst in moves:
+        src.rename(dst)
+        moved.append((src, dst))
+except OSError:
+    for src, dst in reversed(moved):
+        dst.rename(src)
+    for path in reversed(written):
+        path.write_bytes(originals[path])
+    raise
+finally:
+    for tmp in staged.values():
+        tmp.unlink(missing_ok=True)
+print(f"Узел {old} переименован в {new}. Подпись в VPN-клиентах и сам сервер не изменены.")
+PY
+}
+
 cmd_node_list() {
   read_nodes
   local i
@@ -271,7 +402,8 @@ cmd_node() {
     add)    cmd_node_add "$@" ;;
     import) cmd_node_import "$@" ;;
     del)    cmd_node_del "$@" ;;
+    rename) cmd_node_rename "$@" ;;
     list)   cmd_node_list ;;
-    *)      die "используй: iof node add | import | del | list" ;;
+    *)      die "используй: iof node add | import | del | rename | list" ;;
   esac
 }

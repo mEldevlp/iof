@@ -1,10 +1,10 @@
 "use strict";
 
 // Страница узла: состояние, Hysteria2, AmneziaWG, группы ссылок и ретрансляторы с этим узлом, действия.
-// Данные: GET api/node?n=<имя>, действия: POST api/node (задачи iof hy2 restart | install, iof node del + refresh).
+// Данные: GET api/node?n=<имя>, действия: POST api/node (iof hy2 restart | install, node rename, node del + refresh).
 // Кнопка «Терминал» открывает окно терминала на узел (term.js). Узел в адресе: node.html#n=<имя>
 
-const nd = { data: null, running: false };
+const nd = { data: null, running: false, saving: false };
 
 function nodeName() {
   const m = /^#n=(.+)$/.exec(location.hash);
@@ -35,7 +35,11 @@ const job = watchJob({
   demoJobs: () => demoJobs(),
   all: false,
   render: renderJob,
-  done: () => pageApi.reload(),
+  done: (j) => {
+    const renamed = /^\$ iof node rename (\S+) (\S+)$/.exec(j.log[0] || "");
+    if (j.state === "ok" && renamed && renamed[1] === nodeName()) location.hash = `n=${encodeURIComponent(renamed[2])}`;
+    else pageApi.reload();
+  },
 });
 
 
@@ -52,6 +56,10 @@ function actButton(act, label, off, cls = "") {
 
 function syncButtons() {
   document.querySelectorAll("[data-act]").forEach((b) => { b.disabled = nd.running || b.dataset.off === "1"; });
+  const locked = nd.running || nd.saving || !nd.data?.conf || migrating(nd.data);
+  $("#rename-open").disabled = locked;
+  $("#rename-save").disabled = locked;
+  $("#rename-name").disabled = locked;
 }
 
 function migrating(d) {
@@ -62,6 +70,7 @@ function renderHead(d) {
   const demo = DEMO ? "?demo" : "";
   document.title = `${d.name || "Узел"} · Island of Freedom`;
   $("#node-title").textContent = d.name || "Узел";
+  $("#rename-open").hidden = !d.conf || migrating(d);
   $("#node-sub").innerHTML = `<a href="./${demo}">Обзор</a>` +
     (d.conf ? ` / ${esc(d.conf.title)} · <span class="mono">${esc(d.conf.addr)}</span>` : "");
 }
@@ -214,6 +223,38 @@ function render(d) {
 
 // Действия
 
+function closeRename(focus = false) {
+  $("#rename-form").hidden = true;
+  $("#node-heading").hidden = false;
+  $("#rename-open").setAttribute("aria-expanded", "false");
+  if (focus) $("#rename-open").focus();
+}
+
+async function renameNode(e) {
+  e.preventDefault();
+  if (nd.running || nd.saving || !nd.data?.conf || migrating(nd.data)) return;
+  const name = nd.data.name, newName = $("#rename-name").value.trim();
+  formError("", "#rename-error");
+  if (!/^[A-Za-z0-9._-]{1,40}$/.test(newName) || [".", "..", "all"].includes(newName)) {
+    formError("Укажи имя до 40 знаков: латиница, цифры, точка, дефис, подчёркивание. Имена ., .. и all запрещены.", "#rename-error");
+    return;
+  }
+  if (name === newName) { closeRename(true); return; }
+  nd.saving = true;
+  syncButtons();
+  try {
+    const body = { action: "rename", name, new_name: newName };
+    const id = DEMO ? demoNodeJob(body) : (await postJson("api/node", body)).job;
+    closeRename();
+    job.start(id);
+  } catch (err) {
+    formError(err.message, "#rename-error");
+  } finally {
+    nd.saving = false;
+    syncButtons();
+  }
+}
+
 async function act(key) {
   const a = ACTIONS[key], name = nd.data.name;
   if (!confirm(a.ask(name))) return;
@@ -245,6 +286,9 @@ function renderJob(j) {
     error: j.log.includes("$ iof refresh")
       ? `${icon("crit")}<div>Узел удалён, но пересборка прервалась${why}. Повторить: <code>sudo iof refresh</code></div>`
       : `${icon("crit")}<div>Узел не удалён${why}</div>`,
+  } : first.startsWith("$ iof node rename") ? {
+    ok: `${icon("good")}<div>Имя сервера изменено.</div>`,
+    error: `${icon("crit")}<div>Не удалось переименовать сервер${why}</div>`,
   } : first.startsWith("$ iof hy2 install") ? {
     ok: `${icon("good")}<div>Hysteria2 установлена, узел добавлен в группы ссылок.</div>`,
     warn: `${icon("warn")}<div>Установить не удалось${why}. Подробности в логе, повторить можно той же кнопкой.</div>`,
@@ -261,7 +305,19 @@ const pageApi = startPage({
   demo: () => demoNode(nodeName()),
   init() {
     // Другой узел в адресе: другие данные и свои задачи, терминал прошлого узла закрывается
-    window.addEventListener("hashchange", () => { Term.close(); job.hide(); pageApi.reload(); job.poll(); });
+    window.addEventListener("hashchange", () => { closeRename(); Term.close(); job.hide(); pageApi.reload(); job.poll(); });
+    $("#rename-open").addEventListener("click", () => {
+      $("#rename-name").value = nd.data.name;
+      formError("", "#rename-error");
+      $("#node-heading").hidden = true;
+      $("#rename-form").hidden = false;
+      $("#rename-open").setAttribute("aria-expanded", "true");
+      $("#rename-name").focus();
+      $("#rename-name").select();
+    });
+    $("#rename-form").addEventListener("submit", renameNode);
+    $("#rename-form").addEventListener("keydown", (e) => { if (e.key === "Escape") { e.preventDefault(); closeRename(true); } });
+    $("#rename-cancel").addEventListener("click", () => closeRename(true));
     $("#term-open").addEventListener("click", () => {
       const d = nd.data;
       if (d && d.conf) Term.open({ name: d.name, ssh: d.conf.ssh, enabled: !!d.terminal });

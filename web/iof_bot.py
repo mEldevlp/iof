@@ -15,7 +15,7 @@ Long polling (getUpdates), без webhook: на сервере не открыв
 команды выполняются в отдельных потоках (не больше WORKERS сразу), а цикл опроса Telegram не ждёт.
 Кнопки inline: callback_data не длиннее 64 байт, у слишком длинного имени узла или группы — хэш.
 Ссылки Hysteria2 (кнопка группы под /hy2, если в bot.json hy2_links) — только в сообщения админу:
-фото QR и ссылка в подписи. В журнал панели бот пишет всё через маску пароля ссылок.
+все ссылки одним блоком и общий QR группы. В журнал панели бот пишет всё через маску пароля ссылок.
 
 Действия (/check, /hy2add, /hy2refresh и кнопки перезапуска Hysteria2, проверки узла, удаления
 группы) — только главному админу и только если в bot.json actions. Шаги задачи собирает панель
@@ -541,11 +541,6 @@ def hy2_keyboard(groups, links, act):
     if act and groups:
         rows.append([button("♻️ Пересобрать все группы", "hf")])
     return {"inline_keyboard": rows} if rows else None
-
-
-def link_caption(group, link):
-    """Подпись к QR ссылки: узел, группа и сама ссылка в <pre> (Telegram даёт её скопировать)."""
-    return f"<b>{esc(link['node'])}</b> · {esc(group)}\n<pre>{esc(link['url'])}</pre>"
 
 
 def confirm_text(title, steps, note=None, ttl=300):
@@ -1241,8 +1236,8 @@ class Bot:
         self.send(api, chat_id, hy2_text(groups, links, act), hy2_keyboard(groups, links, act))
 
     def view_links(self, api, chat_id, name):
-        """Кнопка 🔗 группы: по сообщению на ссылку — фото QR (PNG от qrencode) и подпись с узлом и ссылкой.
-        Без qrencode или если Telegram не принял фото — только текст. В ссылках пароль: они уходят только
+        """Кнопка 🔗 группы: ссылки одним блоком <pre> и один QR всей группы.
+        Без qrencode или если Telegram не принял фото — только ссылки. В ссылках пароль: они уходят только
         админу, в журнал панели (маска LINK_SECRET) и лог задач не попадают."""
         g = self.views.hy2_links(name)
         if g is None:
@@ -1250,22 +1245,25 @@ class Bot:
         if not g["links"]:
             return self.send(api, chat_id, f"В группе «{esc(g['label'])}» нет ссылок: ни один узел их не выдал. "
                                            "Пересобрать: /hy2refresh")
-        for link in g["links"]:
-            caption = link_caption(g["label"], link)
-            png = self.views.qr_png(link["url"])
-            if png is not None:
-                # Длинная ссылка в подпись не влезает: тогда она отдельным сообщением после фото
-                short = caption if len(caption) <= MAX_CAPTION else caption.split("\n", 1)[0]
-                try:
-                    self.photo(api, chat_id, png, short)
-                except ApiError as e:
-                    if e.code != 400:
-                        raise
-                    self.log(f"бот: Telegram не принял QR ссылки группы {name}: {e}")
-                    short = None
-                if short == caption:
-                    continue
-            self.send(api, chat_id, caption)
+        links = "\n".join(link["url"] for link in g["links"])
+        title = f"<b>{esc(g['label'])}</b>"
+        # <pre> — эквивалент ``` в Telegram HTML. Считаем UTF-16 после разбора HTML,
+        # отправляем напрямую: общий send режет длинный HTML по строкам и разорвёт блок.
+        if len((g["label"] + "\n" + links).encode("utf-16-le")) // 2 <= MAX_TEXT:
+            self.call(api, "sendMessage", {"chat_id": chat_id, "parse_mode": "HTML",
+                                           "text": f"{title}\n<pre>{esc(links)}</pre>"})
+        else:
+            self.call(api, "sendDocument", {"chat_id": chat_id, "parse_mode": "HTML",
+                                            "caption": f"{title}\nВсе ссылки группы в файле: превышен лимит сообщения Telegram."},
+                      files={"document": ("hysteria2.txt", links.encode("utf-8"), "text/plain")})
+        png = self.views.qr_png(links)
+        if png is not None:
+            try:
+                self.photo(api, chat_id, png, f"QR группы · {esc(g['label'])}")
+            except ApiError as e:
+                if e.code != 400:
+                    raise
+                self.log(f"бот: Telegram не принял QR группы {name}: {e}")
 
     def greeting(self, admin, user):
         name = clean(user.get("first_name") or admin.get("name"), 64) or "админ"

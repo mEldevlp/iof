@@ -76,7 +76,22 @@
           <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 4h11M2.5 8h11M2.5 12h11" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
         </button>
         <div class="page-title">
-          <h1 id="node-title">Узел</h1>
+          <div id="node-heading" class="node-heading">
+            <h1 id="node-title">Узел</h1>
+            <button id="rename-open" class="btn small rename-open" type="button" title="Переименовать сервер" aria-label="Переименовать сервер" aria-controls="rename-form" aria-expanded="false" hidden>
+              <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M10.5 2.5l3 3M3 10l8-8a1.4 1.4 0 0 1 2 2l-8 8-3 1z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </button>
+          </div>
+          <form id="rename-form" class="rename-form field" hidden>
+            <label class="sr-only" for="rename-name">Новое имя сервера</label>
+            <div class="rename-row">
+              <input id="rename-name" type="text" required maxlength="40" pattern="[A-Za-z0-9._\-]+" autocomplete="off" spellcheck="false" aria-describedby="rename-hint rename-error">
+              <button id="rename-save" class="btn small" type="submit">Сохранить</button>
+              <button id="rename-cancel" class="btn small" type="button">Отмена</button>
+            </div>
+            <p id="rename-hint" class="hint">Латиница, цифры, точка, дефис, подчёркивание.</p>
+            <div id="rename-error" class="form-error" role="alert" hidden></div>
+          </form>
           <p id="node-sub"><a href="./">Обзор</a></p>
         </div>
         <div class="controls">

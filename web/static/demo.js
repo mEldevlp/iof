@@ -20,6 +20,7 @@ const demoState = {
     { name: "Family", label: "Family", created: "2026-10-02 09:41:37", nodes: ["Main", "Node 1", "Node 2"], hop: true },
   ],
   deleted: [],
+  renamed: {},
   version: "e741874 2026-11-01",
   updateLog: null,
   jobs: [
@@ -61,7 +62,8 @@ function demoNodes() {
   ];
   nodes[4].issues = ["контейнер AmneziaWG остановлен"];
   nodes[4].ok = false;
-  return nodes.filter((n) => !demoState.deleted.includes(n.name));
+  return nodes.map((n) => ({ ...n, name: demoState.renamed[n.name] || n.name }))
+    .filter((n) => !demoState.deleted.includes(n.name));
 }
 
 function demoStatus() {
@@ -121,7 +123,7 @@ function demoNode(name) {
   return demoDelay({
     ...status,
     name,
-    conf: node && { name, addr: node.addr, ssh: name === "main" ? "local" : `root@${node.addr}`, title: node.title },
+    conf: node && { name, addr: node.addr, ssh: node.addr === "192.0.2.10" ? "local" : `root@${node.addr}`, title: node.title },
     node,
     relays: DEMO_RELAYS.filter((r) => r.node === name || r.via === name),
     hy2_groups: demoState.groups.map((g) => ({
@@ -234,7 +236,20 @@ function demoHy2Job(body) {
 function demoNodeJob(body) {
   const name = body.name;
   const kind = `node:${name}`;
-  const down = name === "node-5";
+  if (body.action === "rename") {
+    if (demoNodes().some((n) => n.name === body.new_name)) throw new Error(`узел ${body.new_name} уже есть`);
+    return demoRunJob(kind, `Переименование ${name} → ${body.new_name}`, [
+      `$ iof node rename ${name} ${body.new_name}`, `Узел ${name} переименован в ${body.new_name}.`,
+    ], "ok", () => {
+      const original = Object.keys(demoState.renamed).find((key) => demoState.renamed[key] === name) || name;
+      demoState.renamed[original] = body.new_name;
+      DEMO_RELAYS.forEach((r) => {
+        if (r.node === name) r.node = body.new_name;
+        if (r.via === name) r.via = body.new_name;
+      });
+    });
+  }
+  const down = !demoNodes().find((n) => n.name === name)?.reachable;
   if (body.action === "restart_hy2") {
     return down
       ? demoRunJob(kind, `Перезапуск Hysteria2 на ${name}`, [`$ iof hy2 restart ${name}`, "Перезапущено: 0", "Ошибки (1):",

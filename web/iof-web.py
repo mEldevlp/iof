@@ -5,7 +5,7 @@
 списки ретрансляторов, групп Hysteria2 и клиентов AWG читает из /root/iof напрямую.
 Ссылки Hysteria2 (в них пароль) отдаёт на странице hy2, ключи и конфиги AWG не отдаёт.
 Меняет что-то только через команды iof (добавление сервера: iof node add, iof hy2 install;
-группы ссылок: iof hy2 add | del | refresh; действия с узлом: iof hy2 restart | install, iof node del;
+группы ссылок: iof hy2 add | del | refresh; действия с узлом: iof hy2 restart | install, iof node del | rename;
 обновление: iof update; перенос управляющего сервера: iof migrate; проверка безопасности:
 iof audit run, она узлы только читает; проверка с ПК: iof audit probe), по одной задаче за раз,
 с логом выполнения. Исключения — терминал на узел со страницы узла (ssh с ключом iof через
@@ -760,11 +760,18 @@ def node_steps(iof, body, conf, relays, hy2_template, migrate):
         raise ValueError(f"узла {name} нет в nodes.conf")
     action = body.get("action")
     # iof hy2 install и restart принимают шаблоны узлов, а all значит «все»
-    if name == "all" and action != "delete":
+    if name == "all" and action not in ("delete", "rename"):
         raise ValueError("узел с именем all так не выбрать, используй терминал")
     if action == "restart_hy2":
         return name, f"Перезапуск Hysteria2 на {name}", [step(iof, "hy2", "restart", name)]
     not_migrating(migrate)
+    if action == "rename":
+        new_name = text_field(body, "new_name", 40)
+        if not SAFE_NAME.fullmatch(new_name) or new_name in (".", "..", "all"):
+            raise ValueError("имя: латиница, цифры, точка, дефис, подчёркивание; ., .. и all запрещены")
+        if new_name != name and new_name in {row[0] for row in conf}:
+            raise ValueError(f"узел {new_name} уже есть")
+        return name, f"Переименование {name} → {new_name}", [step(iof, "node", "rename", name, new_name)]
     if action == "install_hy2":
         if not hy2_template.is_file():
             raise ValueError(f"нет шаблона {hy2_template} для установки Hysteria2")
@@ -1613,7 +1620,7 @@ class BotViews:
 
     @staticmethod
     def qr_png(text):
-        return qr_png(text)
+        return qr_png(text, "L")
 
     def migrate(self):
         return read_migrate(self.srv.base)

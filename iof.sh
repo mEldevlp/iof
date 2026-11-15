@@ -62,6 +62,7 @@ Island of Freedom управление VPN-серверами // by meldevlp
       --addr адрес              адрес для клиентов, если отличается от адреса SSH
   iof node list               список узлов
   iof node del имя            убрать узел из списка (сервер не трогает)
+  iof node rename имя новое   переименовать узел в iof (сервер не трогает)
 
 Hysteria2
   iof hy2 install all         поставить на все узлы, где её нет (конфиг по образцу этого сервера)
@@ -165,7 +166,7 @@ if [[ $# -gt 0 ]]; then shift; fi
 
 # Пока идёт перенос отсюда, команды, которые что-то меняют, запрещены
 case "$cmd:${1:-}" in
-  init:*|refresh:*|node:add|node:import|node:del|relay:add|relay:del|relay:apply) migrate_guard ;;
+  init:*|refresh:*|node:add|node:import|node:del|node:rename|relay:add|relay:del|relay:apply) migrate_guard ;;
   hy2:add|hy2:del|hy2:refresh|hy2:install|hy2:hop|hy2:upgrade|awg:add|awg:del|awg:refresh) migrate_guard ;;
   block:on|block:update|block:off) migrate_guard ;;
   bot:token|bot:on|bot:off|bot:set|bot:invite|bot:redeem|bot:admin) migrate_guard ;;
