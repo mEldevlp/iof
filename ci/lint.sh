@@ -8,7 +8,7 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT" || exit 1
-SHELL_FILES=(iof.sh iof-nightly install.sh stand/stand.sh stand/test.sh ci/lint.sh)
+SHELL_FILES=(iof.sh lib/*.sh build.sh iof-nightly install.sh stand/stand.sh stand/test.sh ci/lint.sh ci/test-build.sh)
 # Панель, модуль Telegram-бота и поддельный Bot API стенда
 PY_FILES=(web/iof-web.py web/iof_bot.py stand/fake-tg.py)
 # Сторонний код в web/static: xterm.js для терминала на странице узла. Правила CSP к нему не применяются:
@@ -51,10 +51,41 @@ check_bash() {
 check_shellcheck() {
   local out
   if ! command -v shellcheck >/dev/null 2>&1; then missing shellcheck; return; fi
-  if out="$(shellcheck --severity=warning "${SHELL_FILES[@]}" 2>&1)"; then
+  # iof.sh проверяется с подключениями; собранный файл ниже ещё раз проверяет весь код вместе.
+  # В отдельном модуле SC2034 не видит, что переменная используется другим модулем.
+  if out="$(shellcheck -x --severity=warning iof.sh build.sh iof-nightly install.sh stand/stand.sh stand/test.sh ci/lint.sh ci/test-build.sh 2>&1 \
+    && shellcheck --severity=warning --exclude=SC2034 lib/*.sh 2>&1)"; then
     ok "shellcheck $(shellcheck --version | sed -n 's/^version: //p')"
   else
     fail "shellcheck"
+    details "$out"
+  fi
+}
+
+# Проверяем тот же автономный файл, который ставит install.sh, без обращения к данным сервера.
+check_build() {
+  local tmp out
+  tmp="$(mktemp -d)" || { fail "сборка: нет временной папки"; return; }
+  if bash build.sh > "$tmp/iof" 2> "$tmp/error"; then
+    ok "сборка: все lib/*.sh включены ровно один раз, bash -n собранного iof"
+    if command -v shellcheck >/dev/null 2>&1; then
+      cp "$ROOT/.shellcheckrc" "$tmp/.shellcheckrc"
+      if out="$(shellcheck --severity=warning "$tmp/iof" 2>&1)"; then
+        ok "shellcheck собранного iof"
+      else
+        fail "shellcheck собранного iof"
+        details "$out"
+      fi
+    fi
+  else
+    fail "сборка iof"
+    details "$(cat "$tmp/error")"
+  fi
+  rm -rf "$tmp"
+  if out="$(bash ci/test-build.sh 2>&1)"; then
+    ok "$out"
+  else
+    fail "регрессии сборки"
     details "$out"
   fi
 }
@@ -94,14 +125,14 @@ check_js() {
 # run_on отправляет на узел только функции из NODE_FUNCS: новая n_* без записи там на узле не найдётся
 check_node_funcs() {
   local defined listed extra lost
-  defined="$(grep -oE '^n_[A-Za-z0-9_]+\(\)' iof.sh | tr -d '()' | sort -u)"
-  listed="$(sed -n '/^NODE_FUNCS=(/,/^)/p' iof.sh | sed '1d;$d' | tr -s ' \t' '\n' | grep -v '^$' | sort -u)"
+  defined="$(grep -h -oE '^n_[A-Za-z0-9_]+\(\)' iof.sh lib/*.sh | tr -d '()' | sort -u)"
+  listed="$(sed -n '/^NODE_FUNCS=(/,/^)/p' lib/remote.sh | sed '1d;$d' | tr -s ' \t' '\n' | grep -v '^$' | sort -u)"
   extra="$(comm -23 <(echo "$defined") <(echo "$listed"))"
   lost="$(comm -13 <(echo "$defined") <(echo "$listed"))"
   if [[ -z "$extra" && -z "$lost" ]]; then
     ok "NODE_FUNCS: все функции n_* ($(wc -l <<<"$defined"))"
   else
-    fail "NODE_FUNCS не совпадает с функциями n_* в iof.sh"
+    fail "NODE_FUNCS не совпадает с функциями n_* в iof.sh и lib/*.sh"
     if [[ -n "$extra" ]]; then details "нет в NODE_FUNCS: $(words "$extra")"; fi
     if [[ -n "$lost" ]]; then details "в NODE_FUNCS, но не определены: $(words "$lost")"; fi
   fi
@@ -207,16 +238,16 @@ check_probe() {
   fi
 }
 
-# Типы уведомлений записаны в четырёх местах: NOTIFY_KINDS и NOTIFY в BOT_PY (iof.sh), BOT_NOTIFY (панель)
+# Типы уведомлений записаны в четырёх местах: NOTIFY_KINDS (common.sh), NOTIFY в BOT_PY (bot.sh), BOT_NOTIFY (панель)
 # и NOTIFY (страница «Телеграм бот»). Новый тип, добавленный не везде, iof не отправит или страница не покажет
 check_notify() {
   local sh py web js
-  sh="$(sed -n 's/^NOTIFY_KINDS="\(.*\)"$/\1/p' iof.sh)"
-  py="$(sed -n '/^NOTIFY = {/,/^}/p' iof.sh | grep -oE '^    "[a-z]+"' | tr -d ' "' | tr '\n' ' ' | sed 's/ $//')"
+  sh="$(sed -n 's/^NOTIFY_KINDS="\(.*\)"$/\1/p' lib/common.sh)"
+  py="$(sed -n '/^NOTIFY = {/,/^}/p' lib/bot.sh | grep -oE '^    "[a-z]+"' | tr -d ' "' | tr '\n' ' ' | sed 's/ $//')"
   web="$(grep -E '^BOT_NOTIFY = \(' web/iof-web.py | grep -oE '"[a-z]+"' | tr -d '"' | tr '\n' ' ' | sed 's/ $//')"
   js="$(sed -n '/^const NOTIFY = \[/,/^\];/p' web/static/bot.js | grep -oE '^  \["[a-z]+"' | tr -d ' ["' | tr '\n' ' ' | sed 's/ $//')"
   if [[ -n "$sh" && "$sh" == "$py" && "$sh" == "$web" && "$sh" == "$js" ]]; then
-    ok "типы уведомлений одинаковы в iof.sh, iof-web.py и bot.js: $sh"
+    ok "типы уведомлений одинаковы в lib/common.sh, lib/bot.sh, iof-web.py и bot.js: $sh"
   else
     fail "типы уведомлений расходятся"
     details "NOTIFY_KINDS: $sh"$'\n'"NOTIFY (BOT_PY): $py"$'\n'"BOT_NOTIFY: $web"$'\n'"NOTIFY (bot.js): $js"
@@ -233,6 +264,7 @@ check_eol() {
 
 check_bash
 check_shellcheck
+check_build
 check_python
 check_js
 check_node_funcs
