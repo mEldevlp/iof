@@ -660,6 +660,64 @@ def login_fields(body):
     raise ValueError("способ входа: пароль, ключ или ключ iof уже добавлен")
 
 
+def template_path(srv):
+    """Путь проверяется при каждом запросе: setup не требует перезапуска панели."""
+    explicit = getattr(srv, "hy2_template", None)
+    if explicit:
+        return Path(explicit)
+    system = Path("/etc/hysteria/config.yaml")
+    return system if system.is_file() else srv.base / "hy2-template.yaml"
+
+
+def setup_view(srv):
+    """Только локальные файлы и несекретные поля, без опроса StatusCache и SSH."""
+    nodes = read_conf(srv.base / "nodes.conf", 4)
+    state = {}
+    try:
+        for line in (srv.base / "setup.state").read_text(encoding="utf-8").splitlines():
+            key, _, value = line.partition("=")
+            if key in ("mode", "phase", "name", "addr"):
+                state[key] = value
+    except OSError:
+        pass
+    local = next((r for r in nodes if (r[2] or "local") == "local"), None)
+    return {"template": template_path(srv).is_file(), "nodes": len(nodes),
+            "local": {"name": local[0], "addr": local[1]} if local else None,
+            "state": state, "busy": srv.jobs.busy(), "migrate": read_migrate(srv.base)}
+
+
+def setup_steps(iof, body):
+    """Мастер передаёт только публичные параметры; пароли создаёт сама команда."""
+    mode = body.get("mode")
+    if mode not in ("local", "template-only"):
+        raise ValueError("выбери роль управляющего сервера")
+    argv = [iof, "setup"]
+    if mode == "template-only":
+        argv += ["--template-only"]
+    else:
+        name = text_field(body, "name", 40)
+        addr = text_field(body, "addr", 253)
+        title = text_field(body, "title", 64)
+        if not NODE_NAME.fullmatch(name) or name in (".", "..", "all"):
+            raise ValueError("неверное имя узла")
+        if (not NODE_HOST.fullmatch(addr) or addr.lower() == "localhost"
+                or addr.startswith("127.") or addr == "0.0.0.0"):
+            raise ValueError("укажи адрес для VPN-клиентов, не localhost SSH-туннеля")
+        if "|" in title or "\t" in title:
+            raise ValueError("неверная подпись узла")
+        argv += ["--name", name, "--addr", addr, "--title", title or name]
+    if "port" in body:
+        port = body["port"]
+        if isinstance(port, bool) or not re.fullmatch(r"[0-9]{1,5}", str(port)) or not 1 <= int(port) <= 65535:
+            raise ValueError("UDP-порт: число от 1 до 65535")
+        argv += ["--port", str(port)]
+    if "obfs" in body:
+        if body["obfs"] not in ("none", "salamander"):
+            raise ValueError("обфускация: none или salamander")
+        argv += ["--obfs", body["obfs"]]
+    return "Первоначальная настройка", [(shlex.join(["iof", *argv[1:]]), argv, None)]
+
+
 def node_add_steps(iof, body, existing):
     """Поля формы -> (заголовок задачи, шаги для Jobs). ValueError с текстом для формы."""
     name, addr, title = text_field(body, "name", 40), text_field(body, "addr", 253), text_field(body, "title", 64)
@@ -858,7 +916,7 @@ def action_steps(srv, kind, body):
         return ("hy2", *hy2_steps(srv.iof, body, read_index(srv.base / "hy2" / "index.tsv"), migrate))
     if kind == "node":
         name, title, steps = node_steps(srv.iof, body, read_conf(srv.base / "nodes.conf", 4),
-                                        read_relays(srv.base), srv.hy2_template, migrate)
+                                        read_relays(srv.base), template_path(srv), migrate)
         return f"node:{name}", title, steps
     if kind == "audit":
         names = {r[0] for r in read_conf(srv.base / "nodes.conf", 4)}
@@ -1530,7 +1588,7 @@ def node_view(srv, name, force):
         "node": next((n for n in nodes if n["name"] == name), None),
         "relays": [r for r in read_relays(base) if name in (r["node"], r["via"])],
         "hy2_groups": groups,
-        "hy2_template": srv.hy2_template.is_file(),
+        "hy2_template": template_path(srv).is_file(),
         "busy": srv.jobs.busy(),
         "terminal": srv.terms.enabled,
         "migrate": read_migrate(base),
@@ -1684,6 +1742,8 @@ class Handler(BaseHTTPRequestHandler):
         if not self.authorized():
             return
         force = query.get("force") == "1"
+        if url.path == "/api/setup":
+            return self.send_json(setup_view(self.server))
         if url.path == "/api/dashboard":
             return self.dashboard(force)
         if url.path == "/api/hy2":
@@ -1723,7 +1783,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self.authorized() or not self.same_origin():
             return
         if path not in ("/api/nodes", "/api/migrate", "/api/hy2", "/api/node", "/api/service", "/api/security",
-                        "/api/term", "/api/probe", "/api/bot"):
+                        "/api/term", "/api/probe", "/api/bot", "/api/setup"):
             return self.send_json({"error": "не найдено"}, HTTPStatus.NOT_FOUND)
         body = self.read_json()
         if body is None:
@@ -1747,11 +1807,14 @@ class Handler(BaseHTTPRequestHandler):
         """POST -> (вид задачи, заголовок, шаги). ValueError с текстом для страницы."""
         srv = self.server
         migrate = read_migrate(srv.base)
+        if path == "/api/setup":
+            not_migrating(migrate)
+            return ("setup", *setup_steps(srv.iof, body))
         if path == "/api/nodes":
             not_migrating(migrate)
             title, steps = node_add_steps(srv.iof, body, self.node_names())
-            if body.get("install_hy2") and not srv.hy2_template.is_file():
-                raise ValueError(f"нет шаблона {srv.hy2_template} для установки Hysteria2")
+            if body.get("install_hy2") and not template_path(srv).is_file():
+                raise ValueError(f"нет шаблона {template_path(srv)} для установки Hysteria2")
             return "node", title, steps
         if path == "/api/migrate":
             return ("migrate", *migrate_steps(srv.iof, body, migrate))
@@ -1808,7 +1871,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json({
             "nodes": sorted(self.node_names()),
             "pubkey": self.pubkey(),
-            "hy2_template": self.server.hy2_template.is_file(),
+            "hy2_template": template_path(self.server).is_file(),
             "busy": self.server.jobs.busy(),
             "migrate": read_migrate(self.server.base),
         })
@@ -2112,7 +2175,7 @@ def main():
     srv.hosts = hosts
     ssh_key = os.environ.get("IOF_SSH_KEY", "/root/.ssh/iof_ed25519")
     srv.ssh_pub = Path(ssh_key + ".pub")
-    srv.hy2_template = Path(os.environ.get("HY2_TEMPLATE", "/etc/hysteria/config.yaml"))
+    srv.hy2_template = Path(os.environ["HY2_TEMPLATE"]) if os.environ.get("HY2_TEMPLATE") else None
     srv.cache = StatusCache(args.iof, args.ttl)
     srv.probes = Probes(srv.base)
 

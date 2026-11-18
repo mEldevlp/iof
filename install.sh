@@ -31,6 +31,7 @@ sed "s|^IOF_VERSION=.*|IOF_VERSION=\"$VERSION\"|" "$TMP/iof" > "$TMP/iof-version
 bash -n "$TMP/iof-versioned" || die "iof с версией не проходит bash -n, ничего не менял"
 install -m 700 "$TMP/iof-versioned" /usr/local/bin/iof
 echo "iof: /usr/local/bin/iof ($VERSION)"
+echo "Первый запуск: sudo iof setup (или мастер на Обзоре панели); только шаблон: sudo iof setup --template-only"
 
 # Ночное обслуживание. Расписание в crontab root не трогаем, только подсказываем
 install -m 700 "$SRC/iof-nightly" /usr/local/sbin/iof-nightly

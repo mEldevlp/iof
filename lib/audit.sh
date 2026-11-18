@@ -843,7 +843,8 @@ audit_list_info() {
 
 # Перед опросом блока dpi: соль запуска, хэши блоков шаблона Hysteria2, списки в кэше
 audit_dpi_prepare() {
-  local tpl="${HY2_TEMPLATE:-/etc/hysteria/config.yaml}"
+  local tpl
+  tpl="$(hy2_template_path)"
   AUDIT_SALT="$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
   AUDIT_TPL_SRC=""
   AUDIT_TPL=""

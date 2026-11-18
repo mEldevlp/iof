@@ -2,16 +2,16 @@
 
 # Общие команды: init, update, exec, refresh; заглушка VLESS
 
-cmd_init() {
+init_files() {
   mkdir -p "$BASE" "$HY2_DIR" "$STATE_DIR"
   chmod 700 "$BASE"
 
   if [[ ! -f "$NODES_FILE" ]]; then
     cat > "$NODES_FILE" <<'EOF'
 # имя | адрес для клиентов | ssh (local или user@host[:port]) | подпись в клиенте
-main   | 192.0.2.10    | local                 | Main
-node-1 | 198.51.100.20 | root@198.51.100.20    | Node 1
-node-2 | 203.0.113.30  | admin@203.0.113.30:22 | Node 2
+# main   | 192.0.2.10    | local                 | Main
+# node-1 | 198.51.100.20 | root@198.51.100.20    | Node 1
+# node-2 | 203.0.113.30  | admin@203.0.113.30:22 | Node 2
 EOF
     echo "Создан $NODES_FILE"
   fi
@@ -40,9 +40,15 @@ EOF
     echo "Создан $ENV_FILE"
   fi
 
-  if [[ ! -f "$SSH_KEY" ]]; then
-    ssh-keygen -t ed25519 -N "" -f "$SSH_KEY" -C "iof@$(hostname)" >/dev/null
-    echo "Создан SSH-ключ $SSH_KEY"
+  ensure_ssh_key
+  chmod 600 "$NODES_FILE"
+}
+
+cmd_init() {
+  init_files
+  if ! grep -qE '^[[:space:]]*[^#[:space:]]' "$NODES_FILE"; then
+    echo "Узлов пока нет. Первый запуск: sudo iof setup (или мастер на Обзоре панели)."
+    return 0
   fi
 
   # Раздача ключа по одному узлу с вводом пароля. Для многих серверов удобнее iof node import

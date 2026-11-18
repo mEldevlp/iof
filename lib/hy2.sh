@@ -400,7 +400,7 @@ hy2_install() {
   read_nodes
   select_nodes "${args[@]}"
 
-  tplsrc="${HY2_TEMPLATE:-/etc/hysteria/config.yaml}"
+  tplsrc="$(hy2_template_path)"
   [[ -f "$tplsrc" ]] || die "нет шаблона $tplsrc (конфиг Hysteria2 на управляющем сервере)"
   HY2_INST_TPL="$(base64 -w0 "$tplsrc")"
   HY2_INST_FORCE="$force"

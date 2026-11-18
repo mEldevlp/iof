@@ -33,6 +33,8 @@ source "$IOF_LIB/migrate.sh"
 source "$IOF_LIB/status.sh"
 # shellcheck source=lib/service.sh
 source "$IOF_LIB/service.sh"
+# shellcheck source=lib/setup.sh
+source "$IOF_LIB/setup.sh"
 # shellcheck source=lib/api.sh
 source "$IOF_LIB/api.sh"
 unset IOF_LIB
@@ -42,6 +44,8 @@ usage() {
 Island of Freedom управление VPN-серверами // by meldevlp
 
 Общее
+  iof setup [--template-only]  мастер первого запуска; --addr IPv4/домен, --name main,
+                              --title подпись, --port 443, --obfs none|salamander
   iof status                  сводная таблица по узлам
   iof check                   проверка для cron, уведомление в Telegram при изменениях; раз в сутки ещё
                               обновления iof и доступ к российским серверам с узлов (RU_TARGETS), --daily — сейчас
@@ -166,7 +170,7 @@ if [[ $# -gt 0 ]]; then shift; fi
 
 # Пока идёт перенос отсюда, команды, которые что-то меняют, запрещены
 case "$cmd:${1:-}" in
-  init:*|refresh:*|node:add|node:import|node:del|node:rename|relay:add|relay:del|relay:apply) migrate_guard ;;
+  setup:*|init:*|refresh:*|node:add|node:import|node:del|node:rename|relay:add|relay:del|relay:apply) migrate_guard ;;
   hy2:add|hy2:del|hy2:refresh|hy2:install|hy2:hop|hy2:upgrade|awg:add|awg:del|awg:refresh) migrate_guard ;;
   block:on|block:update|block:off) migrate_guard ;;
   bot:token|bot:on|bot:off|bot:set|bot:invite|bot:redeem|bot:admin) migrate_guard ;;
@@ -194,6 +198,7 @@ case "$cmd" in
   api)     cmd_api "$@" ;;
   update)  cmd_update "$@" ;;
   version) echo "iof $IOF_VERSION" ;;
+  setup)   cmd_setup "$@" ;;
   init)    cmd_init ;;
   *)       usage ;;
 esac

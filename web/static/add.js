@@ -85,10 +85,12 @@ async function loadInfo() {
   $("#known").innerHTML = i.nodes.length ? i.nodes.map((n) => `<span class="chip">${esc(n)}</span>`).join("") : '<span class="hint">пока пусто</span>';
   $("#pubkey-cmd").textContent = pubkeyCommand(i.pubkey);
   $("#copy-pubkey").disabled = !i.pubkey;
+  $("#f-hy2").disabled = !i.hy2_template;
+  if (i.hy2_template) $("#hy2-hint").textContent = "Шаблон готов для установки Hysteria2";
   if (!i.hy2_template) {
     $("#f-hy2").checked = false;
     $("#f-hy2").disabled = true;
-    $("#hy2-hint").innerHTML = "Нет <code>/etc/hysteria/config.yaml</code> на этом сервере, ставить Hysteria2 не по чему";
+    $("#hy2-hint").innerHTML = 'Нет шаблона Hysteria2. <a href="index.html#setup">Подготовь его в мастере первого запуска</a>';
   }
 }
 

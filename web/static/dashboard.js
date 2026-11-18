@@ -157,9 +157,16 @@ function renderAwg(d) {
     </div>`).join("") : emptyList("Клиентов, созданных через iof, пока нет", 'sudo iof awg add "Имя"');
 }
 
-startPage({
+const overview = startPage({
   url: "api/dashboard",
-  demo: demoDashboard,
+  demo: async () => {
+    const d = await demoDashboard();
+    if (["setup", "template-only", "setup-error"].includes(setupDemo)) {
+      d.nodes = setup.info && setup.info.nodes ? d.nodes.slice(0, 1) : [];
+      if (d.nodes.length && setup.info.local) Object.assign(d.nodes[0], setup.info.local);
+    }
+    return d;
+  },
   init(rerender) {
     $("#onlybad").checked = prefs.get("onlybad", "0") === "1";
     $("#onlybad").addEventListener("change", () => { prefs.set("onlybad", $("#onlybad").checked ? "1" : "0"); rerender(); });
@@ -178,4 +185,101 @@ startPage({
     renderHy2(d);
     renderAwg(d);
   },
+});
+
+// Мастер загружается отдельно: отсутствие узлов или ошибка SSH не мешают первой настройке.
+const setup = { info: null, touched: false, running: false, demoJob: null };
+const setupDemo = new URLSearchParams(location.search).get("demo");
+function demoSetupInfo() {
+  const empty = ["setup", "template-only", "setup-error"].includes(setupDemo);
+  return { template: !["setup", "nodes-no-template"].includes(setupDemo), nodes: empty ? 0 : 6,
+    local: null, state: setupDemo === "template-only" ? { mode: "template-only", phase: "done" } : {}, busy: false, migrate: null };
+}
+function setupMode() {
+  const only = $("#setup-mode").value === "template-only";
+  $("#setup-local").hidden = only;
+  $("#setup-local").disabled = only || setup.running;
+}
+async function loadSetup() {
+  try {
+    const i = setup.info = DEMO ? (setup.info || demoSetupInfo()) : await getJson("api/setup");
+    renderMigrate(i.migrate);
+    $("#overview-content").hidden = !i.nodes;
+    $("#setup").hidden = i.template && i.nodes > 0 && i.state.phase !== "installing";
+    $("#setup-template").hidden = i.template;
+    $("#setup-template").disabled = i.template || setup.running;
+    if (!setup.touched) {
+      $("#setup-mode").value = i.nodes || i.state.mode === "template-only" ? "template-only" : "local";
+      const local = i.local || i.state;
+      if (local.name) $("#setup-name").value = local.name;
+      if (local.addr) $("#setup-addr").value = local.addr;
+    }
+    $("#setup-note").textContent = i.template
+      ? "Шаблон готов. Добавь удалённый сервер или выбери установку VPN здесь. Существующий шаблон не изменится."
+      : "Создадим шаблон Hysteria2 со случайными паролями. Можно установить VPN здесь или оставить этот сервер только управляющим.";
+    const blocked = setup.running || i.busy || (i.migrate && i.migrate.role === "source");
+    $("#setup-submit").disabled = Boolean(blocked);
+    $("#setup-mode").disabled = Boolean(blocked);
+    setupMode();
+  } catch (e) { formError(`Не удалось загрузить состояние настройки: ${e.message}`, "#setup-error"); $("#setup").hidden = false; }
+}
+const setupJob = watchJob({
+  kind: "setup", demoJobs: () => setup.demoJob ? [setup.demoJob] : [],
+  render(j) {
+    const lvl = renderJobCard(j);
+    setup.running = Boolean(j && j.state === "running");
+    $("#setup-submit").disabled = setup.running || Boolean(setup.info && setup.info.busy);
+    $("#setup-form").querySelectorAll("input, select").forEach((el) => { el.disabled = setup.running; });
+    if (setup.info) { $("#setup-template").disabled = setup.running || setup.info.template; setupMode(); }
+    if (j && j.state !== "running" && setup.completed !== j.id) {
+      setup.completed = j.id;
+      loadSetup(); overview.reload();
+    }
+    if (j) jobResult(lvl, j.state === "ok"
+      ? `${icon("good")}<div>Настройка завершена. <a href="hy2.html${DEMO ? "?demo" : ""}">Создать группу Hysteria2</a> · <a href="add.html${DEMO ? "?demo" : ""}">Добавить удалённый сервер</a></div>`
+      : j.state === "error" ? `${icon("crit")}<div>Настройка прервалась. ${esc(failReason(j.log))} Исправь причину и повтори: созданные файлы и пароли сохранятся.</div>` : "");
+  },
+  done() { loadSetup(); overview.reload(); },
+});
+async function submitSetup(e) {
+  e.preventDefault();
+  formError("", "#setup-error");
+  if (!setup.info || setup.running) return;
+  const data = { mode: $("#setup-mode").value }, errors = {};
+  if (data.mode === "local") {
+    data.name = $("#setup-name").value.trim(); data.addr = $("#setup-addr").value.trim(); data.title = $("#setup-title").value.trim();
+    if (!/^[A-Za-z0-9._-]{1,40}$/.test(data.name) || [".", "..", "all"].includes(data.name)) errors["#setup-name"] = "неверное имя узла";
+    if (!HOST_RE.test(data.addr) || data.addr.toLowerCase() === "localhost" || data.addr.startsWith("127.") || data.addr === "0.0.0.0") errors["#setup-addr"] = "нужен адрес для клиентов, не localhost";
+    if (/[|\r\n\t]/.test(data.title)) errors["#setup-title"] = "без | и переводов строк";
+  }
+  if (!setup.info.template) {
+    data.port = $("#setup-port").value.trim(); data.obfs = $("#setup-obfs").value;
+    if (!/^\d{1,5}$/.test(data.port) || Number(data.port) < 1 || Number(data.port) > 65535) errors["#setup-port"] = "число от 1 до 65535";
+  }
+  showErrors(errors);
+  if (Object.keys(errors).length) return;
+  $("#setup-submit").disabled = true;
+  try {
+    let id;
+    if (DEMO) {
+      setup.demoJob = { id: "setup-demo", kind: "setup", title: "Первоначальная настройка", state: "running", log: ["Подготовка шаблона и узлов…"] };
+      id = setup.demoJob.id;
+      setTimeout(() => {
+        const failed = setupDemo === "setup-error";
+        setup.demoJob.state = failed ? "error" : "ok";
+        setup.demoJob.log.push(failed ? "Ошибка: не удалось запустить службу (демо)" : "Готово. Создай группу Hysteria2 или добавь удалённый сервер.");
+        if (!failed) Object.assign(setup.info, { template: true, nodes: data.mode === "local" ? 1 : 0,
+          local: data.mode === "local" ? { name: data.name, addr: data.addr } : null, state: { mode: data.mode, phase: "done" } });
+      }, 1800);
+    } else id = (await postJson("api/setup", data)).job;
+    setupJob.start(id);
+  } catch (err) { formError(err.message, "#setup-error"); loadSetup(); }
+}
+document.addEventListener("DOMContentLoaded", () => {
+  $("#setup-form").addEventListener("submit", submitSetup);
+  $("#setup-form").addEventListener("input", () => { setup.touched = true; });
+  $("#setup-mode").addEventListener("change", () => { setup.touched = true; setupMode(); });
+  $("#refresh").addEventListener("click", loadSetup);
+  loadSetup(); setupJob.poll();
+  setInterval(() => { if (!document.hidden) loadSetup(); }, 15000);
 });

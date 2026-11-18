@@ -89,7 +89,7 @@ migrate_bundle() {
 
   # Шаблон Hysteria2 переезжает в папку iof. Сертификата, на который он ссылается, на новом
   # сервере нет, поэтому CN записывается явно. HY2_TEMPLATE нужен и iof, и панели
-  tpl="${HY2_TEMPLATE:-/etc/hysteria/config.yaml}"
+  tpl="$(hy2_template_path)"
   if [[ -f "$tpl" ]]; then
     install -m 600 "$tpl" "$stage/data/hy2-template.yaml"
     env_set "$stage/data/iof.env" HY2_TEMPLATE "$BASE/hy2-template.yaml"
@@ -304,6 +304,14 @@ migrate_status() {
 cmd_migrate() {
   local action="${1:-status}"
   if [[ $# -gt 0 ]]; then shift; fi
+  case "$action" in
+    start|finish|cancel)
+      # Архив переноса не должен получить наполовину подготовленную установку.
+      (umask 077; mkdir -p "$BASE")
+      exec 8>"$BASE/setup.lock"
+      flock -n 8 || die "идёт начальная настройка или другой перенос, дождись окончания"
+      ;;
+  esac
   case "$action" in
     start)  migrate_start "$@" ;;
     finish) migrate_finish "$@" ;;

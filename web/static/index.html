@@ -99,6 +99,43 @@
         <div id="alert" class="alert" role="alert" hidden></div>
         <div id="migrate-banner" class="note warn banner" role="status" hidden></div>
 
+        <section id="setup" class="card" hidden>
+          <div class="card-head"><h2>Первый запуск</h2></div>
+          <form id="setup-form" class="form setup-form">
+            <p id="setup-note" class="hint">Подготовь шаблон Hysteria2 и выбери роль этого сервера. Пароли создаются автоматически и не выводятся в лог.</p>
+            <div class="field">
+              <label for="setup-mode">Роль управляющего сервера</label>
+              <select id="setup-mode">
+                <option value="local">VPN на этом сервере</option>
+                <option value="template-only">Только управление, VPN на удалённых узлах</option>
+              </select>
+            </div>
+            <fieldset id="setup-local">
+              <legend>Этот сервер как VPN-узел</legend>
+              <div class="form-grid">
+                <div class="field"><label for="setup-name">Имя узла</label><input id="setup-name" value="main" maxlength="40" spellcheck="false"></div>
+                <div class="field"><label for="setup-addr">Адрес для VPN-клиентов</label><input id="setup-addr" placeholder="IPv4 или домен" maxlength="253" spellcheck="false"><p class="hint">Не localhost SSH-туннеля. Адрес должен быть доступен клиентам напрямую.</p></div>
+                <div class="field"><label for="setup-title">Подпись в клиенте</label><input id="setup-title" maxlength="64" placeholder="как имя узла"></div>
+              </div>
+            </fieldset>
+            <fieldset id="setup-template">
+              <legend>Новый шаблон Hysteria2</legend>
+              <div class="form-grid">
+                <div class="field"><label for="setup-port">UDP-порт</label><input id="setup-port" value="443" inputmode="numeric"></div>
+                <div class="field"><label for="setup-obfs">Обфускация</label><select id="setup-obfs"><option value="none">Без обфускации</option><option value="salamander">Salamander</option></select></div>
+              </div>
+            </fieldset>
+            <p class="hint">Самоподписанный сертификат создаётся на VPN-узле. Установщик открывает UDP-порт в активном UFW; файрвол провайдера нужно настроить отдельно. Существующие конфиги, узлы и секреты не заменяются.</p>
+            <div id="setup-error" class="form-error" role="alert" hidden></div>
+            <div class="form-actions"><button id="setup-submit" class="btn primary" type="submit">Начать настройку</button><a class="btn" href="add.html">Добавить удалённый сервер</a></div>
+          </form>
+        </section>
+        <section id="job" class="card" hidden>
+          <div class="card-head"><h2 id="job-title">Первоначальная настройка</h2><span id="job-state"></span></div>
+          <div id="job-result"></div>
+          <pre id="job-log" class="log" aria-live="polite"></pre>
+        </section>
+        <div id="overview-content">
         <section id="health" class="health" aria-live="polite"></section>
 
         <section id="kpis" class="kpis" aria-label="Сводка"></section>
@@ -145,6 +182,7 @@
             <div class="card-head"><h2>Клиенты AmneziaWG <span id="awg-count" class="count"></span></h2></div>
             <div id="awg" class="list"></div>
           </section>
+        </div>
         </div>
       </main>
 

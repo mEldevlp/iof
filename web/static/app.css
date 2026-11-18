@@ -224,6 +224,15 @@ input[type="search"]::placeholder { color: var(--muted); }
 
 /* Раскладки внутри main подстраиваются под его ширину (container queries внизу файла),
    а не под ширину окна: место занимает ещё и боковое меню */
+/* Мастер первого запуска использует те же поля, что добавление сервера. */
+#overview-content { display: flex; flex-direction: column; gap: 16px; }
+.setup-form > .field, .setup-form > .hint { margin: 0 16px 16px; }
+.setup-form select {
+  width: 100%; min-height: 36px; padding: 8px 12px;
+  border: 1px solid var(--ring); border-radius: 8px;
+  background: var(--page); color: var(--ink); font: inherit;
+}
+
 main {
   container: content / inline-size;
   flex: 1;

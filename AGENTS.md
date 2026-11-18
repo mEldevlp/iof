@@ -42,7 +42,7 @@ Docker Desktop там не запускается: Kaspersky Standard не да�
 | `stand/` | тестовый стенд на Docker: `Dockerfile` (Ubuntu 24.04 с systemd и SSH), `compose.yml` (old, node1, node2, new), `stand.sh`, `test.sh` (проверка iof на стенде), `hy2-template.yaml`, `fake-tg.py` (поддельный Bot API для бота) | не ставится; попадает в `/opt/iof` как часть клона |
 | `ci/lint.sh` | статические проверки: `bash -n`, shellcheck, разбор и pyflakes для `iof-web.py`, `iof_bot.py` и `stand/fake-tg.py`, `node --check`, правила проекта (NODE_FUNCS, STATIC_FILES, CSP, одинаковое меню во всех html, `probe.ps1`: только ASCII, одна метка, разбор парсером PowerShell, если он есть, LF) | не ставится |
 | `ci/test-build.sh` | проверка автономности сборки и совпадения функций и встроенных программ; отказ при отсутствующем, лишнем, повторном или сломанном модуле | не ставится |
-| `ci/test-panel.py` | регрессионные тесты выдачи группы Hysteria2 ботом и переименования узла на временных данных, без SSH и Telegram | не ставится |
+| `ci/test-panel.py` | регрессионные тесты ссылок Hysteria2 ботом, переименования и первого запуска на временных данных, без SSH и Telegram | не ставится |
 | `.github/workflows/ci.yml` | CI в GitHub Actions, см. «Проверка изменений» | не ставится |
 | `.shellcheckrc` | настройки shellcheck: отключены SC2178 и SC2128, ложные срабатывания на local-переменные разных функций | не ставится |
 
@@ -94,12 +94,58 @@ Docker Desktop там не запускается: Kaspersky Standard не да�
 | `probe-white.txt`, `probe-black.txt` | контрольные сайты для ПК, по имени в строке, `#` — комментарий, не больше 10: белый открывается из России всегда (ya.ru, vk.com, gosuslugi.ru), чёрный давно заблокирован РКН (rutracker.org, linkedin.com, instagram.com). Создаются при первой `probe start` |
 | `migrate.conf` | только во время переноса: `role` (source на старом, target на новом), `id`, `peer` (адрес SSH другого сервера), `self` (на старом: как новый заходит на него), `started` |
 | `migrate-cron` | на новом сервере до `migrate finish`: задания cron старого сервера |
-| `hy2-template.yaml` | на сервере, получившем управление переносом: шаблон Hysteria2 (в `iof.env` и `web.env` на него указывает `HY2_TEMPLATE`) |
+| `hy2-template.yaml` | шаблон Hysteria2, созданный setup или полученный переносом; fallback после `/etc/hysteria/config.yaml`, либо явный HY2_TEMPLATE |
 
 SSH-ключ iof: `/root/.ssh/iof_ed25519` (+ `.pub`). Создаётся в `iof init` или при первом `node add`.
 Логин делается из подписи функцией `name_for`: латиница остаётся как есть, иначе к ней добавляется
 sha1-хэш. Повторный запуск с той же подписью даёт тот же логин, поэтому `hy2 add` и `awg add`
 идемпотентны.
+
+## Первый запуск (`iof setup`)
+
+- `lib/setup.sh` подключён в `iof.sh`; `setup` запрещён под `migrate_guard`. В терминале
+  `iof setup` спрашивает роль, адрес/имя/подпись local-узла, UDP-порт и обфускацию.
+  Без вопросов: `iof setup --name main --addr IPv4/домен [--title подпись] [--port 443]
+  [--obfs none|salamander]`. По умолчанию порт 443, обфускации нет. Адрес клиента вводится явно,
+  localhost/127.* и 0.0.0.0 не подходят; частные адреса для стенда разрешены.
+- `iof setup --template-only` готовит только шаблон; не создаёт local и не ставит VPN здесь.
+  Затем админ добавляет удалённый узел и ставит на него Hysteria2 из панели.
+- Шаблон чистой установки — `/root/iof/hy2-template.yaml` (600): случайный auth.password,
+  при Salamander ещё отдельный случайный пароль, TLS-пути `/etc/hysteria/server.crt` и `server.key`.
+  Сертификат создаёт установщик на VPN-узле, стандартный CN — bing.com (или HY2_CN).
+- Выбор шаблона в CLI (`hy2_template_path`) и панели (`template_path`) динамический:
+  явный HY2_TEMPLATE → существующий `/etc/hysteria/config.yaml` → `$BASE/hy2-template.yaml`.
+  Явный отсутствующий путь не подменяется. Панель видит новый шаблон без перезапуска и правки web.env.
+  CLI по-прежнему читает явный override из iof.env, панель — из окружения/web.env.
+- `setup.lock` — общий flock настройки и меняющих этапов переноса (start/finish/cancel),
+  `setup.state` (600, атомарная замена) — несекретные mode, phase (installing/done),
+  name и addr для восстановления после сбоя. Повтор использует сохранённые файлы и пароли,
+  не дублирует local и не меняет чужие записи; конфликт имени/адреса/local — отказ.
+  Существующий шаблон не заменяется, отличающиеся --port/--obfs отвергаются.
+- Установщик `n_hy2_install` принимает четвёртый внутренний аргумент `preserve`: существующий
+  конфиг и TLS-файлы не заменяются. Setup не восстанавливает неизвестную остановленную службу;
+  возобновить собственную незавершённую установку можно повтором. Неполная пара TLS-файлов — отказ.
+  Успех setup требует активную службу и UDP-слушатель; секреты не выводятся в лог/API.
+  Активный UFW открывает установщик; прочие firewall и security group провайдера мастер не меняет.
+- `init_files` в service.sh создаёт данные/ключ без раздачи SSH. `iof init` по-прежнему может раздать
+  ключ существующим узлам, но новый nodes.conf содержит только закомментированные примеры.
+  Пустой список — подсказка запустить setup, а не попытка SSH к тестовым адресам.
+- `GET /api/setup` читает только локальные файлы, без StatusCache/SSH: template (bool), nodes (число),
+  local ({name, addr} или null), state, busy, migrate. `POST /api/setup` принимает mode
+  (local/template-only), name/addr/title для local, необязательные port/obfs; обычная защита
+  Host/Origin/CSRF, not_migrating и задача Jobs вида setup с одним шагом CLI.
+- Мастер встроен в Обзор (`index.html`, `dashboard.js`), загружается независимо от опроса узлов.
+  При существующих узлах без шаблона предлагает template-only, не скрывая обзор. Если шаблон готов,
+  а узлов нет — предлагает добавить удалённый сервер или настроить local. Ввод не затирается при
+  обновлении, ход задачи восстанавливается через Jobs. Страница добавления при отсутствии шаблона
+  ссылается на мастер. Демо Обзора: `?demo=setup`, `template-only`, `setup-error`, `nodes-no-template`.
+- `stand/test-setup.sh` — отдельный сквозной тест на трёх одноразовых контейнерах из образа iof-stand:
+  API обоих режимов, повтор без изменения конфигов/сертификатов/секретов, отсутствие секретов
+  в API/логах, установка удалённого узла и реальный клиентский туннель. Нужен интернет;
+  сценарий запускается в CI после сборки образа и до настройки основного стенда;
+  существующие контейнеры стенда и их данные не трогает, созданные ресурсы удаляет trap.
+  `ci/test-panel.py` также проверяет валидацию API, локальное состояние без SSH, template-only,
+  повтор после ошибки установки, сохранность конфига, конфликты и запрет во время переноса.
 
 ## Что iof оставляет на узлах
 
@@ -374,7 +420,7 @@ sha1-хэш. Повторный запуск с той же подписью д�
   проверен переход на iptables), ссылки со списком портов в настоящем Hiddify и v2rayN (формат взят из
   их исходников), блок-лист с Docker и `ufw` на узле.
 
-Команды: `status`, `check [--daily]` (для cron, Telegram, пишет `check.last` и раз в сутки `check.daily`), `notify тип [текст]`, `exec`, `refresh`, `init`,
+Команды: `setup [--template-only] [--name main --addr IPv4/домен --title подпись --port 443 --obfs none|salamander]`, `status`, `check [--daily]` (для cron, Telegram, пишет `check.last` и раз в сутки `check.daily`), `notify тип [текст]`, `exec`, `refresh`, `init`,
 `api status|service|updates|audit` (audit — JSON), `audit run [server|dpi|all]|show|cron`,
 `audit probe start [--ttl с]|stop|import|list`, `update`, `version` (версию подставляет `install.sh` в `IOF_VERSION`),
 `node add|import|del|rename|list`, `hy2 install|add [--hop|--no-hop]|del|list|show|refresh|status|restart|hop on|off|upgrade`,

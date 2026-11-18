@@ -275,6 +275,23 @@ n_hy2_install() {
   n_defaults
   [[ $EUID -eq 0 ]] || n_err "нужны права root"
 
+  # Мастер первого запуска не заменяет существующий конфиг даже после сбоя службы.
+  if [[ "${4:-}" == preserve && -f "$CONFIG" ]]; then
+    command -v hysteria >/dev/null 2>&1 || n_err "конфиг уже есть, но нет hysteria; восстанови установку вручную"
+    cert="$(n_yaml_value tls cert || true)"; key="$(n_yaml_value tls key || true)"
+    [[ -s "$cert" && -s "$key" ]] || n_err "конфиг сохранён, восстанови сертификат и ключ вручную"
+    port="$(n_hy2_port)"
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+      ufw allow "$port"/udp >/dev/null || n_err "не удалось открыть UDP $port в UFW"
+    fi
+    systemctl enable "$SERVICE" >/dev/null 2>&1 || n_err "не удалось включить службу"
+    systemctl start "$SERVICE" || n_err "не удалось запустить службу с сохранённым конфигом"
+    sleep 2
+    systemctl is-active --quiet "$SERVICE" || n_err "служба не работает, конфиг сохранён"
+    echo skip
+    return 0
+  fi
+
   if [[ "$force" != "1" && -f "$CONFIG" ]] && command -v hysteria >/dev/null 2>&1 \
      && systemctl is-active --quiet "$SERVICE"; then
     echo "skip"

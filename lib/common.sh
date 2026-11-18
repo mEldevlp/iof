@@ -57,6 +57,13 @@ if [[ -f "$ENV_FILE" ]]; then
   source "$ENV_FILE"
 fi
 
+# Явный путь не подменяем: ошибка настройки должна оставаться видимой.
+hy2_template_path() {
+  if [[ -n "${HY2_TEMPLATE:-}" ]]; then printf '%s' "$HY2_TEMPLATE"
+  elif [[ -f /etc/hysteria/config.yaml ]]; then printf '%s' /etc/hysteria/config.yaml
+  else printf '%s/hy2-template.yaml' "$BASE"; fi
+}
+
 die()  { echo "Ошибка: $*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
