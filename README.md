@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="web/static/favicon.svg" alt="Логотип Island Of Freedom" width="180" height="180">
+  <img src="docs/logo.png" alt="Логотип Island Of Freedom" width="180" height="180">
 </p>
 
 <h1 align="center">Island Of Freedom</h1>
