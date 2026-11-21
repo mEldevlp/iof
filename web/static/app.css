@@ -721,6 +721,67 @@ table.admins { width: 100%; border-collapse: collapse; font-size: 13px; font-var
   margin: 0 auto; padding: 12px var(--gutter) 28px; font-size: 12px; color: var(--muted);
 }
 
+/* Скелетоны используют существующую раскладку и нейтральные оттенки обеих тем. */
+.skeleton-active > :not(.skeleton-part) { display: none !important; }
+.skeleton-active[data-skeleton^="line"], pre.skeleton-active { font-size: 0; }
+.health.skeleton-active { background: var(--surface); border-color: var(--ring); }
+.skeleton-fill {
+  display: inline-block; max-width: 100%; height: 10px; border-radius: 4px;
+  background: color-mix(in srgb, var(--ink) 12%, transparent);
+}
+.skeleton-slot { display: flex; align-items: center; width: min(100%, 192px); min-width: 0; height: 20px; }
+.skeleton-short { width: 40%; }
+.skeleton-medium { width: 65%; }
+.skeleton-long { width: 88%; }
+.skeleton-full { width: 100%; }
+.skeleton-grow { flex: 1; min-width: 0; }
+.skeleton-sub { height: 16px; }
+.skeleton-track { height: 8px; }
+.skeleton-track .skeleton-fill { height: 4px; }
+[data-skeleton="select"]:has(> select[hidden]) { display: none; }
+.skeleton-heading { height: 24px; }
+.skeleton-value { height: 32px; }
+.skeleton-value .skeleton-fill { height: 21px; }
+.skeleton-button { width: 112px; height: 32px; }
+.skeleton-button .skeleton-fill, .skeleton-field .skeleton-fill { width: 100%; height: 100%; border-radius: 8px; }
+.skeleton-button:has(.skeleton-short) { width: 44px; }
+.skeleton-field { width: 100%; height: 36px; }
+[data-skeleton="server-select"] .skeleton-button:first-child { flex: 1; }
+[data-skeleton="time"] .skeleton-button { width: 88px; }
+.skeleton-switch { width: 32px; height: 20px; flex: none; }
+.skeleton-switch .skeleton-fill { width: 100%; height: 100%; border-radius: 10px; }
+.skeleton-pill { width: 64px; height: 22px; }
+.skeleton-pill .skeleton-fill { width: 100%; height: 100%; }
+.skeleton-summary { display: flex; align-items: center; gap: 8px 16px; padding: 12px 0; }
+.kv dt .skeleton-slot { width: 104px; }
+.kv dd .skeleton-slot { width: min(100%, 220px); }
+.item-head .skeleton-slot:last-child { max-width: 100px; }
+.card-head > .skeleton-slot:last-child:not(:first-child) { max-width: 25%; }
+.nodes .skeleton-slot { width: min(100%, 108px); }
+.nodes .skeleton-sub { margin-top: 2px; }
+.table-wrap.skeleton-active + .empty { display: none; }
+.link-actions .skeleton-button { height: 28px; }
+.skeleton-qr {
+  display: block; width: min(100%, 240px); height: auto; aspect-ratio: 1; border-radius: 8px; margin: 0 auto;
+}
+.skeleton-flag { width: 16px; height: 12px; vertical-align: baseline; }
+.term-box { position: relative; }
+.term-box.skeleton-active > .xterm { display: block !important; visibility: hidden; }
+.term-box .skeleton-part { position: absolute; inset: 0; padding: 8px 12px; pointer-events: none; }
+.term-box .skeleton-slot { width: min(100%, 560px); height: 15px; }
+.term-box .skeleton-fill { background: color-mix(in srgb, var(--term-fg) 18%, transparent); }
+.skeleton-log { margin: 0 16px 16px; padding: 8px 12px; border-radius: 8px; background: var(--surface-2); }
+@media (prefers-reduced-motion: no-preference) {
+  .skeleton-fill { animation: skeleton-pulse 1.6s ease-in-out infinite alternate; }
+}
+@keyframes skeleton-pulse { to { opacity: .55; } }
+@container content (max-width: 600px) {
+  .skeleton-value { height: 28px; }
+  .link-actions .skeleton-button { flex: 1; }
+  .checks .skeleton-summary { flex-wrap: wrap; }
+  .checks .skeleton-summary .skeleton-slot:last-child { flex-basis: 100%; }
+}
+
 /* Узкое окно: меню уезжает за левый край и открывается кнопкой в шапке страницы (common.js) */
 @media (max-width: 960px) {
   .shell { grid-template-columns: minmax(0, 1fr); }
@@ -785,7 +846,7 @@ table.admins { width: 100%; border-collapse: collapse; font-size: 13px; font-var
 @container content (max-width: 900px) {
   .hy2-layout, .add-layout, .grid2 { grid-template-columns: minmax(0, 1fr); }
   .group-body { grid-template-columns: minmax(0, 1fr); }
-  .qr-all { width: auto; max-width: 260px; margin: 0 auto 4px; }
+  .qr-all { width: min(100%, 240px); margin: 0 auto 4px; }
 }
 @container content (max-width: 600px) {
   .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }

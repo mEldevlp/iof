@@ -1,6 +1,6 @@
 "use strict";
 
-const awg = { migrate: null, running: false, sending: false, request: 0 };
+const awg = { migrate: null, running: false, sending: false, request: null, selected: null, clients: null, links: null };
 
 const job = watchJob({
   kind: "awg",
@@ -77,12 +77,19 @@ function clientHref(name) {
   return `#c=${encodeURIComponent(name)}`;
 }
 
-async function renderKeys(client) {
-  const request = ++awg.request;
+async function loadKeys(client, replace) {
+  awg.request?.abort();
+  const request = awg.request = new AbortController();
   const panel = $("#client-keys");
+  const finish = replace ? skeleton(panel, skeletonLinks(client.configs.length || 1)) : null;
   try {
-    const { links } = DEMO ? demoAwgKeys(client.name) : await getJson(`api/awg/keys?name=${encodeURIComponent(client.name)}`);
-    if (request !== awg.request) return;
+    const { links } = DEMO ? demoAwgKeys(client.name)
+      : await getJson(`api/awg/keys?name=${encodeURIComponent(client.name)}`, request.signal);
+    if (request !== awg.request || !panel.isConnected) return;
+    const value = JSON.stringify(links);
+    if (value === awg.links) return;
+    finish?.();
+    awg.links = value;
     panel.innerHTML = links.length ? `<ol class="links">${links.map((link, i) => `<li class="link">
       <div class="link-main"><div class="link-title">${esc(link.title || `Подключение ${i + 1}`)}</div></div>
       <div class="link-actions"><button class="btn small" type="button" data-copy="${i}">Копировать vpn://</button></div>
@@ -91,12 +98,22 @@ async function renderKeys(client) {
       toast(await copyText(links[Number(button.dataset.copy)].url) ? "Ключ скопирован" : "Не удалось скопировать ключ");
     }));
   } catch (e) {
-    if (request === awg.request) panel.textContent = `Не удалось получить ключи: ${e.message}`;
+    if (request === awg.request && panel.isConnected && (replace || !awg.links)) {
+      finish?.();
+      awg.links = null;
+      panel.innerHTML = `<p class="empty">${esc(`Не удалось получить ключи: ${e.message}`)}</p>`;
+    }
+  } finally {
+    finish?.();
   }
 }
 
-function renderClients(clients) {
+function renderClients(clients, replace) {
   const selected = clients.find((client) => clientHref(client.name) === location.hash) || clients[0];
+  const changed = awg.selected?.name !== selected?.name || awg.selected?.label !== selected?.label;
+  const refreshed = awg.clients !== clients;
+  awg.selected = selected;
+  awg.clients = clients;
   $("#clients-count").textContent = clients.length || "";
   $("#clients").innerHTML = clients.length ? clients.map((client) => `
     <a class="group-item" href="${clientHref(client.name)}"${client === selected ? ' aria-current="true"' : ""}>
@@ -106,10 +123,16 @@ function renderClients(clients) {
     </a>`).join("") : emptyList("Клиентов пока нет");
   const panel = $("#client");
   if (!selected) {
-    ++awg.request;
+    awg.request?.abort();
+    awg.request = null;
     panel.innerHTML = emptyList("Добавь клиента, чтобы получить ключи для Amnezia VPN.");
     return;
   }
+  if (!changed && $("#client-keys")) {
+    if (replace || refreshed) loadKeys(selected, replace || !awg.links);
+    return;
+  }
+  awg.links = null;
   panel.innerHTML = `<div class="card-head">
       <div><h2>${esc(selected.label)}</h2><span class="sub-line mono">${esc(selected.name)}</span></div>
       <div class="actions">
@@ -117,7 +140,7 @@ function renderClients(clients) {
         <button id="client-del" class="btn danger" type="button" data-lock>Удалить</button>
       </div>
     </div>
-    <div id="client-keys" class="pad" aria-live="polite">Загружаю ключи…</div>
+    <div id="client-keys" class="pad" aria-live="polite"></div>
     <p class="hint">Скопируй один ключ. В Amnezia VPN нажми «+» → «Вставить ключ».</p>`;
   $("#client-add-nodes").addEventListener("click", () => run({ action: "add", label: selected.label }));
   $("#client-del").addEventListener("click", () => {
@@ -125,7 +148,7 @@ function renderClients(clients) {
       run({ action: "del", name: selected.name });
     }
   });
-  renderKeys(selected);
+  loadKeys(selected, true);
 }
 
 function renderNodes(d) {
@@ -153,9 +176,9 @@ const pageApi = startPage({
     $("#job-hide").addEventListener("click", () => job.hide());
     job.poll();
   },
-  render(d) {
+  render(d, replace) {
     awg.migrate = d.migrate;
-    renderClients(d.clients);
+    renderClients(d.clients, replace);
     renderNodes(d);
     lock();
   },

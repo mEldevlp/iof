@@ -4,7 +4,7 @@
 // и задачи панели. Данные: GET api/service[?fetch=1], GET api/jobs, обновление: POST api/service
 // (задача iof update; в конце install.sh перезапускает панель, задача пропадает вместе с ней)
 
-const svc = { info: null, jobs: [], updates: null, checking: false, updating: null };
+const svc = { info: null, jobs: [], updates: null, checking: false, updating: null, request: null };
 
 
 // Форматирование
@@ -56,23 +56,29 @@ function fmtJobTime(j) {
 
 function renderVersion() {
   const i = svc.info;
+  const open = $("#version details")?.open;
   const rows = [
     ["Установлена", fmtVersion(i.version)],
     ["Клон", `<span class="mono">${esc(i.src)}</span>${i.src_version ? `, ${fmtVersion(i.src_version)}` : ' <span class="muted">— git-клона нет</span>'}`],
   ];
   if (i.update_log) {
     const when = new Date(i.update_log.at * 1000).toLocaleString("ru-RU", { dateStyle: "short", timeStyle: "short" });
-    rows.push(["Обновлялась", `${when} из панели <details class="more"><summary>вывод iof update</summary>
+    rows.push(["Обновлялась", `${when} из панели <details class="more"${open ? " open" : ""}><summary>вывод iof update</summary>
       <pre class="code">${esc(i.update_log.lines.join("\n"))}</pre></details>`]);
   }
   $("#version").innerHTML = kv(rows);
+  renderUpdates();
+}
 
+function renderUpdates() {
+  const i = svc.info;
   const u = svc.updates;
   let html = "";
   if (i.error) {
     html = `<div class="note crit">${icon("crit")}<div>iof не ответил: ${esc(i.error)}</div></div>`;
   } else if (svc.checking) {
-    html = `<div class="note"><span class="spinner" aria-hidden="true"></span><div>Проверяю: git fetch в ${esc(i.src)}…</div></div>`;
+    html = `<div class="note"><span class="spinner" aria-hidden="true"></span><div>Проверяю: git fetch в ${esc(i.src)}…</div></div>
+      <ul class="commits" aria-hidden="true">${`<li>${skeletonBar("long")}</li>`.repeat(u?.commits.length || 2)}</ul>`;
   } else if (u && u.error) {
     html = `<div class="note crit">${icon("crit")}<div>Не удалось проверить: ${esc(u.error)}</div></div>`;
   } else if (u && !u.commits.length) {
@@ -86,6 +92,8 @@ function renderVersion() {
       или <code>sudo bash ${esc(i.src)}/install.sh</code></div></div>`;
   }
   $("#updates").innerHTML = html;
+  if (svc.checking) $("#updates").setAttribute("aria-busy", "true");
+  else $("#updates").removeAttribute("aria-busy");
   $("#check-updates").disabled = svc.checking || !i.src_version;
   $("#update").disabled = !!svc.updating || !i.src_version;
 }
@@ -191,29 +199,64 @@ function render() {
   renderVersion();
   renderCheck();
   renderNightly();
-  renderJobs();
 }
 
-async function loadInfo() {
+async function loadInfo({ replace = false } = {}) {
+  svc.request?.abort();
+  const request = svc.request = new AbortController();
+  const finish = !svc.info || replace ? skeletonRegions($("#service-info")) : null;
   $("#refresh").setAttribute("aria-busy", "true");
+  const jobs = loadJobs(request, replace);
   try {
-    svc.info = DEMO ? await demoService(false) : await getJson("api/service");
-    svc.jobs = DEMO ? demoJobs() : (await getJson("api/jobs")).jobs;
+    const info = DEMO ? await demoService(false) : await getJson("api/service", request.signal);
+    if (request !== svc.request) return false;
+    finish?.();
+    svc.info = info;
+    if (svc.updating) svc.updating.from ??= info.version;
     $("#alert").hidden = true;
     render();
-    return true;
+    await jobs;
+    return request === svc.request;
   } catch (e) {
+    if (request !== svc.request) return false;
     $("#alert").hidden = false;
     $("#alert").innerHTML = `${icon("crit")} Нет связи с панелью: ${esc(e.message)}`;
     return false;
   } finally {
-    $("#refresh").removeAttribute("aria-busy");
+    finish?.();
+    if (request === svc.request) $("#refresh").removeAttribute("aria-busy");
+  }
+}
+
+async function loadJobs(request, replace) {
+  const list = $("#jobs");
+  const finish = !svc.jobsReady || replace ? skeleton(list, skeletonMarkup(list, "jobs", 3)) : null;
+  try {
+    const jobs = DEMO ? demoJobs() : (await getJson("api/jobs", request.signal)).jobs;
+    if (request !== svc.request) return;
+    finish?.();
+    svc.jobs = jobs;
+    svc.jobsReady = true;
+    $("#jobs-error").hidden = true;
+    renderJobs();
+    // Страницу открыли, пока обновление уже идёт.
+    const running = jobs.find((j) => j.kind === "service" && j.state === "running");
+    if (running && !svc.updating) {
+      svc.updating = { id: running.id, from: svc.info?.version, last: running };
+      renderUpdateJob(running);
+      pollUpdate();
+    }
+  } catch (e) {
+    if (request === svc.request) formError(`Не удалось загрузить задачи: ${e.message}`, "#jobs-error");
+  } finally {
+    finish?.();
   }
 }
 
 async function checkUpdates() {
+  if (!svc.info || svc.checking) return;
   svc.checking = true;
-  renderVersion();
+  renderUpdates();
   try {
     const d = DEMO ? await demoService(true) : await getJson("api/service?fetch=1");
     svc.updates = d.updates;
@@ -221,7 +264,7 @@ async function checkUpdates() {
     svc.updates = { error: e.message, commits: [] };
   }
   svc.checking = false;
-  renderVersion();
+  renderUpdates();
 }
 
 
@@ -234,7 +277,7 @@ async function update() {
   try {
     const id = DEMO ? demoUpdateJob() : (await postJson("api/service", { action: "update" })).job;
     svc.updating = { id, from: svc.info.version, last: null, started: Date.now() / 1000 };
-    renderVersion();
+    renderUpdates();
     $("#job").scrollIntoView({ behavior: "smooth", block: "nearest" });
     pollUpdate();
   } catch (e) {
@@ -252,6 +295,8 @@ function renderUpdateJob(j) {
 async function pollUpdate() {
   const u = svc.updating;
   if (!u) return;
+  const finish = !u.last && !u.polled ? pendingCard($("#job"), skeletonJob()) : null;
+  u.polled = true;
   let jobs;
   try {
     jobs = DEMO ? demoJobs() : (await getJson("api/jobs")).jobs;
@@ -261,6 +306,8 @@ async function pollUpdate() {
     }
     setTimeout(pollUpdate, 2000);
     return;
+  } finally {
+    finish?.();
   }
   const j = jobs.find((x) => x.id === u.id);
   if (j) {
@@ -290,16 +337,10 @@ async function pollUpdate() {
         <a href="${location.pathname}${location.search}">Перезагрузи страницу</a>, чтобы панель открылась в новой версии.</div>`);
 }
 
-document.addEventListener("DOMContentLoaded", async () => {
-  $("#refresh").addEventListener("click", loadInfo);
+document.addEventListener("DOMContentLoaded", () => {
+  $("#refresh").addEventListener("click", () => loadInfo({ replace: true }));
   $("#check-updates").addEventListener("click", checkUpdates);
   $("#update").addEventListener("click", update);
   $("#job-hide").addEventListener("click", () => { $("#job").hidden = true; });
-  await loadInfo();
-  // Страницу открыли, пока обновление уже идёт
-  const running = svc.jobs.find((j) => j.kind === "service" && j.state === "running");
-  if (running && svc.info) {
-    svc.updating = { id: running.id, from: svc.info.version, last: null };
-    pollUpdate();
-  }
+  loadInfo();
 });

@@ -5,7 +5,7 @@
 // Поля входа на сервер и карточка задачи общие со страницей «Перенос», они в common.js
 
 const NAME_RE = /^[A-Za-z0-9._-]{1,40}$/;
-const add = { info: null, nameTouched: false };
+const add = { info: null, nameTouched: false, request: null };
 
 // Имя узла по умолчанию из хоста, пока его не меняли руками: 203.0.113.44 -> node-203-0-113-44
 function suggestName(host) {
@@ -72,12 +72,23 @@ const job = watchJob({
 // Справка для формы: известные узлы, ключ iof, есть ли шаблон Hysteria2, идёт ли перенос
 
 async function loadInfo() {
+  add.request?.abort();
+  const request = add.request = new AbortController();
+  const finish = skeletonRegions();
+  $("#copy-pubkey").disabled = $("#f-hy2").disabled = true;
   try {
-    add.info = DEMO ? demoAddInfo() : await getJson("api/nodes/add-info");
+    const info = DEMO ? demoAddInfo() : await getJson("api/nodes/add-info", request.signal);
+    if (request !== add.request) return;
+    add.info = info;
   } catch (e) {
+    if (request !== add.request) return;
     $("#alert").hidden = false;
     $("#alert").innerHTML = `${icon("crit")} Нет связи с панелью: ${esc(e.message)}`;
+    $("#copy-pubkey").disabled = !add.info?.pubkey;
+    $("#f-hy2").disabled = add.info ? !add.info.hy2_template : false;
     return;
+  } finally {
+    finish();
   }
   $("#alert").hidden = true;
   const i = add.info;

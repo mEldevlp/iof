@@ -53,7 +53,24 @@ function qrUrl(g, i) {
 function qrImage(d, g, i, alt) {
   if (DEMO) return `<div class="qr-placeholder">QR-код рисует сервер через qrencode, в демо его нет</div>`;
   if (!d.qr) return `<div class="qr-placeholder">Для QR-кодов установи qrencode:<br><code>sudo apt install qrencode</code></div>`;
-  return `<img class="qr" src="${qrUrl(g, i)}" alt="${esc(alt)}" width="240" height="240">`;
+  return `<div class="qr-frame"><img class="qr" src="${qrUrl(g, i)}" alt="${esc(alt)}" width="240" height="240"></div>`;
+}
+
+function loadQr(root) {
+  const frame = root.querySelector(".qr-frame");
+  if (!frame) return;
+  const img = frame.firstElementChild;
+  const finish = skeleton(frame, '<span class="skeleton-fill skeleton-qr"></span>');
+  function show() {
+    finish();
+    if (!frame.isConnected) return;
+    if (!img.naturalWidth) frame.innerHTML = '<div class="qr-placeholder">Не удалось загрузить QR-код</div>';
+  }
+  if (img.complete) show();
+  else {
+    img.addEventListener("load", show, { once: true });
+    img.addEventListener("error", show, { once: true });
+  }
 }
 
 function utf8Len(s) {
@@ -148,16 +165,21 @@ function renderGroups(d, current) {
   }).join("") : emptyList("Групп ссылок пока нет", 'sudo iof hy2 add "Подпись"');
 }
 
-function renderGroup(d, name) {
+let renderedGroup;
+
+function renderGroup(d, name, retry = false) {
   const el = $("#group");
   const g = d.groups.find((x) => x.name === name);
+  const drift = g && groupDrift(g, d);
+  const signature = JSON.stringify([g, drift, d.qr, authMode(d)]);
+  if (signature === renderedGroup && !(retry && el.querySelector(".qr-frame .qr-placeholder"))) return;
+  renderedGroup = signature;
   if (!g) {
     el.innerHTML = `<div class="card-head"><h2>Группа не выбрана</h2></div>
       ${emptyList("Создай группу на сервере, и она появится здесь.", 'sudo iof hy2 add "Подпись"')}`;
     return;
   }
 
-  const drift = groupDrift(g, d);
   const notes = [];
   if (drift.missing.length) {
     notes.push(`Нет ссылок на узлы: <b>${drift.missing.map((n) => esc(n.name)).join(", ")}</b>.`);
@@ -204,7 +226,15 @@ function renderGroup(d, name) {
     </div>
     <p class="hint">В Hiddify: «Скопировать все», затем в приложении «Добавить из буфера обмена». Получится группа подключений.</p>`;
 
-  $("#reveal").addEventListener("change", (e) => { page.reveal = e.target.checked; renderGroup(d, name); });
+  loadQr(el);
+  $("#reveal").addEventListener("change", (e) => {
+    page.reveal = e.target.checked;
+    el.querySelectorAll(".link-url").forEach((code, i) => {
+      code.textContent = displayUrl(g.links[i].url);
+      if (page.reveal) code.title = g.links[i].url;
+      else code.removeAttribute("title");
+    });
+  });
   $("#copy-all").addEventListener("click", async () => {
     toast(await copyText(all) ? `Скопировано ссылок: ${g.links.length}` : "Не удалось скопировать");
   });
@@ -225,6 +255,7 @@ function renderGroup(d, name) {
     $("#qr-title").textContent = l.title;
     $("#qr-body").innerHTML = qrImage(d, g, i, `QR ${l.title}`) +
       `<p class="hint">Hiddify: «+», затем «Сканировать QR-код».</p>`;
+    loadQr($("#qr-body"));
     $("#qr-dialog").showModal();
   }));
 }
@@ -292,14 +323,15 @@ const pageApi = startPage({
     $("#job-hide").addEventListener("click", () => job.hide());
     job.poll();
     $("#qr-close").addEventListener("click", () => $("#qr-dialog").close());
+    $("#qr-dialog").addEventListener("close", (e) => { if (!e.currentTarget.open) $("#qr-body").replaceChildren(); });
     // Клик по фону закрывает окно с QR
     $("#qr-dialog").addEventListener("click", (e) => { if (e.target === e.currentTarget) e.currentTarget.close(); });
   },
-  render(d) {
+  render(d, replace) {
     page.data = d;
     const name = selectedName(d);
     renderGroups(d, name);
-    renderGroup(d, name);
+    renderGroup(d, name, replace);
     renderNodes(d);
     lock();
   },

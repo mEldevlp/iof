@@ -4,7 +4,7 @@
 // Данные: GET api/node?n=<имя>, действия: POST api/node (iof hy2 restart | install, node rename, node del + refresh).
 // Кнопка «Терминал» открывает окно терминала на узел (term.js). Узел в адресе: node.html#n=<имя>
 
-const nd = { data: null, running: false, saving: false };
+const nd = { data: null, running: false, saving: false, view: 0 };
 
 function nodeName() {
   const m = /^#n=(.+)$/.exec(location.hash);
@@ -265,22 +265,27 @@ async function renameNode(e) {
   }
   if (name === newName) { closeRename(true); return; }
   nd.saving = true;
+  const view = nd.view;
   syncButtons();
   try {
     const body = { action: "rename", name, new_name: newName };
     const id = DEMO ? demoNodeJob(body) : (await postJson("api/node", body)).job;
+    if (view !== nd.view || name !== nodeName()) return;
     closeRename();
     job.start(id);
   } catch (err) {
-    formError(err.message, "#rename-error");
+    if (view === nd.view && name === nodeName()) formError(err.message, "#rename-error");
   } finally {
-    nd.saving = false;
-    syncButtons();
+    if (view === nd.view) {
+      nd.saving = false;
+      syncButtons();
+    }
   }
 }
 
 async function act(key) {
   const a = ACTIONS[key], name = nd.data.name;
+  const view = nd.view;
   formError("", "#action-error");
   const body = { ...a.body, name };
   if (key === "install_awg" && !$("#awg-port-label").hidden) {
@@ -291,10 +296,11 @@ async function act(key) {
   if (!confirm(a.ask(name))) return;
   try {
     const id = DEMO ? demoNodeJob(body) : (await postJson("api/node", body)).job;
+    if (view !== nd.view || name !== nodeName()) return;
     job.start(id);
     $("#job").scrollIntoView({ behavior: "smooth", block: "nearest" });
   } catch (e) {
-    formError(e.message, "#action-error");
+    if (view === nd.view && name === nodeName()) formError(e.message, "#action-error");
   }
 }
 
@@ -336,9 +342,28 @@ function renderJob(j) {
 const pageApi = startPage({
   url: () => `api/node?n=${encodeURIComponent(nodeName())}`,
   demo: () => demoNode(nodeName()),
+  reset() {
+    nd.view++;
+    nd.data = null;
+    nd.running = nd.saving = false;
+    $("#node-title").textContent = nodeName() || "Узел";
+    $("#node-sub").innerHTML = `<a href="./${DEMO ? "?demo" : ""}">Обзор</a>`;
+    $("#rename-open").hidden = $("#term-open").hidden = true;
+    $("#awg-port-label").hidden = $("#awg-clients").parentElement.hidden = true;
+    for (const id of ["health", "node-body", "node-more", "danger"]) $(`#${id}`).hidden = false;
+  },
+  empty() {
+    for (const id of ["health", "node-body", "node-more", "danger"]) $(`#${id}`).hidden = true;
+  },
   init() {
     // Другой узел в адресе: другие данные и свои задачи, терминал прошлого узла закрывается
-    window.addEventListener("hashchange", () => { closeRename(); Term.close(); job.hide(); pageApi.reload(); job.poll(); });
+    window.addEventListener("hashchange", () => {
+      closeRename();
+      Term.close();
+      formError("", "#action-error");
+      pageApi.reload();
+      job.reset();
+    });
     $("#rename-open").addEventListener("click", () => {
       $("#rename-name").value = nd.data.name;
       formError("", "#rename-error");

@@ -7,6 +7,7 @@
 const countryNames = new Intl.DisplayNames("ru", { type: "region", fallback: "none" });
 let nodeCountries = {};
 let countriesTimer, countriesLoading = false, lastOverview;
+const countriesChecked = new Set();
 
 function countryFlag(code) {
   if (!/^[A-Z]{2}$/.test(code) || code === "ZZ") return "";
@@ -20,18 +21,30 @@ async function loadNodeCountries() {
   if (countriesLoading) return;
   clearTimeout(countriesTimer);
   countriesLoading = true;
+  const overviewData = lastOverview;
+  const addresses = overviewData.nodes.filter((n) => !n.dedicated && n.addr).map((n) => n.addr);
+  let pending = false;
   try {
-    const { countries, pending } = await getJson("api/nodes/countries");
-    if (JSON.stringify(countries) !== JSON.stringify(nodeCountries)) {
-      nodeCountries = countries;
-      renderNodes(overview.state.data);
-    }
-    if (pending) countriesTimer = setTimeout(loadNodeCountries, 1500);
+    const data = await getJson("api/nodes/countries");
+    pending = data.pending;
+    nodeCountries = pending ? { ...nodeCountries, ...data.countries } : data.countries;
   } catch {
     // Сбой геоданных не меняет состояние узлов. Повторим при следующем обновлении обзора.
   } finally {
+    if (!pending) addresses.forEach((addr) => countriesChecked.add(addr));
     countriesLoading = false;
+    $("#nodes").querySelectorAll("[data-country]").forEach(renderCountry);
+    if (lastOverview !== overviewData) loadNodeCountries();
+    else if (pending) countriesTimer = setTimeout(loadNodeCountries, 1500);
   }
+}
+
+function renderCountry(el) {
+  const flag = countryFlag(nodeCountries[el.dataset.country]);
+  const waiting = !flag && !countriesChecked.has(el.dataset.country);
+  if (waiting) el.setAttribute("aria-busy", "true");
+  else el.removeAttribute("aria-busy");
+  el.innerHTML = flag || (waiting ? '<span class="node-flag skeleton-fill skeleton-flag" aria-hidden="true"></span>' : "");
 }
 
 function renderHealth(d) {
@@ -126,7 +139,7 @@ function nodeRow(n) {
   const tip = [...n.issues, ...warnings(n)].join("; ") || "в порядке";
   const name = n.dedicated ? n.title : n.name;
   const rowClass = `${n.controller ? "is-controller" : ""} ${level === "good" ? "" : "is-" + level}`.trim();
-  const flag = countryFlag(DEMO ? n.country : nodeCountries[n.addr]);
+  const flag = DEMO ? countryFlag(n.country) : n.addr && !n.dedicated ? `<span data-country="${esc(n.addr)}"></span>` : "";
   const head = `<td class="cell-node"><div class="node-cell"><span title="${esc(tip)}">${icon(level)}</span><div>
       <div class="node-name"><a class="node-link" href="${nodeHref(n.name)}">${esc(name)}</a>${flag}</div>
       ${n.title && n.title !== name ? `<span class="sub-line">${esc(n.title)}</span>` : ""}
@@ -158,6 +171,7 @@ function renderNodes(d) {
 
   $("#nodes-count").textContent = list.length === d.nodes.length ? d.nodes.length : `${list.length} из ${d.nodes.length}`;
   $("#nodes").innerHTML = list.map(nodeRow).join("");
+  $("#nodes").querySelectorAll("[data-country]").forEach(renderCountry);
   applyWidths($("#nodes"));
   const empty = $("#nodes-empty");
   empty.hidden = list.length > 0;
@@ -231,7 +245,7 @@ const overview = startPage({
 });
 
 // Мастер загружается отдельно: отсутствие узлов или ошибка SSH не мешают первой настройке.
-const setup = { info: null, touched: false, running: false, demoJob: null };
+const setup = { info: null, touched: false, running: false, demoJob: null, request: null };
 const setupDemo = new URLSearchParams(location.search).get("demo");
 function demoSetupInfo() {
   const empty = ["setup", "template-only", "setup-error"].includes(setupDemo);
@@ -243,9 +257,19 @@ function setupMode() {
   $("#setup-local").hidden = only;
   $("#setup-local").disabled = only || setup.running;
 }
-async function loadSetup() {
+async function loadSetup(replace = false) {
+  if (setup.request && !replace) return;
+  setup.request?.abort();
+  const request = setup.request = new AbortController();
+  const finish = !setup.info ? pendingCard($("#setup-pending"), `<div class="card-head">${skeletonBar()}</div>
+    <div class="pad">${skeletonBar("long")}</div>`)
+    : replace && !$("#setup").hidden ? skeleton($("#setup-note"), skeletonBar("long")) : null;
   try {
-    const i = setup.info = DEMO ? (setup.info || demoSetupInfo()) : await getJson("api/setup");
+    const i = DEMO ? (setup.info || demoSetupInfo()) : await getJson("api/setup", request.signal);
+    if (request !== setup.request) return;
+    finish?.();
+    setup.info = i;
+    formError("", "#setup-load-error");
     renderMigrate(i.migrate);
     $("#setup").hidden = i.template && i.nodes > 0 && i.state.phase !== "installing";
     $("#setup-template").hidden = i.template;
@@ -256,14 +280,20 @@ async function loadSetup() {
       if (local.name) $("#setup-name").value = local.name;
       if (local.addr) $("#setup-addr").value = local.addr;
     }
-    $("#setup-note").textContent = i.template
+    $("#setup-note span").textContent = i.template
       ? "Шаблон готов. Добавь удалённый сервер или выбери установку VPN здесь. Существующий шаблон не изменится."
       : "Создадим шаблон Hysteria2 со случайными паролями. Можно установить VPN здесь или оставить этот сервер только управляющим.";
     const blocked = setup.running || i.busy || (i.migrate && i.migrate.role === "source");
     $("#setup-submit").disabled = Boolean(blocked);
     $("#setup-mode").disabled = Boolean(blocked);
     setupMode();
-  } catch (e) { formError(`Не удалось загрузить состояние настройки: ${e.message}`, "#setup-error"); $("#setup").hidden = false; }
+  } catch (e) {
+    if (request !== setup.request) return;
+    finish?.();
+    formError(`Не удалось загрузить состояние настройки: ${e.message}`, "#setup-load-error");
+  } finally {
+    if (request === setup.request) setup.request = null;
+  }
 }
 const setupJob = watchJob({
   kind: "setup", demoJobs: () => setup.demoJob ? [setup.demoJob] : [],
@@ -275,13 +305,12 @@ const setupJob = watchJob({
     if (setup.info) { $("#setup-template").disabled = setup.running || setup.info.template; setupMode(); }
     if (j && j.state !== "running" && setup.completed !== j.id) {
       setup.completed = j.id;
-      loadSetup(); overview.reload();
+      loadSetup(true); overview.reload();
     }
     if (j) jobResult(lvl, j.state === "ok"
       ? `${icon("good")}<div>Настройка завершена. <a href="hy2.html${DEMO ? "?demo" : ""}">Создать группу Hysteria2</a> · <a href="add.html${DEMO ? "?demo" : ""}">Добавить удалённый сервер</a></div>`
       : j.state === "error" ? `${icon("crit")}<div>Настройка прервалась. ${esc(failReason(j.log))} Исправь причину и повтори: созданные файлы и пароли сохранятся.</div>` : "");
   },
-  done() { loadSetup(); overview.reload(); },
 });
 async function submitSetup(e) {
   e.preventDefault();
@@ -321,7 +350,7 @@ document.addEventListener("DOMContentLoaded", () => {
   $("#setup-form").addEventListener("submit", submitSetup);
   $("#setup-form").addEventListener("input", () => { setup.touched = true; });
   $("#setup-mode").addEventListener("change", () => { setup.touched = true; setupMode(); });
-  $("#refresh").addEventListener("click", loadSetup);
+  $("#refresh").addEventListener("click", () => loadSetup(true));
   loadSetup(); setupJob.poll();
   setInterval(() => { if (!document.hidden) loadSetup(); }, 15000);
 });

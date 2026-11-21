@@ -107,10 +107,12 @@
         <div id="alert" class="alert" role="alert" hidden></div>
         <div id="migrate-banner" class="note warn banner" role="status" hidden></div>
 
+        <section id="setup-pending" class="card" hidden></section>
+        <div id="setup-load-error" class="form-error banner" role="alert" hidden></div>
         <section id="setup" class="card" hidden>
           <div class="card-head"><h2>Первый запуск</h2></div>
           <form id="setup-form" class="form setup-form">
-            <p id="setup-note" class="hint">Подготовь шаблон Hysteria2 и выбери роль этого сервера. Пароли создаются автоматически и не выводятся в лог.</p>
+            <p id="setup-note" class="hint"><span>Подготовь шаблон Hysteria2 и выбери роль этого сервера. Пароли создаются автоматически и не выводятся в лог.</span></p>
             <div class="field">
               <label for="setup-mode">Роль управляющего сервера</label>
               <select id="setup-mode">
@@ -144,9 +146,9 @@
           <pre id="job-log" class="log" aria-live="polite"></pre>
         </section>
         <div id="overview-content">
-        <section id="health" class="health" aria-live="polite"></section>
+        <section id="health" data-skeleton="health" class="health" aria-live="polite"></section>
 
-        <section id="kpis" class="kpis" aria-label="Сводка"></section>
+        <section id="kpis" data-skeleton="kpis" class="kpis" aria-label="Сводка"></section>
 
         <section class="card">
           <div class="card-head">
@@ -156,7 +158,7 @@
               <label class="check"><input id="onlybad" type="checkbox"> только с проблемами</label>
             </div>
           </div>
-          <div class="table-wrap">
+          <div class="table-wrap" data-skeleton="nodes 3">
             <table class="nodes">
               <thead>
                 <tr>
@@ -180,15 +182,15 @@
         <div class="grid3">
           <section class="card">
             <div class="card-head"><h2>Ретрансляторы <span id="relays-count" class="count"></span></h2></div>
-            <div id="relays" class="list"></div>
+            <div id="relays" data-skeleton="list 2" class="list"></div>
           </section>
           <section class="card">
             <div class="card-head"><h2>Группы Hysteria2 <span id="hy2-count" class="count"></span></h2></div>
-            <div id="hy2" class="list"></div>
+            <div id="hy2" data-skeleton="list 2" class="list"></div>
           </section>
           <section class="card">
             <div class="card-head"><h2>Клиенты AmneziaWG <span id="awg-count" class="count"></span></h2></div>
-            <div id="awg" class="list"></div>
+            <div id="awg" data-skeleton="list 2" class="list"></div>
           </section>
         </div>
         </div>

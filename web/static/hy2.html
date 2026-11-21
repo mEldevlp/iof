@@ -129,21 +129,21 @@
               <button class="btn small primary" type="submit" data-lock>Создать</button>
               <p class="hint">Ссылки на все узлы для одного человека или устройства. Подпись видна в клиенте: «Family | Node 1»</p>
             </form>
-            <div id="groups" class="group-list"></div>
+            <div id="groups" data-skeleton="groups 3" class="group-list"></div>
             <div class="btn-row">
               <button id="refresh-all" class="btn small" type="button" data-lock>Пересобрать все группы</button>
             </div>
           </section>
 
-          <section id="group" class="card group-detail" aria-live="polite"></section>
+          <section id="group" data-skeleton="hy2-detail 3" class="card group-detail" aria-live="polite"></section>
         </div>
 
         <section class="card">
           <div class="card-head">
             <h2>Hysteria2 на узлах <span id="nodes-count" class="count"></span></h2>
-            <span id="auth-mode" class="card-note"></span>
+            <span id="auth-mode" data-skeleton="line" class="card-note"></span>
           </div>
-          <div class="table-wrap">
+          <div class="table-wrap" data-skeleton="nodes 2">
             <table class="nodes">
               <thead>
                 <tr><th>Узел</th><th>Адрес</th><th>Состояние</th><th>Доступ</th><th>Версия</th></tr>

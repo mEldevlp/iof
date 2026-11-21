@@ -129,20 +129,20 @@
               <button class="btn small primary" type="submit" data-lock>Создать</button>
               <p class="hint">Для каждого узла с AmneziaWG будет создан отдельный ключ.</p>
             </form>
-            <div id="clients" class="group-list"></div>
+            <div id="clients" data-skeleton="groups 3" class="group-list"></div>
             <div class="btn-row">
               <button id="refresh-all" class="btn small" type="button" data-lock>Пересобрать ссылки</button>
             </div>
           </section>
 
-          <section id="client" class="card group-detail" aria-live="polite"></section>
+          <section id="client" data-skeleton="detail 3" class="card group-detail" aria-live="polite"></section>
         </div>
 
         <section class="card">
           <div class="card-head">
             <h2>AmneziaWG на узлах <span id="nodes-count" class="count"></span></h2>
           </div>
-          <div class="table-wrap">
+          <div class="table-wrap" data-skeleton="nodes 2">
             <table class="nodes">
               <thead>
                 <tr><th>Узел</th><th>Адрес</th><th>Состояние</th><th>Установка</th></tr>

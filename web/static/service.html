@@ -107,26 +107,26 @@
           <pre id="job-log" class="log" aria-live="polite"></pre>
         </section>
 
-        <div class="grid3">
+        <div id="service-info" class="grid3">
           <section class="card">
             <div class="card-head"><h2>Версия iof</h2></div>
-            <dl id="version" class="kv"></dl>
+            <dl id="version" data-skeleton="kv 2" class="kv"></dl>
             <div id="updates"></div>
             <div class="btn-row">
-              <button id="check-updates" class="btn" type="button">Проверить обновления</button>
-              <button id="update" class="btn primary" type="button">Обновить iof и панель</button>
+              <button id="check-updates" class="btn" type="button" disabled>Проверить обновления</button>
+              <button id="update" class="btn primary" type="button" disabled>Обновить iof и панель</button>
             </div>
             <p class="hint pad">«Обновить» — это <code>sudo iof update</code>: git pull в клоне репозитория и install.sh.
               В конце панель перезапустится, страница дождётся её сама.</p>
           </section>
           <section class="card">
             <div class="card-head"><h2>Проверка узлов</h2></div>
-            <dl id="check" class="kv"></dl>
+            <dl id="check" data-skeleton="kv 4" class="kv"></dl>
             <p id="check-hint" class="hint pad" hidden></p>
           </section>
           <section class="card">
             <div class="card-head"><h2>Ночное обслуживание</h2></div>
-            <dl id="nightly" class="kv"></dl>
+            <dl id="nightly" data-skeleton="kv 3" class="kv"></dl>
             <p id="nightly-hint" class="hint pad" hidden></p>
             <details id="nightly-more" class="more pad" hidden>
               <summary>Лог последнего запуска</summary>
@@ -141,6 +141,7 @@
             <span class="card-note">последние 10, хранятся до перезапуска панели</span>
           </div>
           <ul id="jobs" class="jobs"></ul>
+          <p id="jobs-error" class="form-error" role="alert" hidden></p>
         </section>
       </main>
 

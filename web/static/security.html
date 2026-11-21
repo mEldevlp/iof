@@ -113,14 +113,14 @@
             <div class="actions">
               <span id="server-stamp" class="card-note"></span>
               <label class="sr-only" for="server-node">Узел</label>
-              <select id="server-node"></select>
+              <div data-skeleton="select"><select id="server-node"></select></div>
               <button id="server-run" class="btn primary" type="button" data-run="server">Проверить</button>
             </div>
           </div>
           <p class="hint pad">SSH, файрвол, защита от подбора паролей, обновления, открытые порты, sudo и SUID-файлы.
             Проверка только читает настройки узлов и ничего на них не меняет. Нагрузка на узлы — на «Обзоре».</p>
-          <div id="server-health" class="health"></div>
-          <div id="server-checks"></div>
+          <div id="server-health" data-skeleton="health" class="health"></div>
+          <div id="server-checks" data-skeleton="checks 4"></div>
         </section>
 
         <section id="dpi" class="card">
@@ -129,7 +129,7 @@
             <div class="actions">
               <span id="dpi-stamp" class="card-note"></span>
               <label class="sr-only" for="dpi-node">Узел</label>
-              <select id="dpi-node"></select>
+              <div data-skeleton="select"><select id="dpi-node"></select></div>
               <button id="dpi-run" class="btn primary" type="button" data-run="dpi">Проверить</button>
             </div>
           </div>
@@ -137,8 +137,8 @@
             снаружи, блок-лист сканеров, репутация адреса, журналы. Проверка показывает признаки, а не обещает,
             что узел не найдут. Пароли и параметры обфускации в панель не попадают. Узлы она только читает,
             снаружи на них смотрит управляющий сервер.</p>
-          <div id="dpi-health" class="health"></div>
-          <div id="dpi-checks"></div>
+          <div id="dpi-health" data-skeleton="health" class="health"></div>
+          <div id="dpi-checks" data-skeleton="checks 4"></div>
         </section>
 
         <section id="probe" class="card">
@@ -147,7 +147,7 @@
             <div class="actions">
               <span id="probe-stamp" class="card-note"></span>
               <label class="sr-only" for="probe-node">Узел</label>
-              <select id="probe-node"></select>
+              <div data-skeleton="select"><select id="probe-node"></select></div>
               <button id="probe-start" class="btn primary" type="button">Начать проверку</button>
               <button id="probe-cancel" class="btn" type="button" hidden>Остановить</button>
             </div>
@@ -158,9 +158,9 @@
             Где ПК не дошёл, а контроль дошёл, там и режут. Проверка показывает, что прошло из этой сети
             в этот раз, и не обещает, что так будет всегда.</p>
           <div id="probe-wait" class="probe-wait" hidden></div>
-          <div id="probe-health" class="health"></div>
-          <div id="probe-nodes"></div>
-          <div id="probe-history" class="list"></div>
+          <div id="probe-health" data-skeleton="health" class="health"></div>
+          <div id="probe-nodes" data-skeleton="checks 2"></div>
+          <div id="probe-history" data-skeleton="list" class="list"></div>
         </section>
 
         <section class="card">
@@ -168,9 +168,9 @@
             <h2>Проверка по расписанию</h2>
             <span class="card-note">оба блока; последние запуски, из панели и из cron</span>
           </div>
-          <dl id="sched" class="kv"></dl>
+          <dl id="sched" data-skeleton="kv 3" class="kv"></dl>
           <p id="sched-hint" class="hint pad" hidden></p>
-          <div id="history" class="list"></div>
+          <div id="history" data-skeleton="list 2" class="list"></div>
         </section>
       </main>
 

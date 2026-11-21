@@ -5,7 +5,7 @@
 // ход: GET api/jobs. На старом сервере страница начинает и отменяет перенос, на новом завершает
 
 const TARGET_RE = /^[a-z_][a-z0-9_-]{0,31}@[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?(:\d{1,5})?$/;
-const mig = { info: null };
+const mig = { info: null, loading: false };
 
 // root@203.0.113.5:2222 -> { user, host, port }
 function parseTarget(t) {
@@ -54,12 +54,21 @@ function render() {
 }
 
 async function loadInfo() {
+  if (mig.loading) return;
+  mig.loading = true;
+  const current = [$("#form"), $("#source"), $("#target")].find((el) => !el.hidden);
+  if (current) current.hidden = true;
+  const finish = pendingCard($("#migrate-pending"), skeletonMarkup(null, "form", 4));
   try {
     mig.info = DEMO ? demoInfo() : await getJson("api/migrate");
   } catch (e) {
     $("#alert").hidden = false;
     $("#alert").innerHTML = `${icon("crit")} Нет связи с панелью: ${esc(e.message)}`;
+    if (current) current.hidden = false;
     return;
+  } finally {
+    finish();
+    mig.loading = false;
   }
   $("#alert").hidden = true;
   render();

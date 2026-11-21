@@ -284,8 +284,8 @@ const JOB_STATES = {
   error: ["crit", "ошибка"],
 };
 
-async function getJson(url) {
-  const r = await fetch(url, { cache: "no-store", credentials: "same-origin" });
+async function getJson(url, signal) {
+  const r = await fetch(url, { cache: "no-store", credentials: "same-origin", signal });
   if (r.status === 401) location.replace("login.html");
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return r.json();
@@ -386,8 +386,8 @@ function initLoginForm() {
 }
 
 // Задача страницы: запущенная с неё (id), иначе последняя задача этого вида (node или migrate)
-async function pageJob(kind, id, demoJobs) {
-  const jobs = DEMO ? demoJobs() : (await getJson("api/jobs")).jobs;
+async function pageJob(kind, id, demoJobs, signal) {
+  const jobs = DEMO ? demoJobs() : (await getJson("api/jobs", signal)).jobs;
   return jobs.find((j) => j.id === id) || jobs.find((j) => (j.kind || "node") === kind);
 }
 
@@ -418,11 +418,25 @@ function jobResult(lvl, html) {
 // done(job) вызывается, когда закончилась задача, запущенная с этой страницы (start).
 // all: показывать последнюю задачу этого вида, иначе только идущую или запущенную отсюда
 function watchJob({ kind, demoJobs, render, done, all = true }) {
-  const w = { id: null, shown: null, timer: null };
+  const w = { id: null, shown: null, timer: null, kind: null, request: null, ready: false };
+  const getKind = () => typeof kind === "function" ? kind() : kind;
   async function poll() {
     clearTimeout(w.timer);
+    const current = getKind();
+    if (w.kind !== current) {
+      Object.assign(w, { kind: current, ready: false, shown: w.id });
+    }
+    w.request?.abort();
+    const request = w.request = new AbortController();
+    const card = $("#job");
+    const finish = w.ready ? null : skeleton(card, skeletonJob(Boolean(w.id)));
+    if (finish) card.hidden = false;
+    const active = () => request === w.request && current === getKind();
     try {
-      const job = await pageJob(typeof kind === "function" ? kind() : kind, w.id, demoJobs);
+      const job = await pageJob(current, w.id, demoJobs, request.signal);
+      if (!active()) return;
+      finish?.();
+      w.ready = true;
       const visible = job && (all || job.state === "running" || job.id === w.shown);
       if (visible) w.shown = job.id;
       render(visible ? job : undefined);
@@ -430,16 +444,24 @@ function watchJob({ kind, demoJobs, render, done, all = true }) {
         w.timer = setTimeout(poll, 1000);
       } else if (job && job.id === w.id) {
         w.id = null;
-        done(job);
+        done?.(job);
       }
     } catch {
-      w.timer = setTimeout(poll, 3000);
+      if (active()) {
+        if (finish) {
+          finish();
+          render(undefined);
+        }
+        w.ready = true;
+        w.timer = setTimeout(poll, 3000);
+      }
     }
   }
   return {
     poll,
-    start(id) { w.id = id; w.shown = id; poll(); },
+    start(id) { w.id = id; w.shown = id; w.ready = false; poll(); },
     hide() { w.shown = null; render(undefined); },
+    reset() { w.id = null; w.shown = null; render(undefined); poll(); },
   };
 }
 
@@ -452,12 +474,160 @@ function failReason(log) {
 }
 
 
+// Заглушка занимает место содержимого, сохраняя его DOM и значения полей до ответа.
+// Завершение старого запроса не убирает заглушку нового.
+const skeletons = new WeakMap();
+
+function skeleton(el, html) {
+  skeletons.get(el)?.();
+  const template = document.createElement("template");
+  template.innerHTML = html;
+  const parts = [...template.content.children];
+  for (const part of parts) {
+    part.classList.add("skeleton-part");
+    part.setAttribute("aria-hidden", "true");
+  }
+  el.append(template.content);
+  el.classList.add("skeleton-active");
+  el.setAttribute("aria-busy", "true");
+  function finish() {
+    if (skeletons.get(el) !== finish) return;
+    parts.forEach((part) => part.remove());
+    el.classList.remove("skeleton-active");
+    el.removeAttribute("aria-busy");
+    skeletons.delete(el);
+  }
+  skeletons.set(el, finish);
+  return finish;
+}
+
+function skeletonBar(size = "medium", shape = "line") {
+  return `<span class="skeleton-slot skeleton-${shape}"><i class="skeleton-fill skeleton-${size}"></i></span>`;
+}
+
+function skeletonHealth() {
+  return `<span class="skeleton-fill big-ico"></span><div class="skeleton-grow">
+    ${skeletonBar("medium", "heading")}${skeletonBar("long")}</div>`;
+}
+
+function skeletonMeter() {
+  return `<div class="meter">${skeletonBar("short", "sub")}${skeletonBar("full", "track")}${skeletonBar("medium", "sub")}</div>`;
+}
+
+function skeletonLinks(count, url = false) {
+  return `<ol class="links">${Array.from({ length: count }, () => `<li class="link">
+    <div class="link-main">${skeletonBar()}${url ? skeletonBar("long", "sub") : ""}</div>
+    <div class="link-actions">${skeletonBar("medium", "button")}${url ? skeletonBar("short", "button") : ""}</div>
+  </li>`).join("")}</ol>`;
+}
+
+function skeletonJob(log = true) {
+  return `<div class="card-head">${skeletonBar()}${skeletonBar("short")}</div>${log
+    ? `<div class="skeleton-log">${skeletonBar("long")}${skeletonBar("medium")}</div>` : ""}`;
+}
+
+function skeletonFields(count) {
+  return `<div class="form-grid">${Array.from({ length: count }, () =>
+    `<div class="field">${skeletonBar("short")}${skeletonBar("full", "field")}</div>`).join("")}</div>`;
+}
+
+function skeletonTable(labels, classes, count, meters = false, head = "") {
+  const cells = labels.map((label, i) => {
+    const nodes = classes === "nodes";
+    const name = i === 0;
+    const action = classes === "admins" && i === labels.length - 1;
+    const meter = meters && i >= 4 && i <= 6;
+    const attrs = name ? `class="${nodes ? "cell-node" : "cell-name"}"`
+      : action ? 'class="cell-act"' : `data-label="${esc(label)}"`;
+    return `<td ${attrs}>${meter ? skeletonMeter() : skeletonBar("medium", action ? "button" : "line")}
+      ${name ? skeletonBar("short", "sub") : ""}</td>`;
+  }).join("");
+  return `<table class="${classes}">${head || `<thead><tr>${labels.map((label) => `<th>${esc(label)}</th>`).join("")}</tr></thead>`}
+    <tbody>${`<tr>${cells}</tr>`.repeat(count)}</tbody></table>`;
+}
+
+// Шаблоны используют те же сетки, строки и отступы, что и готовые данные.
+function skeletonMarkup(el, shape, count) {
+  switch (shape) {
+    case "health": return skeletonHealth();
+    case "kpis": return Array.from({ length: 5 }, () => `<div class="kpi">
+      <div class="label">${skeletonBar()}</div><div class="value">${skeletonBar("short", "value")}</div>
+      <div class="sub">${skeletonBar("long")}</div></div>`).join("");
+    case "nodes": {
+      const table = el.querySelector("table:not(.skeleton-part)");
+      return skeletonTable([...table.querySelectorAll("th")].map((th) => th.textContent), "nodes",
+        table.tBodies[0].rows.length || count, count === 3, table.tHead.outerHTML);
+    }
+    case "admins": return skeletonTable(["Админ", "ID", "Роль", "Звук в тихие часы", "Добавлен", "Удалить"], "admins",
+      el.querySelector("tbody")?.rows.length || count);
+    case "notify": return skeletonTable(["Админ", "Узлы", "Аудит", "Ночное обслуживание", "Обновления", "Доступ к РФ", "Админы"],
+      "admins notify", el.querySelector("tbody")?.rows.length || count);
+    case "kv":
+    case "resources": {
+      const keys = el.querySelectorAll("dt:not(.skeleton-part)");
+      return Array.from({ length: keys.length || count }, (_, i) => {
+        const meter = shape === "resources" && i >= 2 && i <= 4 && (!keys.length || keys[i].nextElementSibling.querySelector(".meter"));
+        return `<dt>${skeletonBar("short")}</dt><dd>${meter ? skeletonMeter() : skeletonBar("long")}</dd>`;
+      }).join("");
+    }
+    case "groups":
+    case "list": return Array.from({ length: el.querySelectorAll(".item:not(.skeleton-part), .group-item:not(.skeleton-part)").length || count }, () =>
+      `<div class="${shape === "groups" ? "group-item" : "item"}">
+        <div class="item-head">${skeletonBar()}${skeletonBar("short")}</div>${skeletonBar("medium", "sub")}</div>`).join("");
+    case "checks":
+    case "jobs": {
+      const rows = el.querySelectorAll("summary").length || count;
+      const items = `<li><div class="skeleton-summary">
+        ${skeletonBar("short")}${skeletonBar("medium")}${skeletonBar("short")}</div></li>`.repeat(rows);
+      return shape === "checks" ? `<ul class="checks">${items}</ul>` : items;
+    }
+    case "settings": return Array.from({ length: count }, () => `<li><div class="skeleton-grow">
+      ${skeletonBar()}${skeletonBar("long")}</div>${skeletonBar("short", "switch")}</li>`).join("");
+    case "form": return `<div class="card-head">${skeletonBar()}</div>
+      <div class="pad">${skeletonFields(count)}</div><div class="btn-row">${skeletonBar("medium", "button")}</div>`;
+    case "detail":
+    case "hy2-detail": return `<div class="card-head"><div class="skeleton-grow">${skeletonBar()}${skeletonBar("medium", "sub")}</div>
+      ${skeletonBar("medium", "button")}</div>${shape === "hy2-detail"
+      ? `<div class="group-body">${skeletonLinks(count, true)}<div class="qr-all"><span class="skeleton-fill skeleton-qr"></span></div></div>`
+      : `<div class="pad">${skeletonLinks(count)}</div>`}<div class="hint">${skeletonBar("long")}</div>`;
+    case "danger": return `<div class="card-head">${skeletonBar()}</div><div class="pad">${skeletonBar("long")}</div>
+      <div class="btn-row">${skeletonBar("medium", "button")}</div>`;
+    case "invites": return `<li>${skeletonBar("short", "pill")}${skeletonBar()}${skeletonBar("medium", "button")}</li>`
+      .repeat(el.querySelectorAll("li:not(.skeleton-part)").length);
+    case "server-select": return skeletonBar("full", "button") + skeletonBar("medium", "button");
+    case "select": return skeletonBar("medium", "button");
+    case "switch": return skeletonBar("full", "switch");
+    case "time": return skeletonBar("short", "button").repeat(2);
+    case "buttons": return skeletonBar("medium", "button").repeat(count);
+    case "chips": return skeletonBar("short", "pill").repeat(count);
+    case "code": return skeletonBar("long").repeat(count);
+    default: return skeletonBar("long");
+  }
+}
+
+function skeletonRegions(root = document, selector = "[data-skeleton]") {
+  const finish = [...root.querySelectorAll(selector)].map((el) => {
+    const [shape, count = 1] = el.dataset.skeleton.split(" ");
+    return skeleton(el, skeletonMarkup(el, shape, Number(count)));
+  });
+  return () => finish.forEach((end) => end());
+}
+
+function pendingCard(el, html) {
+  el.hidden = false;
+  const finish = skeleton(el, html);
+  return () => {
+    finish();
+    el.hidden = true;
+  };
+}
+
 // Загрузка данных страницы, кнопка «Обновить», автообновление и строка состояния.
-// page: { url (строка или функция), demo() -> Promise<data>, render(data), init(rerender) }.
+// page: { url (строка или функция), demo() -> Promise<data>, render(data, replace), init(rerender) }.
 // Возвращает { state, reload }: reload() загружает данные заново, например после задачи
 
 function startPage(page) {
-  const state = { data: null, error: null, loading: false, timer: null };
+  const state = { data: null, error: null, loading: false, replacing: false, rerender: false, timer: null, url: null, request: null };
 
   function renderAlert() {
     const el = $("#alert");
@@ -476,38 +646,46 @@ function startPage(page) {
       (d.cached ? " · из кэша" : "") + (DEMO ? " · демо" : "");
   }
 
-  function render() {
+  async function load({ force = false, replace = false } = {}) {
+    const url = typeof page.url === "function" ? page.url() : page.url;
+    const changed = state.url !== url;
+    if (state.loading && !changed && !replace && !force) return;
+    state.request?.abort();
+    const request = state.request = new AbortController();
+    state.url = url;
+    if (changed) state.data = null;
+    if (!state.data) page.reset?.();
+    state.error = null;
+    state.loading = true;
+    state.replacing = !state.data || force || replace;
+    const finish = state.replacing ? skeletonRegions() : null;
+    $("#refresh").setAttribute("aria-busy", "true");
     renderAlert();
     renderStamp();
-    if (state.data) {
-      renderMigrate(state.data.migrate);
-      page.render(state.data);
-    }
-  }
-
-  async function load(force = false) {
-    if (state.loading) return;
-    state.loading = true;
-    $("#refresh").setAttribute("aria-busy", "true");
-    renderStamp();
+    const active = () => request === state.request && (typeof page.url !== "function" || page.url() === url);
+    let data;
     try {
-      if (DEMO) {
-        state.data = await page.demo();
-      } else {
-        const url = typeof page.url === "function" ? page.url() : page.url;
-        const r = await fetch(force ? `${url}${url.includes("?") ? "&" : "?"}force=1` : url,
-          { cache: "no-store", credentials: "same-origin" });
-        if (r.status === 401) location.replace("login.html");
-        if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        state.data = await r.json();
-      }
-      state.error = null;
+      data = DEMO ? await page.demo() : await getJson(
+        force ? `${url}${url.includes("?") ? "&" : "?"}force=1` : url, request.signal);
     } catch (e) {
-      state.error = e.message || String(e);
+      if (active()) state.error = e.message || String(e);
     } finally {
+      finish?.();
+      if (!active()) return;
       state.loading = false;
+      state.replacing = false;
       $("#refresh").removeAttribute("aria-busy");
-      render();
+      if (data) {
+        state.data = data;
+        renderMigrate(data.migrate);
+        page.render(data, changed || force || replace);
+      } else if (state.data && state.rerender) {
+        page.render(state.data);
+      }
+      state.rerender = false;
+      if (!state.data && page.empty) page.empty();
+      renderAlert();
+      renderStamp();
     }
   }
 
@@ -519,12 +697,15 @@ function startPage(page) {
 
   document.addEventListener("DOMContentLoaded", () => {
     $("#auto").value = prefs.get("auto", "60");
-    $("#refresh").addEventListener("click", () => load(true));
+    $("#refresh").addEventListener("click", () => load({ force: true }));
     $("#auto").addEventListener("change", () => { prefs.set("auto", $("#auto").value); schedule(); });
-    if (page.init) page.init(() => state.data && page.render(state.data));
+    if (page.init) page.init(() => {
+      if (state.replacing) state.rerender = true;
+      else if (state.data) page.render(state.data);
+    });
     load();
     schedule();
   });
 
-  return { state, reload: () => load() };
+  return { state, reload: () => load({ replace: true }) };
 }

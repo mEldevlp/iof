@@ -101,18 +101,18 @@
           <section class="card">
             <div class="card-head">
               <h2>Бот</h2>
-              <label class="switch">
+              <label class="switch" data-skeleton="switch">
                 <input id="bot-enable" type="checkbox" role="switch" data-lock>
                 <span class="switch-track" aria-hidden="true"></span>
                 <span>Включён</span>
               </label>
             </div>
-            <div id="bot-state" class="health" role="status"></div>
-            <dl id="bot-kv" class="kv"></dl>
+            <div id="bot-state" data-skeleton="health" class="health" role="status"></div>
+            <dl id="bot-kv" data-skeleton="kv 3" class="kv"></dl>
             <form id="server-form" class="form">
               <div class="field">
                 <label for="bot-server">Сервер бота</label>
-                <div class="input-row">
+                <div class="input-row" data-skeleton="server-select">
                   <select id="bot-server" data-lock></select>
                   <button id="bot-move" class="btn" type="submit" data-lock>Перенести</button>
                 </div>
@@ -129,7 +129,7 @@
                     <input id="f-token" type="password" autocomplete="off" spellcheck="false" maxlength="200">
                     <button id="toggle-token" class="btn small" type="button">Показать</button>
                   </div>
-                  <p id="token-hint" class="hint"></p>
+                  <p id="token-hint" data-skeleton="line" class="hint"></p>
                 </div>
               </fieldset>
               <div class="form-actions">
@@ -148,20 +148,20 @@
                   <p class="hint">Главные админы смогут запускать из бота проверку узлов, перезапуск Hysteria2 и группы
                     ссылок, каждое действие — с подтверждением. Удаление узлов, перенос и обновление — только в панели.</p>
                 </div>
-                <label class="switch"><input id="set-actions" type="checkbox" role="switch" aria-labelledby="actions-label" data-lock><span class="switch-track" aria-hidden="true"></span></label>
+                <label class="switch" data-skeleton="switch"><input id="set-actions" type="checkbox" role="switch" aria-labelledby="actions-label" data-lock><span class="switch-track" aria-hidden="true"></span></label>
               </li>
               <li>
                 <div class="setting-text">
                   <b id="links-label">Ссылки Hysteria2</b>
                   <p class="hint">Бот выдаёт админам ссылки групп с QR-кодами. В ссылках пароль: выключи, если не хочешь держать их в Telegram.</p>
                 </div>
-                <label class="switch"><input id="set-links" type="checkbox" role="switch" aria-labelledby="links-label" data-lock><span class="switch-track" aria-hidden="true"></span></label>
+                <label class="switch" data-skeleton="switch"><input id="set-links" type="checkbox" role="switch" aria-labelledby="links-label" data-lock><span class="switch-track" aria-hidden="true"></span></label>
               </li>
               <li>
                 <div class="setting-text">
                   <b id="quiet-label">Тихие часы</b>
                   <p class="hint">Уведомления в это время приходят без звука, кроме админов со звуком в тихие часы. <span id="quiet-tz"></span></p>
-                  <form id="quiet-form" class="time-row" novalidate>
+                  <form id="quiet-form" data-skeleton="time" class="time-row" novalidate>
                     <label for="quiet-from">с</label>
                     <input id="quiet-from" type="time" value="23:00" required data-lock>
                     <label for="quiet-to">до</label>
@@ -169,7 +169,7 @@
                     <button id="quiet-save" class="btn small" type="submit" data-lock hidden>Сохранить</button>
                   </form>
                 </div>
-                <label class="switch"><input id="set-quiet" type="checkbox" role="switch" aria-labelledby="quiet-label" data-lock><span class="switch-track" aria-hidden="true"></span></label>
+                <label class="switch" data-skeleton="switch"><input id="set-quiet" type="checkbox" role="switch" aria-labelledby="quiet-label" data-lock><span class="switch-track" aria-hidden="true"></span></label>
               </li>
             </ul>
           </section>
@@ -180,19 +180,19 @@
             <h2>Админы <span id="admins-count" class="count"></span></h2>
             <button id="add-admin" class="btn small primary" type="button" data-lock>Добавить админа</button>
           </div>
-          <div id="admins" class="table-wrap"></div>
+          <div id="admins" data-skeleton="admins 2" class="table-wrap"></div>
           <div id="invites-box" hidden>
             <h3 class="sub-head">Неиспользованные приглашения <span id="invites-count" class="count"></span></h3>
-            <ul id="invites" class="invites"></ul>
+            <ul id="invites" data-skeleton="invites" class="invites"></ul>
           </div>
         </section>
 
         <section class="card">
           <div class="card-head"><h2>Уведомления</h2></div>
-          <p id="notify-hint" class="hint pad"></p>
-          <div id="notify" class="table-wrap"></div>
+          <p id="notify-hint" data-skeleton="line" class="hint pad"></p>
+          <div id="notify" data-skeleton="notify 2" class="table-wrap"></div>
           <h3 class="sub-head">Когда приходят</h3>
-          <dl id="notify-types" class="cmds"></dl>
+          <dl id="notify-types" data-skeleton="kv 6" class="cmds"></dl>
         </section>
 
         <section class="card">

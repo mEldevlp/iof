@@ -10,7 +10,7 @@
 const Term = (() => {
   const t = { xterm: null, fit: null, ws: null, node: null, state: "closed", ping: null, exit: null, demo: null };
   const enc = new TextEncoder();
-  let loading = null;
+  let loading = null, session = 0, finish = null;
 
   // xterm.js сам создаёт элементы <style>, а CSP панели (default-src 'self') их не применяет.
   // Поэтому такой элемент подменяется невидимым <template>, а его текст уходит в constructable
@@ -75,6 +75,10 @@ const Term = (() => {
 
   // Состояние в шапке карточки и подсказка под ней: ошибка или как подключиться снова
   function setState(state, text = "") {
+    if (state !== "connecting") {
+      finish?.();
+      finish = null;
+    }
     t.state = state;
     $("#term-state").innerHTML = STATES[state](state === "closed" ? text : "");
     const note = $("#term-note");
@@ -131,6 +135,7 @@ const Term = (() => {
   }
 
   async function connect() {
+    const current = session;
     setState("connecting");
     t.exit = null;
     t.fit.fit();
@@ -139,9 +144,10 @@ const Term = (() => {
     try {
       ({ ticket } = await postJson("api/term", { name: t.node, cols: t.xterm.cols, rows: t.xterm.rows }));
     } catch (e) {
-      setState("error", e.message);
+      if (current === session) setState("error", e.message);
       return;
     }
+    if (current !== session) return;
     const url = new URL(`api/term/ws?t=${encodeURIComponent(ticket)}`, location.href);
     url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
     const ws = new WebSocket(url);
@@ -210,22 +216,28 @@ const Term = (() => {
       return;
     }
     close(false);
+    const current = session;
     card.hidden = false;
     t.node = node.name;
     setState("connecting");
+    finish = skeleton($("#term-box"), `<div>${skeletonBar("long")}${skeletonBar("medium")}
+      ${skeletonBar("short")}</div>`);
     try {
       await loadXterm();
     } catch (e) {
-      setState("error", e.message);
+      if (current === session) setState("error", e.message);
       return;
     }
-    if (t.node !== node.name) return;
+    if (current !== session) return;
     if (!t.xterm) createXterm();
     connect();
   }
 
   // Закрыть сессию и окно терминала. hide = false: только сессию, окно останется
   function close(hide = true) {
+    session++;
+    finish?.();
+    finish = null;
     clearInterval(t.ping);
     const ws = t.ws;
     t.ws = null;

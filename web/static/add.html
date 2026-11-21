@@ -157,7 +157,7 @@
 
               <div class="auth-pane" data-auth="installed" hidden>
                 <p class="hint">Добавь на новом сервере публичный ключ iof в <code>~/.ssh/authorized_keys</code> пользователя, например так:</p>
-                <pre id="pubkey-cmd" class="code"></pre>
+                <pre id="pubkey-cmd" data-skeleton="code 2" class="code"></pre>
                 <button id="copy-pubkey" class="btn small" type="button">Скопировать команду</button>
               </div>
 
@@ -169,7 +169,7 @@
               <legend>После добавления</legend>
               <label class="check"><input id="f-hy2" type="checkbox" checked> Сразу установить Hysteria2 и добавить узел в группы ссылок</label>
               <label class="check"><input id="f-awg" type="checkbox"> Сразу установить AmneziaWG 2.0 (UDP 51820)</label>
-              <p id="hy2-hint" class="hint">Конфиг по образцу этого сервера, как <code>iof hy2 install</code></p>
+              <p id="hy2-hint" data-skeleton="line" class="hint">Конфиг по образцу этого сервера, как <code>iof hy2 install</code></p>
               <details class="more">
                 <summary>Дополнительно</summary>
                 <div class="field">
@@ -208,7 +208,7 @@
                 <code>sudo iof awg add "Имя"</code> создаст клиентов и на новом узле.</p>
               <div class="pad">
                 <div class="hint">Уже в nodes.conf:</div>
-                <div id="known" class="chips"></div>
+                <div id="known" data-skeleton="chips 3" class="chips"></div>
               </div>
             </section>
           </div>

@@ -7,7 +7,8 @@
 // Карточка «Доступность из РФ» — проверка с ПК (iof audit probe), см. ниже «Проверка с ПК»
 
 // kind — вид задачи, которую показывает карточка задачи: audit или probe
-const sec = { data: null, running: false, kind: "audit", poll: null, tick: null };
+const sec = { data: null, running: false, kind: "audit", poll: null, tick: null,
+  request: null, probeRequest: null, starting: false };
 // Блоки страницы: у каждого в html есть #<блок>-node, -run, -stamp, -health, -checks
 const BLOCKS = ["server", "dpi"];
 // Что проверял запуск из истории (поле block)
@@ -20,7 +21,12 @@ const job = watchJob({
   demoJobs,
   all: false,
   render: renderJob,
-  done: () => load(),
+  done(j) {
+    const block = /\baudit run (server|dpi)\b/.exec(j.log[0] || "")?.[1];
+    const selector = j.kind === "probe" ? "#probe [data-skeleton]" : block
+      ? `#${block} [data-skeleton], #history` : "#server [data-skeleton], #dpi [data-skeleton], #history";
+    load({ replace: true, selector });
+  },
 });
 
 function fmtWhen(ts) {
@@ -335,11 +341,14 @@ function renderSchedule() {
 
 function syncButtons() {
   const off = sec.running || !sec.data || !!sec.data.error;
-  document.querySelectorAll("[data-run]").forEach((b) => { b.disabled = off; });
+  document.querySelectorAll("[data-run]").forEach((b) => {
+    b.disabled = off || Boolean(b.closest("section").querySelector(".skeleton-active"));
+  });
   document.querySelectorAll("[data-act-open]").forEach((b) => { b.disabled = !sec.data || !!sec.data.error; });
-  if ($("#act-dialog").open) renderActDialog();
+  if ($("#act-dialog").open && sec.data && !sec.data.error) renderActDialog();
   // Мишени меняют узлы: во время переноса управления их не запустить
-  $("#probe-start").disabled = off || !!(sec.data && sec.data.migrate && sec.data.migrate.role === "source");
+  $("#probe-start").disabled = off || sec.starting || Boolean($("#probe-health").closest(".skeleton-active"))
+    || !!(sec.data && sec.data.migrate && sec.data.migrate.role === "source");
   $("#probe-cancel").disabled = sec.running;
 }
 
@@ -358,16 +367,37 @@ function render() {
   syncButtons();
 }
 
-async function load() {
+async function load({ replace = false, was, selector } = {}) {
+  if (sec.request && !replace) return;
+  sec.request?.abort();
+  sec.probeRequest?.abort();
+  const request = sec.request = new AbortController();
+  const finish = !sec.data || replace ? skeletonRegions(document, selector) : null;
+  syncButtons();
   $("#refresh").setAttribute("aria-busy", "true");
   try {
-    sec.data = DEMO ? await demoAudit() : await getJson("api/security");
+    const data = DEMO ? await demoAudit() : await getJson("api/security", request.signal);
+    if (request !== sec.request) return;
+    finish?.();
+    sec.data = data;
     render();
+    if (was && !data.error && probeStage() !== was) job.poll();
   } catch (e) {
+    if (request !== sec.request) return;
     $("#alert").hidden = false;
     $("#alert").innerHTML = `${icon("crit")} Нет связи с панелью: ${esc(e.message)}`;
+    if (sec.data && !sec.data.error) {
+      finish?.();
+      BLOCKS.forEach(renderBlock);
+      renderProbe();
+    }
   } finally {
-    $("#refresh").removeAttribute("aria-busy");
+    finish?.();
+    if (request === sec.request) {
+      sec.request = null;
+      $("#refresh").removeAttribute("aria-busy");
+      syncButtons();
+    }
   }
 }
 
@@ -413,7 +443,7 @@ function renderJob(j) {
   $("#job-hide").hidden = sec.running;
   if (j.kind === "probe") {
     // Этап карточки зависит от того, идёт ли задача
-    if (was !== sec.running && sec.data && !sec.data.error) renderProbe();
+    if (was !== sec.running && sec.data && !sec.data.error && !$("#probe-nodes").classList.contains("skeleton-active")) renderProbe();
     probeJobResult(j, lvl);
   } else if (ACT_JOB.test(j.title)) {
     const reason = failReason(j.log);
@@ -489,6 +519,7 @@ function probeTargets(s) {
 
 function renderProbeWait(stage) {
   const el = $("#probe-wait"), st = sec.data.probe_state || {}, p = st.panel, s = st.session;
+  if (sec.starting) return;
   el.hidden = !["starting", "wait", "import", "expired", "foreign"].includes(stage);
   if (el.hidden) return;
   let html;
@@ -614,21 +645,23 @@ function renderProbe() {
 
 // Опрос во время проверки: этап меняется — данные загружаются целиком
 async function pollProbe(was) {
+  if (!sec.data || sec.data.error || sec.request || sec.starting) return;
+  if (DEMO || was === "import") return load({ was });
+  sec.probeRequest?.abort();
+  const request = sec.probeRequest = new AbortController();
   try {
-    if (DEMO) {
-      sec.data = await demoAudit();
-    } else if (was === "import") {
-      sec.data = await getJson("api/security");
-    } else {
-      sec.data.probe_state = await getJson("api/probe");
-    }
+    const state = await getJson("api/probe", request.signal);
+    if (request !== sec.probeRequest || request.signal.aborted) return;
+    sec.data.probe_state = state;
   } catch {
     // нет связи: попробуем в следующий раз
   }
+  if (request !== sec.probeRequest || request.signal.aborted) return;
+  sec.probeRequest = null;
   if (probeStage() !== was) {
     // Отчёт с ПК принят: задачу с ним запустила панель, карточка задачи её подхватит
     job.poll();
-    if (was !== "import") return load();
+    return load();
   }
   render();
 }
@@ -637,13 +670,25 @@ async function probeStart() {
   formError("", "#action-error");
   const node = $("#probe-node").value;
   const body = { action: "start", nodes: node ? [node] : [] };
+  const box = $("#probe-wait");
+  const finish = pendingCard(box, `<div>${skeletonBar("long")}${skeletonBar("medium")}</div>`);
+  sec.starting = true;
+  syncButtons();
   try {
     const id = DEMO ? demoProbeJob(body) : (await postJson("api/probe", body)).job;
     sec.kind = "probe";
-    sec.data.probe_state = DEMO ? demoProbeState() : await getJson("api/probe");
     job.start(id);
+    sec.probeRequest?.abort();
+    const request = sec.probeRequest = new AbortController();
+    const state = DEMO ? demoProbeState() : await getJson("api/probe", request.signal);
+    if (!request.signal.aborted && sec.probeRequest === request) sec.data.probe_state = state;
   } catch (e) {
-    formError(e.message, "#action-error");
+    if (e.name !== "AbortError") formError(e.message, "#action-error");
+  } finally {
+    finish();
+    sec.starting = false;
+    if (sec.data && !sec.data.error && !$("#probe-nodes").classList.contains("skeleton-active")) renderProbe();
+    syncButtons();
   }
 }
 
@@ -659,15 +704,19 @@ async function probeCancel() {
 }
 
 document.addEventListener("DOMContentLoaded", async () => {
-  $("#refresh").addEventListener("click", load);
+  $("#refresh").addEventListener("click", () => load({ replace: true }));
   $("#job-hide").addEventListener("click", () => job.hide());
   for (const block of BLOCKS) {
     $(`#${block}-run`).addEventListener("click", () => run(block));
-    $(`#${block}-node`).addEventListener("change", () => sec.data && !sec.data.error && renderBlock(block));
+    $(`#${block}-node`).addEventListener("change", () => {
+      if (!$(`#${block}-checks`).classList.contains("skeleton-active") && sec.data && !sec.data.error) renderBlock(block);
+    });
   }
   $("#probe-start").addEventListener("click", probeStart);
   $("#probe-cancel").addEventListener("click", probeCancel);
-  $("#probe-node").addEventListener("change", () => sec.data && !sec.data.error && renderProbeResult((sec.data.probe || {}).last));
+  $("#probe-node").addEventListener("change", () => {
+    if (!$("#probe-nodes").classList.contains("skeleton-active") && sec.data && !sec.data.error) renderProbeResult((sec.data.probe || {}).last);
+  });
   $("#act-node").addEventListener("change", renderActDialog);
   $("#act-close").addEventListener("click", () => $("#act-dialog").close());
   $("#act-dialog").addEventListener("click", (e) => {

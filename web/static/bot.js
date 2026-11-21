@@ -22,7 +22,7 @@ const NOTIFY = [
 const NOTIFY_MAIN = ["admins"];
 const TOKEN_RE = /^[0-9]{1,20}:[A-Za-z0-9_-]{20,100}$/;
 
-const bot = { data: null, busy: false, timer: null, loading: 0, shown: {} };
+const bot = { data: null, busy: false, timer: null, request: null, finish: null, shown: {} };
 
 
 // Форматирование
@@ -311,39 +311,65 @@ function schedule() {
   }, spin || bot.data?.move?.running ? 2000 : 15000);
 }
 
-async function load() {
+async function load(replace = false) {
   if (bot.busy) return;
-  const loading = ++bot.loading;
+  if (bot.request && !replace) return;
+  bot.request?.abort();
+  bot.finish?.();
+  const request = bot.request = new AbortController();
+  const finish = bot.finish = !bot.data || replace ? skeletonRegions() : null;
   $("#refresh").setAttribute("aria-busy", "true");
   try {
-    const data = DEMO ? demoGet() : await getJson("api/bot");
-    if (loading !== bot.loading) return;
+    const data = DEMO ? demoGet() : await getJson("api/bot", request.signal);
+    if (request !== bot.request) return;
+    finish?.();
     bot.data = data;
     $("#alert").hidden = true;
     render();
   } catch (e) {
-    if (loading !== bot.loading) return;
+    if (request !== bot.request) return;
     $("#alert").hidden = false;
     $("#alert").innerHTML = `${icon("crit")} Нет связи с панелью: ${esc(e.message)}`;
   } finally {
-    if (loading === bot.loading) $("#refresh").removeAttribute("aria-busy");
+    finish?.();
+    if (request === bot.request) {
+      bot.request = bot.finish = null;
+      $("#refresh").removeAttribute("aria-busy");
+    }
   }
 }
 
 // Изменение: iof bot на сервере, в ответе свежее состояние страницы. Ошибка — в плашке над карточками,
 // а выключатели и выбор возвращаются к сохранённому
-async function act(body) {
-  formError("", "#action-error");
-  bot.loading++;
+const BOT_RESULTS = {
+  token: "#bot-state, #bot-kv",
+  enable: "#bot-state",
+  server: "#bot-state, #bot-kv",
+  admin_set: "#notify",
+  admin_del: "#admins, #notify, #bot-kv",
+  invite_del: "#invites",
+};
+
+async function act(body, { errorSel = "#action-error", afterWrite } = {}) {
+  formError("", errorSel);
+  bot.request?.abort();
+  bot.request = null;
+  bot.finish?.();
+  bot.finish = null;
   $("#refresh").removeAttribute("aria-busy");
   bot.busy = true;
   lock();
+  const selector = BOT_RESULTS[body.action];
+  const finish = selector ? skeletonRegions(document, selector) : null;
   let res = null;
   try {
     res = DEMO ? await demoPost(body) : await postJson("api/bot", body);
     if (res.message) toast(res.message);
   } catch (e) {
-    formError(e.message, "#action-error");
+    if ($(errorSel)) formError(e.message, errorSel);
+  } finally {
+    finish?.();
+    afterWrite?.();
   }
   bot.busy = false;
   bot.shown = {};
@@ -398,6 +424,7 @@ function openInvite() {
     <p id="role-hint" class="hint">${ROLE_HINTS.regular}</p>
     ${running ? "" : `<p class="note warn">${icon("warn")}<span>Бот сейчас не работает: код примет только работающий бот.
       Включи его, прежде чем передавать код.</span></p>`}
+    <p id="invite-error" class="form-error" role="alert" hidden></p>
     <div class="btn-row"><button id="invite-go" class="btn primary" type="button" data-lock>Создать приглашение</button></div>`;
   $("#invite-body").querySelectorAll('input[name="role"]').forEach((r) => r.addEventListener("change", () => {
     $("#role-hint").textContent = ROLE_HINTS[r.value];
@@ -407,13 +434,16 @@ function openInvite() {
 }
 
 async function createInvite() {
+  const dialog = $("#invite-dialog"), body = $("#invite-body"), button = $("#invite-go");
   const role = $('#invite-body input[name="role"]:checked').value;
-  const res = await act({ action: "invite", role });
-  if (!res || !res.invite) {
-    $("#invite-dialog").close();
-    $("#invite-body").innerHTML = "";
-    return;
-  }
+  const finish = skeleton(body, `<div class="note">${skeletonBar("long")}</div>
+    ${["short", "medium"].map((size) => `<div class="dialog-field">${skeletonBar("short")}
+      <div class="cmd"><div class="code skeleton-grow">${skeletonBar(size)}</div>
+        ${skeletonBar("medium", "button")}</div></div>`).join("")}
+    <div>${skeletonBar("long")}${skeletonBar("medium")}</div>`);
+  const res = await act({ action: "invite", role }, { errorSel: "#invite-error", afterWrite: finish });
+  if (!dialog.open || !button.isConnected) return;
+  if (!res?.invite) return;
   const inv = res.invite, name = botName(bot.data);
   $("#invite-title").textContent = `Приглашение: ${ROLES[inv.role]} админ`;
   $("#invite-body").innerHTML = `
@@ -564,7 +594,8 @@ async function demoPost(b) {
 
 
 document.addEventListener("DOMContentLoaded", async () => {
-  $("#refresh").addEventListener("click", load);
+  lock();
+  $("#refresh").addEventListener("click", () => load(true));
   $("#bot-server").addEventListener("change", lock);
   $("#server-form").addEventListener("submit", (e) => {
     e.preventDefault();
@@ -593,11 +624,17 @@ document.addEventListener("DOMContentLoaded", async () => {
   // Код приглашения не остаётся в странице после закрытия окна: ни кнопкой, ни кликом по фону, ни Escape
   const closeInvite = () => {
     $("#invite-dialog").close();
+    skeletons.get($("#invite-body"))?.();
     $("#invite-body").innerHTML = "";
   };
   $("#invite-close").addEventListener("click", closeInvite);
   $("#invite-dialog").addEventListener("click", (e) => { if (e.target === e.currentTarget) closeInvite(); });
-  $("#invite-dialog").addEventListener("close", (e) => { if (!e.currentTarget.open) $("#invite-body").innerHTML = ""; });
+  $("#invite-dialog").addEventListener("close", (e) => {
+    if (!e.currentTarget.open) {
+      skeletons.get($("#invite-body"))?.();
+      $("#invite-body").innerHTML = "";
+    }
+  });
   await load();
   schedule();
 });

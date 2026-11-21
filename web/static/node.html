@@ -138,7 +138,7 @@
           <pre id="job-log" class="log" aria-live="polite"></pre>
         </section>
 
-        <section id="health" class="health" aria-live="polite"></section>
+        <section id="health" data-skeleton="health" class="health" aria-live="polite"></section>
 
         <section id="term" class="card term-card" aria-label="Терминал" hidden>
           <div class="card-head">
@@ -160,38 +160,38 @@
         <div id="node-body" class="grid3">
           <section class="card">
             <div class="card-head"><h2>Hysteria2</h2></div>
-            <dl id="hy2" class="kv"></dl>
-            <div id="hy2-actions" class="btn-row"></div>
+            <dl id="hy2" data-skeleton="kv 4" class="kv"></dl>
+            <div id="hy2-actions" data-skeleton="buttons" class="btn-row"></div>
           </section>
           <section class="card">
             <div class="card-head"><h2>AmneziaWG</h2></div>
-            <dl id="awg" class="kv"></dl>
+            <dl id="awg" data-skeleton="kv 4" class="kv"></dl>
             <div class="btn-row">
               <label id="awg-port-label" class="field" hidden><span>Порт UDP</span>
                 <input id="awg-port" type="number" min="1" max="65535" placeholder="51820">
               </label>
-              <span id="awg-actions"></span>
+              <span id="awg-actions" data-skeleton="buttons"></span>
             </div>
             <p class="hint pad"><a id="awg-clients" href="awg.html">Клиенты и ключи AmneziaWG</a></p>
           </section>
           <section class="card">
             <div class="card-head"><h2>Сервер</h2></div>
-            <dl id="res" class="kv"></dl>
+            <dl id="res" data-skeleton="resources 7" class="kv"></dl>
           </section>
         </div>
 
         <div id="node-more" class="grid2">
           <section class="card">
             <div class="card-head"><h2>Группы Hysteria2 <span id="groups-count" class="count"></span></h2></div>
-            <div id="groups" class="list"></div>
+            <div id="groups" data-skeleton="list 2" class="list"></div>
           </section>
           <section class="card">
             <div class="card-head"><h2>Ретрансляторы <span id="relays-count" class="count"></span></h2></div>
-            <div id="relays" class="list"></div>
+            <div id="relays" data-skeleton="list 2" class="list"></div>
           </section>
         </div>
 
-        <section id="danger" class="card danger-zone">
+        <section id="danger" data-skeleton="danger" class="card danger-zone">
           <div class="card-head"><h2>Удаление узла</h2></div>
           <p class="hint pad">Узел уберётся из <code>nodes.conf</code>, затем ссылки Hysteria2 и ключи AmneziaWG пересоберутся
             уже без него: <code>iof node del</code> и <code>iof refresh</code>. Сам сервер iof не трогает: VPN на нём продолжит
