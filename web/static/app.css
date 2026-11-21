@@ -632,6 +632,9 @@ pre.log {
 }
 .schedule-controls input:disabled { opacity: .6; }
 .cron-command { margin: 0 0 12px; }
+.cron-actions { padding-bottom: 12px; }
+#cron-journal-link { text-decoration: none; }
+#cron-delete-details .code { margin: 0; }
 @media (max-width: 600px) {
   .schedule-row { grid-template-columns: minmax(0, 1fr); }
 }

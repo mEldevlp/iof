@@ -102,7 +102,8 @@ function renderUpdates() {
 
 function renderCheck() {
   const i = svc.info, c = i.check;
-  const cron = i.cron.find((l) => /\biof check\b/.test(l));
+  const cron = svc.schedule ? svc.schedule.jobs.find((j) => j.kind === "check")?.schedule
+    : i.cron.find((l) => /\biof check\b(?!-)/.test(l));
   let last = '<span class="muted">ещё не было</span>';
   if (c) {
     const res = c.bad
@@ -120,7 +121,7 @@ function renderCheck() {
     ["Раз в сутки", dailyCell(i.daily)],
   ]);
   const hints = [];
-  if (!cron) hints.push("Добавить в cron: <code>sudo crontab -e</code>, строка <code>*/5 * * * * /usr/local/bin/iof check >/dev/null 2>&1</code>");
+  if (!cron) hints.push("В «Задачах панели» укажи расписание <code>*/5 * * * *</code> и команду <code>/usr/local/bin/iof check >/dev/null 2>&1</code>.");
   if (tgHint) hints.push(tgHint);
   if ((i.bot || i.tg) && c) hints.push("В Telegram уходит сообщение, только когда состояние узла меняется.");
   hints.push("Раз в сутки <code>iof check</code> ещё проверяет, вышла ли новая версия iof и отвечают ли с узлов российские серверы (<code>RU_TARGETS</code> в <code>/root/iof/iof.env</code>): об этом бот пишет тем, кому отмечены «Обновления iof» и «Доступ к РФ». Сейчас: <code>sudo iof check --daily</code>.");
@@ -148,7 +149,8 @@ function dailyCell(d) {
 
 function renderNightly() {
   const i = svc.info, n = i.nightly, local = i.nightly_local;
-  const cron = svc.schedule?.jobs.find((j) => j.kind === "nightly")?.schedule || i.cron.find((l) => l.includes("iof-nightly"));
+  const cron = svc.schedule ? svc.schedule.jobs.find((j) => j.kind === "nightly")?.schedule
+    : i.cron.find((l) => l.includes("iof-nightly"));
   let last = '<span class="muted">ещё не было</span>';
   if (n) {
     const m = /с ошибкой: (\d+)/.exec(n.summary);
@@ -182,6 +184,9 @@ function renderNightly() {
 function renderSchedule() {
   const plan = svc.schedule;
   if (!plan) return;
+  const busy = !!svc.saving || !!svc.info?.migrate;
+  $("#cron-add").disabled = busy || !!plan.error;
+  for (const button of document.querySelectorAll(".cron-actions button")) button.disabled = busy;
   $("#schedule-zone").textContent = `Время управляющего сервера · ${plan.zone}`;
   for (const [kind, fallback] of Object.entries(scheduleDefaults)) {
     const data = plan.schedules[kind];
@@ -190,7 +195,6 @@ function renderSchedule() {
     const shown = data.time || fallback;
     if (!input.dataset.saved || input.value === input.dataset.saved) input.value = shown;
     input.dataset.saved = shown;
-    const busy = !!svc.saving || !!svc.info?.migrate;
     input.disabled = busy || !!data.error;
     form.querySelector("button").disabled = input.disabled;
     form.querySelector("[data-state]").textContent = svc.saving === kind ? "Сохраняю…"
@@ -203,7 +207,7 @@ function renderCronTasks() {
   const open = new Set([...list.querySelectorAll("details[open]")].map((d) => d.dataset.id));
   const plan = svc.schedule;
   $("#cron-count").textContent = plan.jobs.length || "";
-  list.innerHTML = plan.jobs.map((j) => {
+  list.innerHTML = plan.jobs.map((j, index) => {
     const id = `${j.source}:${j.number}`;
     return `<li><details data-id="${esc(id)}"${open.has(id) ? " open" : ""}>
       <summary><span class="item-title">${esc(j.title)}</span><span class="item-meta">${esc(cronHuman(j.schedule) || j.schedule)}</span></summary>
@@ -214,8 +218,113 @@ function renderCronTasks() {
         ["Источник", `<code>${esc(j.source)}</code>`],
       ])}</dl>
       <pre class="code cron-command">${esc(j.command)}</pre>
+      ${j.revision ? `<div class="actions cron-actions" data-index="${index}">
+        ${j.type === "script" ? "" : `<button class="btn small" type="button" data-cron-action="edit">${j.managed ? "Изменить время" : "Изменить"}</button>`}
+        <button class="btn small danger" type="button" data-cron-action="delete">${j.type === "script" ? "Отключить" : "Удалить"}</button>
+      </div>` : ""}
     </details></li>`;
   }).join("") || `<li class="empty">${plan.error ? "Список cron недоступен." : "Заданий cron пока нет."}</li>`;
+}
+
+function applySchedule(plan) {
+  svc.schedule = plan;
+  formError(plan.error, "#schedule-error");
+  renderCronTasks();
+  renderSchedule();
+  if (svc.info) {
+    renderCheck();
+    renderNightly();
+  }
+}
+
+function cronFields() {
+  const source = $("#cron-source").value;
+  const anacron = svc.schedule.sources.find((s) => s.path === source)?.type === "anacron";
+  $("#cron-user").disabled = anacron || source === "user" && !!svc.cronTarget;
+  if (anacron) $("#cron-user").value = "root";
+  $("#cron-expression").placeholder = anacron ? "1 5 my-job" : "30 5 * * 1-5";
+  $("#cron-format").textContent = anacron ? "Период в днях, задержка в минутах и имя задания."
+    : "Минуты, часы, день месяца, месяц, день недели. Можно ввести @reboot или @daily.";
+}
+
+function openCronDialog(action, job = null) {
+  if (!svc.schedule || svc.saving || svc.info?.migrate) return;
+  if (action === "edit" && job.managed && !$("#schedule-reach-time").disabled) {
+    $("#schedule-reach-time").focus();
+    return;
+  }
+  svc.cronTarget = job;
+  svc.cronAction = action;
+  const deleting = action === "delete";
+  const script = job?.type === "script";
+  $("#cron-fields").hidden = deleting;
+  $("#cron-delete-details").hidden = !deleting;
+  const submit = $("#cron-submit");
+  submit.classList.toggle("danger", deleting);
+  submit.classList.toggle("primary", !deleting);
+  submit.textContent = deleting ? (script ? "Отключить" : "Удалить") : "Сохранить";
+  $("#cron-dialog-title").textContent = deleting ? (script ? "Отключить скрипт cron?" : "Удалить задание cron?")
+    : action === "edit" ? "Изменить задание cron" : "Добавить задание cron";
+  formError("", "#cron-edit-error");
+  if (deleting) {
+    $("#cron-delete-note").textContent = script ? "Скрипт потеряет право на исполнение, и run-parts пропустит его."
+      : job.managed ? "Будут удалены ежедневный запуск проверки из РФ и её запуск после перезагрузки."
+      : `Расписание ${job.schedule} · ${job.user} · ${job.source}`;
+    $("#cron-delete-command").textContent = job.command;
+  } else {
+    const source = $("#cron-source");
+    const paths = new Set(svc.schedule.sources.map((s) => s.path));
+    if (job && job.type !== "user") paths.add(job.source);
+    source.replaceChildren(new Option("Crontab пользователя", "user"), ...[...paths].map((p) => new Option(p, p)));
+    source.value = job && job.type !== "user" ? job.source : "user";
+    source.disabled = !!job;
+    const users = new Set(svc.schedule.users);
+    if (job) users.add(job.user);
+    $("#cron-user").replaceChildren(...[...users].map((u) => new Option(u, u)));
+    $("#cron-user").value = job?.user || "root";
+    $("#cron-expression").value = job?.schedule || "";
+    $("#cron-command").value = job?.command || "";
+    cronFields();
+  }
+  $("#cron-dialog").showModal();
+  $(deleting ? "#cron-cancel" : "#cron-expression").focus();
+}
+
+async function submitCron(event) {
+  event.preventDefault();
+  if (svc.saving) return;
+  const action = svc.cronAction;
+  const job = svc.cronTarget;
+  const data = { action, source: job?.source || $("#cron-source").value };
+  if (job) Object.assign(data, { number: job.number, revision: job.revision });
+  if (action !== "delete") {
+    Object.assign(data, { user: $("#cron-user").value, schedule: $("#cron-expression").value,
+      command: $("#cron-command").value });
+    if (!data.schedule.trim() || !data.command.trim()) {
+      formError("Введи расписание и команду.", "#cron-edit-error");
+      $(data.schedule.trim() ? "#cron-command" : "#cron-expression").focus();
+      return;
+    }
+  }
+  svc.saving = "cron";
+  $("#cron-submit").disabled = $("#cron-cancel").disabled = true;
+  formError("", "#cron-edit-error");
+  renderSchedule();
+  try {
+    applySchedule(DEMO ? demoChangeCron(data) : await postJson("api/service/schedule", data));
+    $("#cron-dialog").close();
+    const message = $("#cron-message");
+    message.textContent = action === "add" ? "Задание добавлено." : action === "edit" ? "Задание изменено."
+      : job.type === "script" ? "Скрипт отключён." : "Задание удалено.";
+    message.hidden = false;
+  } catch (e) {
+    formError(e.message, "#cron-edit-error");
+  } finally {
+    svc.saving = null;
+    $("#cron-submit").disabled = $("#cron-cancel").disabled = false;
+    renderSchedule();
+    if (!$("#cron-dialog").open) $("#cron-add").focus();
+  }
 }
 
 function renderReach() {
@@ -231,11 +340,7 @@ async function loadSchedule(request) {
   try {
     const plan = DEMO ? demoSchedule() : await getJson("api/service/schedule", request.signal);
     if (request !== svc.request || svc.saving || previous !== svc.schedule) return;
-    svc.schedule = plan;
-    formError(plan.error, "#schedule-error");
-    renderSchedule();
-    renderCronTasks();
-    if (svc.info) renderNightly();
+    applySchedule(plan);
   } catch (e) {
     if (request === svc.request) formError(`Не удалось загрузить расписание: ${e.message}`, "#schedule-error");
   }
@@ -249,10 +354,7 @@ async function saveSchedule(event, kind) {
   svc.saving = kind;
   renderSchedule();
   try {
-    svc.schedule = DEMO ? demoSchedule(kind, at) : await postJson("api/service/schedule", { task: kind, time: at });
-    formError(svc.schedule.error, "#schedule-error");
-    renderCronTasks();
-    if (svc.info) renderNightly();
+    applySchedule(DEMO ? demoSchedule(kind, at) : await postJson("api/service/schedule", { task: kind, time: at }));
   } catch (e) {
     formError(e.message, "#schedule-error");
   } finally {
@@ -451,8 +553,19 @@ document.addEventListener("DOMContentLoaded", () => {
   for (const kind of Object.keys(scheduleDefaults)) {
     $(`#schedule-${kind}`).addEventListener("submit", (event) => saveSchedule(event, kind));
   }
+  $("#cron-add").addEventListener("click", () => openCronDialog("add"));
+  $("#cron-tasks").addEventListener("click", (event) => {
+    const button = event.target.closest("[data-cron-action]");
+    if (!button) return;
+    const job = svc.schedule.jobs[button.closest(".cron-actions").dataset.index];
+    openCronDialog(button.dataset.cronAction, job);
+  });
+  $("#cron-form").addEventListener("submit", submitCron);
+  $("#cron-source").addEventListener("change", cronFields);
+  $("#cron-cancel").addEventListener("click", () => $("#cron-dialog").close());
+  $("#cron-dialog").addEventListener("cancel", (event) => { if (svc.saving) event.preventDefault(); });
   $("#load-cron-log").addEventListener("click", loadCronLog);
-  $('a[href="#cron-journal"]').addEventListener("click", () => {
+  $("#cron-journal-link").addEventListener("click", () => {
     if ($("#cron-log").hidden) loadCronLog();
   });
   loadInfo();

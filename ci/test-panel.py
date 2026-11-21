@@ -84,6 +84,62 @@ class CronSchedule(unittest.TestCase):
             self.assertEqual(root[0].count("check-from-ru --scheduled 04:20"), 2)
             self.assertEqual(root[0].count("@reboot"), 1)
             self.assertNotIn("04:10", root[0])
+            reboot = next(j for j in cron.view()["jobs"] if j["schedule"] == "@reboot")
+            cron.change({**reboot, "action": "delete"})
+            self.assertNotIn("check-from-ru", root[0])
+            self.assertTrue(root[0].startswith(other))
+
+    def test_change_system_job_keeps_file_metadata_and_checks_revision(self):
+        cron = web.iof_cron
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "iof-local"
+            existing = "MAILTO=root\n# Локальные задания\n5 2 * * * root /bin/true\n"
+            path.write_text(existing, encoding="utf-8")
+            path.chmod(0o640)
+            with mock_patch.object(cron, "CRON_DIR", path.parent), \
+                 mock_patch.object(cron, "command", return_value=SimpleNamespace(returncode=0)) as command:
+                cron.change({"action": "add", "source": str(path), "schedule": "@reboot",
+                             "command": r"date +\%F | logger", "user": "nobody"})
+                row, = [j for j in cron.tab_jobs(cron.read_tab(path), str(path), None) if j["schedule"] == "@reboot"]
+                cron.change({**row, "action": "edit", "schedule": "0 4 * * MON-FRI", "command": "echo готово"})
+                self.assertEqual(path.read_text(encoding="utf-8"), existing + "0 4 * * MON-FRI nobody echo готово\n")
+                self.assertEqual(path.stat().st_mode & 0o777, 0o640)
+                self.assertEqual(command.call_count, 2)
+                with self.assertRaises(cron.CronChanged):
+                    cron.change({**row, "action": "delete"})
+                current = list(cron.tab_jobs(cron.read_tab(path), str(path), None))[-1]
+                cron.change({**current, "action": "delete"})
+                self.assertEqual(path.read_text(encoding="utf-8"), existing)
+
+    def test_disable_periodic_script_preserves_contents(self):
+        cron = web.iof_cron
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp) / "cron.daily"
+            folder.mkdir()
+            path = folder / "backup"
+            path.write_text("#!/bin/sh\n/bin/true\n", encoding="utf-8")
+            path.chmod(0o751)
+            with mock_patch.object(cron, "PERIODIC", [folder]):
+                rev = cron.file_revision(path.stat())
+                cron.change({"action": "delete", "source": str(folder), "number": path.name, "revision": rev})
+                self.assertEqual(path.stat().st_mode & 0o777, 0o640)
+                self.assertEqual(path.read_text(encoding="utf-8"), "#!/bin/sh\n/bin/true\n")
+                with self.assertRaises(cron.CronChanged):
+                    cron.change({"action": "delete", "source": str(folder), "number": path.name, "revision": rev})
+
+    def test_user_crontab_list_and_edit_use_same_view_of_spool(self):
+        cron = web.iof_cron
+        with tempfile.TemporaryDirectory() as tmp:
+            spool = Path(tmp)
+            tab = spool / "nobody"
+            job = "@reboot /bin/true\n"
+            tab.write_text("# cron spool header\n" + job, encoding="utf-8")
+            with mock_patch.object(cron, "CRON_SPOOL", spool), mock_patch.object(cron, "system_tabs", return_value=[]), \
+                 mock_patch.object(cron, "PERIODIC", []), mock_patch.object(cron, "crontab", return_value=job), \
+                 mock_patch.object(cron, "install_crontab") as install:
+                row, = cron.system_jobs()
+                cron.change({**row, "action": "edit", "schedule": "@daily"})
+                install.assert_called_once_with("nobody", job, ["@daily /bin/true"])
 
     def test_system_jobs_are_visible_and_leave_existing_nightly_untouched(self):
         cron = web.iof_cron

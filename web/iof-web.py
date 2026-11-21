@@ -2107,9 +2107,14 @@ class Handler(BaseHTTPRequestHandler):
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 if read_migrate(base):
                     raise ValueError("Расписание можно изменить после завершения переноса управления.")
-                iof_cron.save(body)
+                if "action" in body:
+                    iof_cron.change(body)
+                else:
+                    iof_cron.save(body)
         except BlockingIOError:
             return self.send_json({"error": "Идёт настройка или перенос. Повтори после завершения."}, HTTPStatus.CONFLICT)
+        except iof_cron.CronChanged as e:
+            return self.send_json({"error": str(e)}, HTTPStatus.CONFLICT)
         except ValueError as e:
             return self.send_json({"error": str(e)}, HTTPStatus.BAD_REQUEST)
         except (OSError, subprocess.SubprocessError) as e:

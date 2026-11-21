@@ -196,33 +196,74 @@ function demoNode(name) {
   });
 }
 
-const demoCronTimes = { nightly: "04:00", reach: "" };
+const demoCronSpool = "/var/spool/cron/crontabs/";
+const demoCronRoot = demoCronSpool + "root";
+const demoCronJobs = [];
+let demoCronNumber = 0;
+
+function demoCronRow(schedule, command, { source = demoCronRoot, user = "root", kind = "", title = command,
+  description = "", managed = "" } = {}) {
+  return { number: demoCronNumber++, revision: "demo", source, user, schedule, command, kind, title, description,
+    managed, type: source.startsWith(demoCronSpool) ? "user" : "system" };
+}
+
+demoCronJobs.push(
+  demoCronRow("0 4 * * *", "/usr/local/sbin/iof-nightly", { kind: "nightly", title: "Ночное обслуживание",
+    description: "Обновляет пакеты и перезагружает зарегистрированные узлы." }),
+  demoCronRow("*/5 * * * *", "/usr/local/bin/iof check >/dev/null 2>&1", { kind: "check", title: "Проверка состояния узлов",
+    description: "Опрашивает службы и ресурсы узлов." }),
+  demoCronRow("17 * * * *", "cd / && run-parts --report /etc/cron.hourly", { source: "/etc/crontab", title: "run-parts /etc/cron.hourly" }),
+);
 
 function demoSchedule(task, at) {
-  if (task) demoCronTimes[task] = at;
-  const root = "/var/spool/cron/crontabs/root";
-  const expression = (time) => {
-    const [hour, minute] = time.split(":").map(Number);
-    return `${minute} ${hour} * * *`;
-  };
-  const row = (number, kind, title, description, schedule, command, source = root) =>
-    ({ number, kind, title, description, schedule, command, source, user: "root" });
-  const jobs = [
-    row(0, "nightly", "Ночное обслуживание", "Обновляет пакеты и перезагружает зарегистрированные узлы.",
-      expression(demoCronTimes.nightly), "/usr/local/sbin/iof-nightly"),
-    row(1, "check", "Проверка состояния узлов", "Опрашивает службы и ресурсы узлов.",
-      "*/5 * * * *", "/usr/local/bin/iof check >/dev/null 2>&1"),
-    row(0, "", "run-parts /etc/cron.hourly", "", "17 * * * *", "cd / && run-parts --report /etc/cron.hourly", "/etc/crontab"),
-  ];
-  if (demoCronTimes.reach) {
-    const cmd = `umask 077; /usr/local/bin/iof check-from-ru --scheduled ${demoCronTimes.reach} 1795224000 >>/var/log/iof-check-from-ru.log 2>&1`;
-    const desc = "Проверяет DNS, ping и TCP до SSH-портов узлов с управляющего сервера.";
-    jobs.splice(1, 0, row(2, "reach", "Доступность из РФ", desc, expression(demoCronTimes.reach), cmd),
-      row(3, "reach", "Доступность из РФ", "Догоняет пропущенный запуск после перезагрузки.", "@reboot", cmd));
+  if (task) {
+    const existing = demoCronJobs.findIndex((job) => job.kind === task);
+    if (existing !== -1) demoCronJobs.splice(existing, task === "reach" ? 2 : 1);
+    const [hour, minute] = at.split(":").map(Number);
+    const when = `${minute} ${hour} * * *`;
+    const index = existing === -1 ? 0 : existing;
+    if (task === "nightly") {
+      demoCronJobs.splice(index, 0, demoCronRow(when, "/usr/local/sbin/iof-nightly",
+        { kind: task, title: "Ночное обслуживание", description: "Обновляет пакеты и перезагружает зарегистрированные узлы." }));
+    } else {
+      const cmd = `umask 077; /usr/local/bin/iof check-from-ru --scheduled ${at} 1795224000 >>/var/log/iof-check-from-ru.log 2>&1`;
+      const meta = { kind: task, managed: task, title: "Доступность из РФ" };
+      demoCronJobs.splice(index, 0, demoCronRow(when, cmd, meta),
+        demoCronRow("@reboot", cmd, { ...meta, description: "Догоняет пропущенный запуск после перезагрузки." }));
+    }
   }
-  const schedules = Object.fromEntries(Object.entries(demoCronTimes).map(([kind, time]) =>
-    [kind, { time, installed: !!time, error: "" }]));
-  return { jobs, schedules, zone: "UTC", error: "" };
+  const schedules = Object.fromEntries(["nightly", "reach"].map((kind) => {
+    const job = demoCronJobs.find((j) => j.kind === kind);
+    const match = /^(\d+) (\d+) \* \* \*$/.exec(job?.schedule || "");
+    const time = match ? `${match[2].padStart(2, "0")}:${match[1].padStart(2, "0")}` : "";
+    return [kind, { time, installed: !!job, error: job && !time ? "Это задание можно изменить в разделе «Задачи панели»." : "" }];
+  }));
+  return { jobs: [...demoCronJobs], schedules, zone: "UTC", error: "", users: ["root", "admin", "nobody"],
+    sources: [{ path: "/etc/crontab", type: "system" }] };
+}
+
+function demoChangeCron(data) {
+  const index = demoCronJobs.findIndex((j) => j.source === data.source && j.number === data.number);
+  const job = demoCronJobs[index];
+  if (data.action !== "add" && !job) throw new Error("Задание изменилось. Обнови страницу.");
+  if (data.action === "delete") {
+    if (job.managed) {
+      const daily = demoCronJobs.findIndex((j) => j.managed === job.managed);
+      demoCronJobs.splice(daily, 2);
+    } else demoCronJobs.splice(index, 1);
+  } else {
+    const when = data.schedule.trim().replace(/\s+/g, " ");
+    const cmd = data.command.trim();
+    if (!/^(?:@[a-z]+|(?:[\w*,/\-]+ ){4}[\w*,/\-]+)$/.test(when) || /[\r\n]/.test(cmd)) {
+      throw new Error("Проверь расписание и введи команду в одну строку.");
+    }
+    const source = data.source === "user" ? demoCronSpool + data.user : data.source;
+    const meta = cmd === job?.command ? job : {};
+    const row = demoCronRow(when, cmd, { ...meta, source, user: data.user });
+    if (job) demoCronJobs.splice(index, 1, { ...row, number: job.number });
+    else demoCronJobs.push(row);
+  }
+  return demoSchedule();
 }
 
 function demoCronLog() {

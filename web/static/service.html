@@ -169,9 +169,13 @@
         <section class="card" aria-labelledby="tasks-title">
           <div class="card-head">
             <h2 id="tasks-title">Задачи панели</h2>
-            <a href="#cron-journal">Журнал cron</a>
+            <div class="controls">
+              <a id="cron-journal-link" class="btn small" href="#cron-journal">Журнал cron</a>
+              <button id="cron-add" class="btn small primary" type="button" disabled>Добавить задание</button>
+            </div>
           </div>
           <h3 class="sub-head">Задания cron на управляющем сервере <span id="cron-count" class="count"></span></h3>
+          <p id="cron-message" class="hint pad" role="status" hidden></p>
           <ul id="cron-tasks" class="jobs"></ul>
           <h3 class="sub-head">Запуски из панели <span id="jobs-count" class="count"></span></h3>
           <p class="hint pad">Последние 10, хранятся до перезапуска панели.</p>
@@ -192,5 +196,40 @@
       <footer class="foot">Island of Freedom · by mEldevlp - <a href="https://github.com/mEldevlp">https://github.com/mEldevlp</a></footer>
     </div>
   </div>
+
+  <dialog id="cron-dialog" class="dialog" aria-labelledby="cron-dialog-title">
+    <div class="dialog-head"><h2 id="cron-dialog-title">Задание cron</h2></div>
+    <form id="cron-form" class="dialog-body">
+      <div id="cron-fields" class="dialog-body">
+        <div class="dialog-field">
+          <label for="cron-source">Хранить в</label>
+          <select id="cron-source"></select>
+        </div>
+        <div class="dialog-field">
+          <label for="cron-user">Запускать от имени</label>
+          <select id="cron-user"></select>
+        </div>
+        <div class="field">
+          <label for="cron-expression">Расписание</label>
+          <input id="cron-expression" type="text" spellcheck="false" autocomplete="off" aria-describedby="cron-format">
+          <p id="cron-format" class="hint"></p>
+        </div>
+        <div class="field">
+          <label for="cron-command">Команда</label>
+          <textarea id="cron-command" rows="3" spellcheck="false" autocomplete="off"></textarea>
+          <p class="hint">Одна строка shell с аргументами и перенаправлениями.</p>
+        </div>
+      </div>
+      <div id="cron-delete-details" class="dialog-body" hidden>
+        <p id="cron-delete-note"></p>
+        <pre id="cron-delete-command" class="code"></pre>
+      </div>
+      <p id="cron-edit-error" class="form-error" role="alert" hidden></p>
+      <div class="actions">
+        <button id="cron-submit" class="btn primary" type="submit">Сохранить</button>
+        <button id="cron-cancel" class="btn" type="button">Отмена</button>
+      </div>
+    </form>
+  </dialog>
 </body>
 </html>
