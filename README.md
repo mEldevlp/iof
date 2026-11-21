@@ -27,19 +27,19 @@ Hysteria 2 и Amnezia 2.0. Позволяет следить за состоян
 ![Веб-панель: обзор всех серверов](docs/panel-overview.png)
 
 <details>
-<summary>Ещё скриншоты: ссылки Hysteria2, аудит безопасности, терминал, добавление сервера, Telegram-бот</summary>
-
-![Веб-панель: страница сервера](docs/panel-node.png)
+<summary>Ещё скриншоты веб-панели</summary>
 
 ![Веб-панель: группы ссылок Hysteria2](docs/panel-hy2.png)
 
-![Веб-панель: аудит безопасности серверов](docs/panel-security.png)
+![Веб-панель: клиенты и узлы AmneziaWG](docs/panel-awg.png)
 
-![Веб-панель: терминал на сервер в браузере](docs/panel-terminal.png)
+![Веб-панель: аудит безопасности серверов](docs/panel-security.png)
 
 ![Веб-панель: добавление сервера](docs/panel-add.png)
 
 ![Веб-панель: Telegram-бот](docs/panel-bot.png)
+
+![Веб-панель: обновления и расписание обслуживания](docs/panel-service.png)
 
 </details>
 
@@ -100,14 +100,3 @@ sudo iof status
 ```bash
 sudo iof update --release
 ```
-
-Если установленная версия появилась до `v0.9`, сначала установите `v0.9` из клона:
-
-```bash
-sudo git -C /opt/iof fetch origin tag v0.9
-sudo git -C /opt/iof checkout --detach v0.9
-sudo bash /opt/iof/install.sh
-```
-
-Первый [релиз iof](https://github.com/mEldevlp/iof/releases) имеет номер `v0.9`. После успешной проверки
-нового коммита `master` GitHub Actions выпускает следующую версию: `v0.10`, `v0.11` и далее.
