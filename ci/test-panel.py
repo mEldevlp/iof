@@ -3,14 +3,16 @@
 import base64
 import html
 import importlib.util
+from io import BytesIO
 import json
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from threading import Event
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch as mock_patch
 import zlib
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,6 +28,118 @@ def module(name, path):
 
 bot = module("iof_bot", "web/iof_bot.py")
 web = module("iof_web", "web/iof-web.py")
+
+
+class Dashboard(unittest.TestCase):
+    def test_controller_before_and_after_migrate_finish(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            conf = base / "nodes.conf"
+            conf.write_text("node-a | 10.0.0.1 | root@a\nold | 8.8.8.8 | local | Старый\n"
+                            "node-b | 10.0.0.2 | root@b\nberlin | 77.1.2.3 | root@new:22 | Новый\n",
+                            encoding="utf-8")
+            nodes = [{"name": n} for n in ("node-a", "old", "node-b", "berlin")]
+            handler = web.Handler.__new__(web.Handler)
+            handler.server = SimpleNamespace(base=base, cache=Mock())
+            handler.send_json = Mock()
+            handler.server.cache.get.side_effect = lambda _: {"nodes": nodes}
+
+            def names():
+                handler.dashboard(False)
+                rows = handler.send_json.call_args.args[0]["nodes"]
+                self.assertTrue(all(not n["controller"] for n in rows[1:]))
+                return [(n["name"], n["controller"]) for n in rows]
+
+            before = [("old", True), ("node-a", False), ("node-b", False), ("berlin", False)]
+            self.assertEqual(names(), before)
+            subprocess.run(["bash", "-c", 'source lib/migrate.sh; migrate_nodes_conf "$1" root@old:2222 root@new',
+                            "migrate-test", str(conf)], cwd=ROOT, check=True)
+            self.assertIn("old | 8.8.8.8 | root@old:2222 | Старый", conf.read_text(encoding="utf-8"))
+            self.assertIn("berlin | 77.1.2.3 | local | Новый", conf.read_text(encoding="utf-8"))
+            state = base / "migrate.conf"
+            state.write_text("role=target\nid=test\npeer=root@old:2222\n", encoding="utf-8")
+            self.assertEqual(names(), before)
+            subprocess.run(["bash", "-c", '''
+set -euo pipefail
+source lib/common.sh
+BASE="$1"; MIGRATE_FILE="$BASE/migrate.conf"
+source lib/migrate.sh
+run_on() { [[ "$1 $2 $3" == 'root@old:2222 n_migrate_demote test' ]]; }
+migrate_finish
+''', "migrate-test", str(base)], cwd=ROOT, capture_output=True, check=True)
+            self.assertFalse(state.exists())
+            self.assertEqual(names(), [("berlin", True), ("node-a", False), ("old", False), ("node-b", False)])
+            self.assertTrue(all("controller" not in node for node in nodes))
+
+            conf.write_text(conf.read_text(encoding="utf-8").replace("| local |", "| root@new |"), encoding="utf-8")
+            self.assertEqual(names(), [(node["name"], False) for node in nodes])
+
+    def test_countries_ip_and_domain_change_and_retry_after_outage(self):
+        now = Mock(return_value=1000)
+        dns = Mock(return_value=SimpleNamespace(stdout="10.0.0.1 STREAM\n8.8.8.8 STREAM\n"))
+        cache = web.CountryCache()
+        addrs = ["vpn.example", "8.8.8.8", "10.0.0.2", "224.0.0.1"]
+
+        def poll():
+            self.assertTrue(cache.get(addrs)["pending"])
+            cache.worker.join(2)
+            self.assertFalse(cache.worker.is_alive())
+            result = cache.get(addrs)
+            self.assertFalse(result["pending"])
+            return result["countries"]
+
+        with mock_patch.object(web.time, "monotonic", now), mock_patch.object(web.subprocess, "run", dns), \
+                mock_patch.object(web, "urlopen") as source:
+            source.return_value = BytesIO(b'[{"ip":"8.8.8.8","country":"US"}]')
+            self.assertEqual(poll(), {"vpn.example": "US", "8.8.8.8": "US"})
+            self.assertEqual(json.loads(source.call_args.args[0].data), ["8.8.8.8"])
+            self.assertEqual(dns.call_args.args[0], ["getent", "--", "ahosts", "vpn.example"])
+            self.assertEqual(dns.call_count, 1)
+
+            now.return_value += 61
+            dns.return_value.stdout = "77.1.2.3 STREAM\n"
+            source.side_effect = TimeoutError
+            self.assertEqual(poll(), {"8.8.8.8": "US"})
+            self.assertEqual(json.loads(source.call_args.args[0].data), ["77.1.2.3"])
+            now.return_value += 61
+            self.assertEqual(poll(), {"8.8.8.8": "US"})
+            self.assertEqual(source.call_count, 2)
+
+            now.return_value += 300
+            source.side_effect = None
+            source.return_value = BytesIO(b'[{"ip":"77.1.2.3","country":"DE"}]')
+            self.assertEqual(poll(), {"vpn.example": "DE", "8.8.8.8": "US"})
+            self.assertEqual(source.call_count, 3)
+
+    def test_countries_endpoint_does_not_wait_for_lookup_or_probe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = web.CountryCache()
+            base = Path(tmp)
+            (base / "nodes.conf").write_text("home | 8.8.8.8 | root@77.1.2.3\n", encoding="utf-8")
+            handler = web.Handler.__new__(web.Handler)
+            handler.server = SimpleNamespace(base=base, countries=cache, hosts={"localhost"}, password="")
+            handler.headers = {"Host": "localhost"}
+            handler.path = "/api/nodes/countries"
+            handler.send_json = Mock()
+            started, release = Event(), Event()
+
+            def lookup(ips):
+                started.set()
+                release.wait(3)
+                return dict.fromkeys(ips, "US")
+
+            with mock_patch.object(web, "lookup_countries", side_effect=lookup) as source:
+                try:
+                    handler.do_GET()
+                    self.assertTrue(started.wait(2))
+                    handler.do_GET()
+                    handler.send_json.assert_called_with({"countries": {}, "pending": True})
+                    source.assert_called_once_with(["8.8.8.8"])
+                finally:
+                    release.set()
+                    cache.worker.join(2)
+                handler.do_GET()
+                handler.send_json.assert_called_with({"countries": {"8.8.8.8": "US"}, "pending": False})
 
 
 class GroupLinks(unittest.TestCase):

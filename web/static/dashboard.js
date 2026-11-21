@@ -4,6 +4,36 @@
 
 // Отрисовка
 
+const countryNames = new Intl.DisplayNames("ru", { type: "region", fallback: "none" });
+let nodeCountries = {};
+let countriesTimer, countriesLoading = false, lastOverview;
+
+function countryFlag(code) {
+  if (!/^[A-Z]{2}$/.test(code) || code === "ZZ") return "";
+  const name = countryNames.of(code);
+  if (!name) return "";
+  const flag = String.fromCodePoint(...Array.from(code, (c) => c.charCodeAt(0) - 65 + 0x1f1e6));
+  return `<span class="node-flag" role="img" aria-label="${esc(name)}" title="${esc(name)}">${flag}</span>`;
+}
+
+async function loadNodeCountries() {
+  if (countriesLoading) return;
+  clearTimeout(countriesTimer);
+  countriesLoading = true;
+  try {
+    const { countries, pending } = await getJson("api/nodes/countries");
+    if (JSON.stringify(countries) !== JSON.stringify(nodeCountries)) {
+      nodeCountries = countries;
+      renderNodes(overview.state.data);
+    }
+    if (pending) countriesTimer = setTimeout(loadNodeCountries, 1500);
+  } catch {
+    // Сбой геоданных не меняет состояние узлов. Повторим при следующем обновлении обзора.
+  } finally {
+    countriesLoading = false;
+  }
+}
+
 function renderHealth(d) {
   const el = $("#health");
   const nodes = d.nodes;
@@ -91,15 +121,19 @@ function renderKpis(d) {
 function nodeRow(n) {
   const level = nodeLevel(n);
   const tip = [...n.issues, ...warnings(n)].join("; ") || "в порядке";
+  const rowClass = `${n.controller ? "is-controller" : ""} ${level === "good" ? "" : "is-" + level}`.trim();
+  const flag = countryFlag(DEMO ? n.country : nodeCountries[n.addr]);
   const head = `<td class="cell-node"><div class="node-cell"><span title="${esc(tip)}">${icon(level)}</span><div>
-      <div class="node-name"><a class="node-link" href="${nodeHref(n.name)}">${esc(n.name)}</a></div>
+      <div class="node-name"><a class="node-link" href="${nodeHref(n.name)}">${esc(n.name)}</a>${flag}</div>
       ${n.title && n.title !== n.name ? `<span class="sub-line">${esc(n.title)}</span>` : ""}
+      ${n.controller ? '<span class="sub-line">Управляющий сервер</span>' : ""}
     </div></div></td>
     <td data-label="Адрес"><span class="mono">${esc(n.addr)}</span></td>`;
+  const row = `<tr class="${rowClass}" data-href="${nodeHref(n.name)}">${head}`;
   if (!n.reachable) {
-    return `<tr class="is-crit" data-href="${nodeHref(n.name)}">${head}<td class="cell-wide offline" colspan="7">${badge("crit", "нет связи по SSH")}</td></tr>`;
+    return `${row}<td class="cell-wide offline" colspan="7">${badge("crit", "нет связи по SSH")}</td></tr>`;
   }
-  return `<tr class="${level === "good" ? "" : "is-" + level}" data-href="${nodeHref(n.name)}">${head}
+  return `${row}
     <td data-label="Hysteria2" class="cell-proto">${hy2Cell(n)}</td>
     <td data-label="AmneziaWG" class="cell-proto">${awgCell(n)}</td>
     <td data-label="ЦП">${meter("ЦП", n.cpu.pct, 90, 0, `LA ${n.cpu.load1} · ${n.cpu.cpus} ${plural(n.cpu.cpus, ["ядро", "ядра", "ядер"])}`)}</td>
@@ -163,7 +197,7 @@ const overview = startPage({
     const d = await demoDashboard();
     if (["setup", "template-only", "setup-error"].includes(setupDemo)) {
       d.nodes = setup.info && setup.info.nodes ? d.nodes.slice(0, 1) : [];
-      if (d.nodes.length && setup.info.local) Object.assign(d.nodes[0], setup.info.local);
+      if (d.nodes.length && setup.info.local) Object.assign(d.nodes[0], setup.info.local, { country: null });
     }
     return d;
   },
@@ -184,6 +218,10 @@ const overview = startPage({
     renderRelays(d);
     renderHy2(d);
     renderAwg(d);
+    if (!DEMO && lastOverview !== d) {
+      lastOverview = d;
+      loadNodeCountries();
+    }
   },
 });
 

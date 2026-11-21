@@ -94,8 +94,11 @@ function demoGroupNodes(g) {
 }
 
 function demoDashboard() {
+  const status = demoStatus();
+  const countries = { "192.0.2.10": "FI", "198.51.100.20": "NL", "203.0.113.30": "DE", "203.0.113.43": "SE" };
   return demoDelay({
-    ...demoStatus(),
+    ...status,
+    nodes: status.nodes.map((n) => ({ ...n, controller: n.addr === "192.0.2.10", country: countries[n.addr] })),
     relays: DEMO_RELAYS,
     hy2_groups: demoState.groups.map(({ name, label, created }) => ({ name, label, created })),
     awg_clients: demoState.awgClients,

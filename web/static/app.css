@@ -329,11 +329,20 @@ table.nodes { width: 100%; border-collapse: collapse; font-variant-numeric: tabu
 .nodes th:last-child, .nodes td:last-child { padding-right: 16px; }
 .nodes tbody tr:last-child td { border-bottom: 0; }
 .nodes tbody tr:hover td { background: color-mix(in srgb, var(--surface-2) 60%, transparent); }
+.nodes tr.is-controller { background: color-mix(in srgb, var(--accent) 6%, var(--surface)); }
+.nodes tr.is-controller:is(:hover, :focus-within) { background: color-mix(in srgb, var(--accent) 12%, var(--surface)); }
+.nodes tbody tr.is-controller:hover td { background: none; }
 .nodes tr.is-crit td:first-child { box-shadow: inset 3px 0 0 var(--crit); }
 .nodes tr.is-warn td:first-child { box-shadow: inset 3px 0 0 var(--warn); }
 .nodes .num { text-align: right; }
 .nodes .col-meter { width: 112px; }
-.node-name { font-weight: 500; }
+.node-name { display: flex; align-items: center; gap: 6px; font-weight: 500; }
+@font-face {
+  font-family: "Twemoji Country Flags";
+  src: url("TwemojiCountryFlags.woff2") format("woff2");
+  font-display: block;
+}
+.node-flag { font: 16px/1 "Twemoji Country Flags", sans-serif; }
 .node-cell { display: flex; gap: 8px; align-items: flex-start; }
 .node-cell .ico { margin-top: 3px; }
 .offline { color: var(--ink-2); }

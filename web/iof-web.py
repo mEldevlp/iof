@@ -46,9 +46,11 @@ import termios
 import threading
 import time
 from http import HTTPStatus
+from http.client import HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.request import Request, urlopen
 
 # Telegram-бот: модуль рядом с панелью. Если он не загрузился, панель работает без бота
 try:
@@ -89,6 +91,7 @@ STATIC_FILES = {
     "/xterm.css": ("xterm.css", "text/css; charset=utf-8"),
     "/app.css": ("app.css", "text/css; charset=utf-8"),
     "/favicon.svg": ("favicon.svg", "image/svg+xml"),
+    "/TwemojiCountryFlags.woff2": ("TwemojiCountryFlags.woff2", "font/woff2"),
 }
 
 # Логи ночного обслуживания: запуск с управляющего сервера и сама работа на этом сервере как узле
@@ -242,6 +245,99 @@ class StatusCache:
     def failed(t0, msg):
         return {"status_at": time.time(), "probe_s": round(time.time() - t0, 2),
                 "status_error": msg, "nodes": []}
+
+
+def public_ip(value):
+    try:
+        ip = ipaddress.ip_address(value)
+    except ValueError:
+        return None
+    if ip.version == 6 and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    return ip if ip.is_global and not (ip.is_multicast or ip.is_reserved) else None
+
+
+def resolve_node_ip(addr):
+    """Клиентский адрес: публичный IPv4 первым, IPv6 для домена без публичного IPv4."""
+    try:
+        ipaddress.ip_address(addr)
+    except ValueError:
+        try:
+            result = subprocess.run(["getent", "--", "ahosts", addr], capture_output=True,
+                                    text=True, encoding="ascii", errors="replace", timeout=3, check=True)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        ips = (public_ip(line.partition(" ")[0]) for line in result.stdout.splitlines())
+        ip = min((ip for ip in ips if ip is not None), key=lambda ip: ip.version, default=None)
+    else:
+        ip = public_ip(addr)
+    return str(ip) if ip is not None else None
+
+
+def lookup_countries(ips):
+    """Запрос к базе геолокации: передаём только публичные IP, без имён и SSH-адресов."""
+    request = Request("https://api.country.is/", data=json.dumps(ips).encode("ascii"),
+                      headers={"Content-Type": "application/json"})
+    try:
+        with urlopen(request, timeout=4) as response:
+            rows = json.loads(response.read(16384))
+    except (OSError, ValueError, HTTPException):
+        return {}
+    if not isinstance(rows, list):
+        return {}
+    return {row["ip"]: row["country"] for row in rows
+            if isinstance(row, dict) and row.get("ip") in ips
+            and isinstance(row.get("country"), str) and re.fullmatch(r"[A-Z]{2}", row["country"])}
+
+
+class CountryCache:
+    """Один фоновый поток на панель. HTTP-обработчик читает кэш, пока DNS и геосервис отвечают."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.addresses = {}
+        self.countries = {}
+        self.worker = None
+
+    def get(self, addresses):
+        now = time.monotonic()
+        countries, pending = {}, []
+        with self.lock:
+            for addr in dict.fromkeys(addresses):
+                resolve_at, ip = self.addresses.get(addr, (0, None))
+                lookup_at, country = self.countries.get(ip, (0, None))
+                if country:
+                    countries[addr] = country
+                if now >= resolve_at or (ip and now >= lookup_at):
+                    pending.append(addr)
+            if pending and (self.worker is None or not self.worker.is_alive()):
+                self.worker = threading.Thread(target=self.refresh, args=(pending,), daemon=True, name="iof-country")
+                self.worker.start()
+        return {"countries": countries, "pending": bool(pending)}
+
+    def refresh(self, addresses):
+        missing = set()
+        for addr in addresses:
+            with self.lock:
+                resolve_at, ip = self.addresses.get(addr, (0, None))
+            if time.monotonic() >= resolve_at:
+                ip = resolve_node_ip(addr)
+                with self.lock:
+                    self.addresses[addr] = (time.monotonic() + 60, ip)
+            with self.lock:
+                lookup_at, _ = self.countries.get(ip, (0, None))
+            if ip and time.monotonic() >= lookup_at:
+                missing.add(ip)
+        ips = sorted(missing)
+        # Геосервис принимает до 100 адресов в запросе.
+        for start in range(0, len(ips), 100):
+            batch = ips[start:start + 100]
+            result = lookup_countries(batch)
+            now = time.monotonic()
+            with self.lock:
+                for ip in batch:
+                    country = result.get(ip)
+                    self.countries[ip] = (now + (86400 if country else 300), country)
 
 
 # Файлы iof
@@ -418,6 +514,19 @@ def read_migrate(base):
         return None
     return {"role": kv["role"], "peer": kv.get("peer", ""), "self": kv.get("self", ""),
             "started": kv.get("started", "")}
+
+
+def dashboard_nodes(base, nodes, migrate):
+    """Порядок меняется только на Обзоре, без изменения общего кэша статусов."""
+    rows = read_conf(base / "nodes.conf", 4)
+    if migrate and migrate["role"] == "target":
+        # В копии nodes.conf запись local уже новая, но до finish управляет ещё старый сервер.
+        peer = migrate["peer"].removesuffix(":22")
+        name = next((n for n, _, ssh, _ in rows if peer and ssh.removesuffix(":22") == peer), None)
+    else:
+        name = next((n for n, _, ssh, _ in rows if ssh in ("", "local")), None)
+    return sorted((dict(node, controller=node["name"] == name) for node in nodes),
+                  key=lambda node: not node["controller"])
 
 
 def read_check(base):
@@ -1816,6 +1925,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json({"error": str(e)}, HTTPStatus.NOT_FOUND)
         if url.path == "/api/nodes/add-info":
             return self.add_info()
+        if url.path == "/api/nodes/countries":
+            rows = read_conf(self.server.base / "nodes.conf", 4)
+            return self.send_json(self.server.countries.get(addr for _, addr, _, _ in rows if addr))
         if url.path == "/api/migrate":
             return self.migrate_info()
         if url.path == "/api/node":
@@ -1976,12 +2088,14 @@ class Handler(BaseHTTPRequestHandler):
     def dashboard(self, force):
         base = self.server.base
         data = self.server.cache.get(force)
+        migrate = read_migrate(base)
         data.update({
             "generated_at": time.time(),
+            "nodes": dashboard_nodes(base, data["nodes"], migrate),
             "relays": read_relays(base),
             "hy2_groups": [g for g in read_index(base / "hy2" / "index.tsv") if SAFE_NAME.match(g["name"])],
             "awg_clients": read_awg_clients(base),
-            "migrate": read_migrate(base),
+            "migrate": migrate,
         })
         self.send_json(data)
 
@@ -2243,6 +2357,7 @@ def main():
     srv.ssh_pub = Path(ssh_key + ".pub")
     srv.hy2_template = Path(os.environ["HY2_TEMPLATE"]) if os.environ.get("HY2_TEMPLATE") else None
     srv.cache = StatusCache(args.iof, args.ttl)
+    srv.countries = CountryCache()
     srv.probes = Probes(srv.base)
 
     # После каждой задачи: свежий статус узлов и отчёт с ПК, если он ждал своей очереди
