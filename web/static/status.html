@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Статус · Island of Freedom</title>
+  <link rel="icon" href="/status/assets/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/status/assets/app.css">
+  <script src="/status/assets/common.js"></script>
+  <script src="/status/assets/status.js" defer></script>
+</head>
+<body class="status-page">
+  <header class="status-header">
+    <div class="status-header-inner">
+      <div class="brand">
+        <img class="logo" src="/status/assets/logo-panel.svg" alt="" width="32" height="32">
+        <b>Island of Freedom</b>
+      </div>
+      <div class="theme" role="group" aria-label="Тема">
+        <button type="button" data-set-theme="auto" title="Как в системе" aria-label="Как в системе"><svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="5.75"/><path class="fill" d="M8 2.25a5.75 5.75 0 0 1 0 11.5z"/></svg></button>
+        <button type="button" data-set-theme="light" title="Светлая" aria-label="Светлая"><svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="2.75"/><path d="M8 1.5v1.5M8 13v1.5M1.5 8H3M13 8h1.5M3.4 3.4l1.06 1.06M11.54 11.54l1.06 1.06M3.4 12.6l1.06-1.06M11.54 4.46l1.06-1.06"/></svg></button>
+        <button type="button" data-set-theme="dark" title="Тёмная" aria-label="Тёмная"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13.5 9.6A5.75 5.75 0 0 1 6.4 2.5a5.75 5.75 0 1 0 7.1 7.1z"/></svg></button>
+      </div>
+    </div>
+  </header>
+  <main>
+    <div class="status-heading">
+      <h1>Статус сети</h1>
+      <p id="status-updated">Загрузка наблюдений…</p>
+    </div>
+    <div id="status-summary" class="health" role="status"><h2>Загрузка статуса</h2></div>
+    <div id="status-maintenance" class="health warn" hidden></div>
+    <section class="card" aria-labelledby="status-nodes-heading">
+      <div class="card-head">
+        <h2 id="status-nodes-heading">VPN-серверы</h2>
+        <span class="status-caption">Последние 30 дней · UTC</span>
+      </div>
+      <div id="status-nodes"></div>
+      <div class="status-method">
+        <p>Проверяем состояние VPN-служб на серверах. Подключение с конкретного устройства также зависит от сети клиента.</p>
+        <p>Доступность рассчитывается по времени между соседними проверками с одинаковым результатом. Пропуски исключаются. Процент появится, когда наберётся час наблюдений с известной длительностью.</p>
+      </div>
+    </section>
+    <section class="card" aria-labelledby="status-events-heading">
+      <div class="card-head"><h2 id="status-events-heading">Недавние события</h2></div>
+      <div id="status-events"></div>
+    </section>
+    <noscript><p class="alert">Включите JavaScript, чтобы посмотреть статус серверов и историю.</p></noscript>
+  </main>
+  <footer class="foot">Island of Freedom · by mEldevlp - <a href="https://github.com/mEldevlp">https://github.com/mEldevlp</a></footer>
+</body>
+</html>

@@ -52,6 +52,7 @@ from urllib.request import Request, urlopen
 
 from iof_auth import Credentials, SESSION_TTL, password_ok
 import iof_cron
+import iof_status
 
 # Telegram-бот: модуль рядом с панелью. Если он не загрузился, панель работает без бота
 try:
@@ -104,7 +105,15 @@ STATIC_FILES = {
     "/tg-light-logo.svg": ("tg-light-logo.svg", "image/svg+xml"),
     "/tg-dark-logo.svg": ("tg-dark-logo.svg", "image/svg+xml"),
     "/TwemojiCountryFlags.woff2": ("TwemojiCountryFlags.woff2", "font/woff2"),
+    "/status": ("status.html", "text/html; charset=utf-8"),
+    "/status/assets/status.js": ("status.js", "text/javascript; charset=utf-8"),
 }
+STATUS_DATA = "/status/data.json"
+STATUS_FILES = {"/status": STATIC_FILES["/status"],
+                "/status/assets/status.js": STATIC_FILES["/status/assets/status.js"],
+                **{"/status/assets" + path: STATIC_FILES[path]
+                   for path in ("/app.css", "/common.js", "/favicon.svg", "/logo-panel.svg")}}
+STATUS_ROUTES = STATUS_FILES.keys() | {STATUS_DATA}
 
 # Логи ночного обслуживания: запуск с управляющего сервера и сама работа на этом сервере как узле
 NIGHTLY_RUN_LOG = Path("/var/log/iof-nightly-run.log")
@@ -174,6 +183,7 @@ def shape_node(r):
     node.update({
         "ms": to_int(r.get("ms")),
         "uptime_s": to_int(r.get("uptime_s")),
+        "nightly_active": {"yes": True, "no": False}.get(r.get("nightly_active")),
         "hy2": {
             "installed": r.get("hy2_installed") == "yes",
             "state": r.get("hy2_state", ""),
@@ -2000,6 +2010,10 @@ class Handler(BaseHTTPRequestHandler):
         if route is None:
             return
         path, query = route
+        if path == STATUS_DATA:
+            return self.send_json(self.server.public_status.view())
+        if path in STATUS_FILES:
+            return self.static(*STATUS_FILES[path])
         if path in PUBLIC_FILES:
             return self.static(*STATIC_FILES[path])
         if path == "/api/term/ws":
@@ -2062,6 +2076,9 @@ class Handler(BaseHTTPRequestHandler):
         if route is None:
             return
         path, query = route
+        if path in STATUS_ROUTES:
+            return self.send_json({"error": "разрешено только чтение"}, HTTPStatus.METHOD_NOT_ALLOWED,
+                                  extra={"Allow": "GET, HEAD"})
         if not self.same_origin(require_origin=path in ("/api/login", "/api/password")):
             return
         # Отчёт скрипта с ПК: вместо пароля панели одноразовый билет, остальная защита как у всех POST
@@ -2098,6 +2115,11 @@ class Handler(BaseHTTPRequestHandler):
         if job is None:
             return self.send_json({"error": "уже идёт другая задача, дождись её окончания"}, HTTPStatus.CONFLICT)
         self.send_json({"job": job["id"]}, HTTPStatus.ACCEPTED)
+
+    def do_HEAD(self):
+        if self.path.partition("?")[0] in STATUS_ROUTES:
+            return self.do_GET()
+        self.send_error(HTTPStatus.NOT_IMPLEMENTED)
 
     def save_schedule(self, body):
         base = self.server.base
@@ -2160,6 +2182,8 @@ class Handler(BaseHTTPRequestHandler):
         authority = host[1] + (f":{port}" if port and port != default_port else "")
         self.origin = f"{scheme}://{authority}"
         path, _, query = self.path.partition("?")
+        if path in STATUS_ROUTES:
+            return path, {}
         if path == "/admin" and self.command == "GET":
             self.redirect("/admin/")
             return None
@@ -2167,7 +2191,11 @@ class Handler(BaseHTTPRequestHandler):
         if not self.prefix and (self.secure or not path.startswith("/")):
             self.send_json({"error": "не найдено"}, HTTPStatus.NOT_FOUND)
             return None
-        return path.removeprefix(self.prefix), {k: v[0] for k, v in parse_qs(query).items()}
+        path = path.removeprefix(self.prefix)
+        if path in STATUS_ROUTES:
+            self.send_json({"error": "не найдено"}, HTTPStatus.NOT_FOUND)
+            return None
+        return path, {k: v[0] for k, v in parse_qs(query).items()}
 
     # Защита от CSRF: менять что-то можно только со страниц самой панели. Свой заголовок
     # браузер не даст отправить с чужого сайта без preflight, а на него сервер не отвечает
@@ -2540,7 +2568,8 @@ class Handler(BaseHTTPRequestHandler):
         for k, v in {**SECURITY_HEADERS, **(extra or {})}.items():
             self.send_header(k, v)
         self.end_headers()
-        self.wfile.write(body)
+        if self.command != "HEAD":
+            self.wfile.write(body)
 
     def log_message(self, fmt, *args):
         sys.stderr.write("%s %s\n" % (self.address_string(), TICKET_IN_URL.sub(r"\1***", fmt % args)))
@@ -2587,6 +2616,7 @@ def main():
     srv.ssh_pub = Path(ssh_key + ".pub")
     srv.hy2_template = Path(os.environ["HY2_TEMPLATE"]) if os.environ.get("HY2_TEMPLATE") else None
     srv.cache = StatusCache(args.iof, args.ttl)
+    srv.public_status = iof_status.PublicStatus(srv.base)
     srv.controller_cache = StatusCache(args.iof, args.ttl, "controller")
     srv.countries = CountryCache()
     srv.probes = Probes(srv.base)
@@ -2621,11 +2651,15 @@ def main():
         raise KeyboardInterrupt
 
     signal.signal(signal.SIGTERM, shutdown)
+    status_stop = threading.Event()
+    threading.Thread(target=iof_status.collect, args=(status_stop, srv.cache, srv.public_status, log),
+                     daemon=True, name="public-status").start()
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        status_stop.set()
         if srv.bot:
             srv.bot.close()
 

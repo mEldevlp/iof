@@ -1101,10 +1101,10 @@ n_awg_del() {
 #  hy2_installed yes/no, hy2_state (вывод systemctl is-active), hy2_udp yes/no, hy2_port,
 #  hy2_auth password/userpass, hy2_users, hy2_ver,
 #  awg_state running/stopped/none, awg_port, awg_peers, awg_online (рукопожатие за 3 минуты),
-#  cpus, load1, mem_used_mb, mem_total_mb, disk_used_kb, disk_total_kb, uptime_s
+#  cpus, load1, mem_used_mb, mem_total_mb, disk_used_kb, disk_total_kb, uptime_s, nightly_active yes/no
 n_status() {
   local installed="no" state="" udp="no" port="" auth="" users=0 ver="" range=""
-  local awg_state="none" awg_port="" awg_peers="" awg_online="" aconf
+  local awg_state="none" awg_port="" awg_peers="" awg_online="" aconf nightly_active=no
   n_defaults
 
   if command -v hysteria >/dev/null 2>&1 || [[ -f "$CONFIG" ]]; then installed="yes"; fi
@@ -1131,6 +1131,7 @@ n_status() {
     fi
   fi
 
+  if systemctl is-active --quiet iof-nightly.service 2>/dev/null; then nightly_active=yes; fi
   printf '%s\n' \
     "hy2_installed=$installed" \
     "hy2_state=${state:-unknown}" \
@@ -1144,6 +1145,7 @@ n_status() {
     "awg_port=$awg_port" \
     "awg_peers=$awg_peers" \
     "awg_online=$awg_online" \
+    "nightly_active=$nightly_active" \
     "cpus=$(nproc 2>/dev/null || echo 1)" \
     "load1=$(cut -d' ' -f1 /proc/loadavg)" \
     "$(free -m | awk '/^Mem:/{printf "mem_used_mb=%d\nmem_total_mb=%d", $3, $2}')" \

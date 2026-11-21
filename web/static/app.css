@@ -769,6 +769,67 @@ table.admins { width: 100%; border-collapse: collapse; font-size: 13px; font-var
 .foot a { color: inherit; text-underline-offset: 2px; overflow-wrap: anywhere; }
 .foot a:hover { color: var(--accent); }
 
+/* Публичная страница статуса */
+.status-page { --wrap: 960px; min-height: 100vh; display: flex; flex-direction: column; }
+.status-header { border-bottom: 1px solid var(--ring); }
+.status-header-inner {
+  max-width: calc(var(--wrap) + 2 * var(--gutter)); margin: 0 auto; padding: 14px var(--gutter);
+  display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px;
+}
+.status-header .brand { padding: 0; }
+.status-header .theme button { min-width: 30px; min-height: 30px; }
+.status-page main { padding-top: 32px; }
+.status-heading { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 4px 16px; }
+.status-heading h1 { font-size: 28px; line-height: 36px; font-weight: 650; }
+.status-heading p, .status-caption, .status-event-meta { color: var(--ink-2); font-size: 13px; }
+.status-node { padding: 16px; border-top: 1px solid var(--grid); }
+.status-node-head { display: flex; align-items: baseline; flex-wrap: wrap; gap: 6px 12px; margin-bottom: 12px; }
+.status-node h3 { margin: 0 auto 0 0; font-size: 15px; font-weight: 600; }
+.status-node-head .st { font-size: 13px; }
+.status-days { display: grid; grid-template-columns: repeat(30, minmax(0, 1fr)); gap: 4px; }
+.status-day {
+  min-width: 0; min-height: 28px; padding: 0; cursor: pointer;
+  border: 1px solid var(--ring); border-radius: 4px; background: var(--track);
+}
+.status-day.good { background: var(--good); }
+.status-day.crit { background: var(--crit); }
+.status-day.none { border: 1px dashed var(--axis); }
+.status-day:hover { outline: 1px solid var(--ink-2); outline-offset: 1px; }
+.status-day[aria-pressed="true"] { box-shadow: inset 0 0 0 2px var(--surface), inset 0 0 0 3px var(--ink-2); }
+.status-day:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.status-scale {
+  display: grid; grid-template-columns: 1fr auto 1fr; gap: 4px 8px; margin-top: 8px;
+  color: var(--ink-2); font-size: 12px; font-variant-numeric: tabular-nums;
+}
+.status-scale span:last-child { text-align: right; }
+.status-scale strong { color: var(--ink); font-weight: 600; }
+.status-day-details {
+  margin-top: 12px; padding: 8px 12px; display: grid; gap: 2px;
+  border: 1px solid var(--ring); border-radius: 8px; background: var(--page);
+  font-size: 12px; color: var(--ink-2);
+}
+.status-date { display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 12px; color: var(--ink); }
+.status-date strong { font-weight: 600; }
+.status-method, .status-empty { padding: 12px 16px 16px; color: var(--ink-2); font-size: 13px; }
+.status-method { display: grid; gap: 4px; border-top: 1px solid var(--grid); }
+.status-events { margin: 0; padding: 0; list-style: none; }
+.status-events li {
+  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 4px 12px;
+  border-top: 1px solid var(--grid); padding: 10px 16px;
+}
+.status-events .st { white-space: normal; }
+@container content (max-width: 860px) {
+  .status-days { grid-template-columns: repeat(15, minmax(0, 1fr)); }
+}
+@container content (max-width: 480px) {
+  .status-days { grid-template-columns: repeat(10, minmax(0, 1fr)); gap: 3px; }
+  .status-heading h1 { font-size: 24px; line-height: 32px; }
+}
+@media (max-width: 480px) {
+  .status-page { --gutter: 12px; }
+  .status-page .card-head, .status-node, .status-method, .status-empty, .status-events li { padding-inline: 12px; }
+}
+
 /* Скелетоны используют существующую раскладку и нейтральные оттенки обеих тем. */
 .skeleton-active > :not(.skeleton-part) { display: none !important; }
 .skeleton-active[data-skeleton^="line"], pre.skeleton-active { font-size: 0; }

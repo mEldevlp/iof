@@ -52,7 +52,7 @@ fi
 if (( ! WEB )); then exit 0; fi
 
 command -v python3 >/dev/null 2>&1 || die "нет python3: sudo apt install python3"
-for f in iof-web.py iof_auth.py iof_bot.py iof_bot_host.py iof_cron.py; do
+for f in iof-web.py iof_auth.py iof_bot.py iof_bot_host.py iof_cron.py iof_status.py; do
   python3 -c 'import ast, sys; ast.parse(open(sys.argv[1], encoding="utf-8").read())' "$SRC/web/$f" \
     || die "web/$f с ошибкой, панель не обновлял"
 done
@@ -62,6 +62,7 @@ install -d -m 755 "$WEB_DIR" "$WEB_DIR/static"
 install -m 644 "$SRC/web/iof-web.py" "$WEB_DIR/iof-web.py"
 install -m 644 "$SRC/web/iof_auth.py" "$WEB_DIR/iof_auth.py"
 install -m 644 "$SRC/web/iof_cron.py" "$WEB_DIR/iof_cron.py"
+install -m 644 "$SRC/web/iof_status.py" "$WEB_DIR/iof_status.py"
 # Telegram-бот и управление его процессом
 install -m 644 "$SRC/web/iof_bot.py" "$SRC/web/iof_bot_host.py" "$WEB_DIR/"
 # Статику заменяем целиком, чтобы не оставались удалённые из репозитория файлы

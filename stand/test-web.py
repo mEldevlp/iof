@@ -35,7 +35,7 @@ def connect(origin):
     return http.client.HTTPConnection(url.netloc, timeout=10)
 
 
-def request(origin, path, status=200, *, body=None, cookie=None, headers=None):
+def request(origin, path, status=200, *, body=None, cookie=None, headers=None, method=None):
     outgoing = {}
     if body is not None:
         outgoing.update({"Content-Type": "application/json", "X-IOF-Request": "1", "Origin": origin})
@@ -48,7 +48,7 @@ def request(origin, path, status=200, *, body=None, cookie=None, headers=None):
             outgoing[key] = value
     conn = connect(origin)
     try:
-        conn.request("POST" if body is not None else "GET", path,
+        conn.request(method or ("POST" if body is not None else "GET"), path,
                      None if body is None else json.dumps(body).encode(), headers=outgoing)
         resp = conn.getresponse()
         data = resp.read()
@@ -195,6 +195,29 @@ for origin in (domain, address):
     assert all(f">{label}<".encode() in page for label in ("Логин", "Пароль"))
     request(origin, "/admin/api/jobs", 401)
     request(origin, "/api/jobs", 404)
+    hdr, _ = request(f"http://{host}", "/status", 308)
+    assert hdr["Location"] == origin + "/status"
+    hdr, page = request(origin, "/status")
+    assert "Set-Cookie" not in hdr and "Content-Security-Policy" in hdr and b'class="nav"' not in page
+    for path in ("app.css", "status.js", "common.js", "logo-panel.svg", "favicon.svg"):
+        request(origin, "/status/assets/" + path)
+    hdr, data = request(origin, "/status/data.json?force=1")
+    assert "Set-Cookie" not in hdr and hdr["Cache-Control"] == "no-store"
+    empty = json.loads(data)
+    assert empty["state"] == "unknown" and empty["nodes"] == empty["events"] == []
+    assert request(origin, "/status/data.json", method="HEAD")[1] == b""
+    for path in ("/status", "/status/data.json", "/status/assets/status.js"):
+        for verb in ("POST", "PUT", "PATCH", "DELETE"):
+            hdr, _ = request(origin, path, 405, method=verb, body={"change": True})
+            assert hdr["Allow"] == "GET, HEAD"
+    for path in ("/status/assets/settings.js", "/status/assets/TwemojiCountryFlags.woff2",
+                 "/status/", "/status.html", "/status/api/jobs", "/admin/status/data.json"):
+        request(origin, path, 404)
+request(domain, "/status", 403, headers={"Host": "example.invalid"})
+request(domain, "/status", 403, headers={"Host": "127.0.0.1"})
+request(tunnel, "/status", 403, headers={"Host": "panel.test"})
+request(tunnel, "/status", 403, headers={"X-IOF-HTTPS": "1"})
+print("ok: публичный статус по HTTPS с доменом и IP, пустая история, Host, методы и границы статики")
 
 login(domain, "неверный пароль", 401)
 login(domain, old, 401, username="другой логин")
@@ -317,3 +340,64 @@ journal = subprocess.check_output(["journalctl", "-u", "iof-web", "-o", "cat", "
 assert all(password not in journal and password.encode() not in auth.read_bytes() for password in (old, new, reset))
 assert ticket not in journal
 print("ok: локальный сброс без старого пароля, отзыв сеансов, пароли и билеты отсутствуют в журнале")
+
+# Старая история с обычными интервалами и пробелом. После перезапуска добавится настоящий опрос.
+from iof_status import PublicStatus
+
+history = PublicStatus(base)
+at = int(time.time()) - 1000
+with tempfile.TemporaryDirectory(dir=base) as tmp:
+    fixture = PublicStatus(Path(tmp))
+    node = {"name": "panel", "addr": ip, "ssh": "root@private.example", "title": "Закрытая подпись",
+            "issues": ["закрытая диагностика"], "reachable": True,
+            "hy2": {"installed": True, "state": "active", "udp": True}, "awg": {"state": "none"}}
+    for step in range(15):
+        node["hy2"]["udp"] = step < 13
+        fixture.record({"status_at": at + (step - 14) * 300, "status_error": None, "nodes": [node]})
+    fixture.path.replace(history.path)
+
+before = history.path.read_bytes()
+for origin in (domain, address):
+    _, data = request(origin, "/status/data.json?force=1")
+    stale = json.loads(data)
+    assert set(stale) == {"state", "updated_at", "nodes", "events"}
+    assert stale["state"] == "unknown" and stale["updated_at"] == at
+    entry, = stale["nodes"]
+    assert set(entry) == {"name", "state", "days", "availability", "maintenance"}
+    assert entry["name"] == "Сервер 1" and entry["state"] == "unknown" and not entry["maintenance"]
+    assert len(entry["days"]) == 30 and entry["availability"] == 92.31
+    assert any(day["state"] == "unknown" for day in entry["days"])
+    assert all(set(day) == {"date", "state", "up", "down", "unknown", "up_seconds", "down_seconds"} for day in entry["days"])
+    assert set(stale["events"][0]) == {"name", "at", "kind"} and stale["events"][0]["kind"] == "outage"
+    assert all(private.encode() not in data for private in (ip, "root@", "panel", "Закрытая", "закрытая"))
+assert history.path.read_bytes() == before
+
+# Тестовый UDP-слушатель и активный юнит обслуживания дают опросу те же наблюдения, что и рабочие службы.
+hysteria = Path("/etc/hysteria")
+hysteria.mkdir(exist_ok=True)
+(hysteria / "config.yaml").write_text("listen: :15443\n", encoding="utf-8")
+subprocess.run(["systemd-run", "--unit=hysteria-server", "--collect", sys.executable, "-c",
+                "import socket,time; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); "
+                "s.bind(('0.0.0.0',15443)); time.sleep(120)"], check=True)
+subprocess.run(["systemd-run", "--unit=iof-nightly", "--collect", "/bin/sleep", "120"], check=True)
+for _ in range(50):
+    if subprocess.check_output(["ss", "-Huln", "sport = :15443"]):
+        break
+    time.sleep(0.1)
+else:
+    raise AssertionError("тестовый UDP-слушатель не запустился")
+restart_panel()
+for _ in range(100):
+    if history.read()["updated_at"] > at:
+        break
+    time.sleep(0.1)
+else:
+    raise AssertionError("фоновый опрос не записал снимок без публичного GET")
+for origin in (domain, address):
+    _, data = request(origin, "/status/data.json")
+    fresh = json.loads(data)
+    entry, = fresh["nodes"]
+    assert fresh["state"] == "operational" and entry["maintenance"]
+    assert entry["name"] == "Сервер 1" and entry["availability"] == 92.31
+    assert [event["kind"] for event in fresh["events"]] == ["maintenance", "recovery", "outage"]
+print("ok: устаревший снимок, накопленная история, приватные поля, фоновый опрос и настоящие признаки техработ")

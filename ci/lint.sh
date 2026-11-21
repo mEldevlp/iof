@@ -10,7 +10,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT" || exit 1
 SHELL_FILES=(iof.sh lib/*.sh build.sh iof-nightly install.sh stand/stand.sh stand/test.sh stand/test-setup.sh stand/test-awg.sh stand/test-web.sh stand/test-bot-host.sh ci/lint.sh ci/test-build.sh)
 # Панель, модуль Telegram-бота и поддельный Bot API стенда
-PY_FILES=(web/iof-web.py web/iof_auth.py web/iof_bot.py web/iof_bot_host.py web/iof_cron.py stand/fake-tg.py stand/panel_client.py stand/test-web.py stand/test-bot-host.py ci/test-panel.py)
+PY_FILES=(web/iof-web.py web/iof_auth.py web/iof_bot.py web/iof_bot_host.py web/iof_cron.py web/iof_status.py stand/fake-tg.py stand/panel_client.py stand/test-web.py stand/test-bot-host.py ci/test-panel.py)
 # Сторонний код в web/static: xterm.js для терминала на странице узла. Правила CSP к нему не применяются:
 # свои <style> он создаёт скриптом, и term.js переносит их в adoptedStyleSheets. Файлы берутся из npm
 # целиком, первая строка называет пакет и версию (CLAUDE.md, «Веб-панель»)
@@ -184,7 +184,7 @@ check_menu() {
   local f ref cur bad=""
   ref="$(sed -n '/<nav class="nav"/,/<\/nav>/p' web/static/index.html | sed -E 's/ aria-current="[a-z]+"//')"
   for f in web/static/*.html; do
-    [[ "$f" == web/static/login.html ]] && continue
+    case "$f" in web/static/login.html|web/static/status.html) continue ;; esac
     cur="$(sed -n '/<nav class="nav"/,/<\/nav>/p' "$f")"
     if [[ "$(sed -E 's/ aria-current="[a-z]+"//' <<<"$cur")" != "$ref" ]]; then bad+="$f "; fi
     if [[ "$(grep -c 'aria-current=' <<<"$cur")" != "1" ]]; then bad+="$f(aria-current) "; fi

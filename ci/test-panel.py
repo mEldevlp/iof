@@ -49,11 +49,87 @@ class PanelAppearance(unittest.TestCase):
         for path in web.STATIC_DIR.glob("*.html"):
             with self.subTest(page=path.name):
                 text = path.read_text(encoding="utf-8")
-                self.assertIn('<img class="logo" src="logo-panel.svg"', text)
+                asset = "/status/assets/" if path.name == "status.html" else ""
+                self.assertIn(f'<img class="logo" src="{asset}logo-panel.svg"', text)
                 self.assertIn(footer, text)
                 self.assertNotIn('<svg class="logo"', text)
         for name in ("hy2.html", "bot.html"):
             self.assertNotIn("Команды на сервере", (web.STATIC_DIR / name).read_text(encoding="utf-8"))
+
+
+class PublicStatus(unittest.TestCase):
+    status = web.iof_status
+    midnight = 20000 * status.DAY
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.history = self.status.PublicStatus(Path(tmp.name))
+
+    @staticmethod
+    def node(name, *, reachable=True, hy2="active", awg="none", nightly="no"):
+        return web.shape_node({"name": name, "addr": "192.0.2.3", "title": "Закрытая подпись",
+                               "reachable": "yes" if reachable else "no", "issues": "закрытая ошибка",
+                               "hy2_installed": "yes" if hy2 else "no", "hy2_state": hy2, "hy2_udp": "yes",
+                               "awg_state": awg, "nightly_active": nightly})
+
+    def record(self, at, *nodes, error=None):
+        self.history.record({"status_at": at, "status_error": error, "nodes": nodes})
+        return self.history.view(at)
+
+    def test_empty_and_classification(self):
+        at = self.midnight
+        self.assertEqual(self.history.view(at), {"state": "unknown", "updated_at": None, "nodes": [], "events": []})
+        up = self.node("vpn1")
+        down = self.node("vpn2", hy2="", awg="stopped")
+        unreachable = self.node("vpn1", reachable=False)
+        view = self.record(at, up, down, self.node("controller", hy2=""), self.node("new", reachable=False))
+        self.assertEqual(view["state"], "outage")
+        self.assertEqual([n["state"] for n in view["nodes"]], ["operational", "outage"])
+        no_container = self.node("vpn2", hy2="")
+        view = self.record(at + 150, up, no_container)
+        self.assertEqual([n["state"] for n in view["nodes"]], ["operational", "unknown"])
+        self.assertEqual(view["nodes"][1]["days"][-1]["down"], 1)
+        view = self.record(at + 300, down, unreachable)
+        self.assertEqual([(n["name"], n["state"]) for n in view["nodes"]],
+                         [("Сервер 1", "unknown"), ("Сервер 2", "outage")])
+        self.assertEqual(view["nodes"][0]["days"][-1]["unknown"], 1)
+        self.assertEqual(self.record(at + 600, down)["state"], "all_outage")
+        failed = self.record(at + 900, error="закрытый лог")
+        self.assertEqual(failed["state"], "unknown")
+        self.assertEqual(failed["updated_at"], at + 600)
+        self.assertNotIn("закрыт", json.dumps(failed, ensure_ascii=False).lower())
+
+    def test_intervals_events_staleness_and_retention(self):
+        at = self.midnight
+        up = self.node("private.example")
+        down = self.node("private.example", hy2="failed", nightly="yes")
+        ssh_failure = self.node("private.example", reachable=False)
+        self.record(at - 100, up)
+        for time in range(at + 200, at + 3501, 300):
+            self.record(time, up)
+        self.record(at + 3800, down)
+        self.record(at + 4100, down)
+        self.record(at + 4400, ssh_failure)
+        self.record(at + 4700, down)
+        self.record(at + 5600, down)
+        view = self.record(at + 5900, up)
+        node = view["nodes"][0]
+        self.assertEqual(sum(d["up_seconds"] for d in node["days"]), 3600)
+        self.assertEqual(node["days"][-2]["up_seconds"], 100)
+        self.assertEqual(node["days"][-1]["down_seconds"], 300)
+        self.assertEqual(node["availability"], 92.31)
+        self.assertEqual([e["kind"] for e in view["events"]], ["recovery", "maintenance", "outage"])
+        stale = self.status.PublicStatus(self.history.base).view(at + 5900 + self.status.FRESH_FOR + 1)
+        self.assertEqual(stale["state"], "unknown")
+        self.assertEqual(stale["nodes"][0]["days"], node["days"])
+        self.assertFalse(stale["nodes"][0]["maintenance"])
+        self.assertEqual(set(node), {"name", "state", "days", "availability", "maintenance"})
+        self.assertNotIn("private.example", json.dumps(view))
+        recent = self.record(at + 31 * self.status.DAY, up)
+        self.assertIsNone(recent["nodes"][0]["availability"])
+        self.assertFalse(recent["events"])
+        self.assertEqual(len(self.history.read()["nodes"]["private.example"]["days"]), 1)
 
 
 class CronSchedule(unittest.TestCase):
