@@ -31,15 +31,25 @@ printf 'IOF_WEB_HOSTS=panel.test,%s\nIOF_WEB_TERMINAL=1\nIOF_WEB_PASSWORD="Пр�
 printf 'IOF_RELEASE_API=file:///run/iof-test-release.json\n' >> /root/iof/web.env
 printf 'panel | %s | local | Панель\n' "$ip" > /root/iof/nodes.conf
 bash /opt/iof/install.sh
+# Тег v0.9 появляется после установки: исходная версия намеренно остаётся нетегированной.
+# Так проверяем, что выбор того же SHA лишь меняет канал, а install.sh не запускается заново.
 git clone -q /tmp/iof-origin /tmp/iof-new-version
-git -C /tmp/iof-new-version -c user.name='Стенд iof' -c user.email='iof@localhost' \
-  commit --allow-empty -qm 'Стабильный выпуск для проверки обновления'
 git -C /tmp/iof-new-version tag v0.9
 git -C /tmp/iof-new-version -c user.name='Стенд iof' -c user.email='iof@localhost' \
-  commit --allow-empty -qm 'Неопубликованный коммит master'
+  commit --allow-empty -qm 'Стабильный выпуск для проверки обновления'
 git -C /tmp/iof-new-version tag v0.10
+git -C /tmp/iof-new-version -c user.name='Стенд iof' -c user.email='iof@localhost' \
+  commit --allow-empty -qm 'Тестовый выпуск для проверки обновления'
+git -C /tmp/iof-new-version tag v0.11
+git -C /tmp/iof-new-version -c user.name='Стенд iof' -c user.email='iof@localhost' \
+  commit --allow-empty -qm 'Более свежий неопубликованный коммит master'
+git -C /tmp/iof-new-version tag v0.12
+git -C /tmp/iof-new-version tag v0.13
+git -C /tmp/iof-new-version tag v0.14
 git -C /tmp/iof-new-version push -q --tags origin master
-printf '{"tag_name":"v0.10","draft":false,"prerelease":true,"published_at":"2026-11-21T00:00:00Z"}\n' > /run/iof-test-release.json
+cat > /run/iof-test-release.json <<'EOF'
+{"latest":"v0.9","releases":[{"tag_name":"v0.9","draft":false,"prerelease":false,"published_at":"2026-11-20T00:00:00Z"}]}
+EOF
 
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=panel.test \
   -addext 'subjectAltName=DNS:panel.test' -keyout /run/iof-test.key -out /run/iof-test.crt 2>/dev/null
@@ -76,7 +86,10 @@ ssh -fN -L 127.0.0.1:18088:127.0.0.1:8088 -i /run/iof-test-ssh \
   -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
   -o LogLevel=ERROR -o ExitOnForwardFailure=yes "root@$ip"
 if ! python3 -B /src/stand/test-web.py "$ip"; then
-  journalctl -u iof-web -u iof-update -n 100 --no-pager >&2
+  journalctl -u iof-web -u 'iof-update*' -n 100 --no-pager >&2
+  tail -n 80 /var/log/iof-update.log >&2 || true
+  git -C /opt/iof status --short >&2
+  /usr/local/bin/iof version >&2
   exit 1
 fi
 SH

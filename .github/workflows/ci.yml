@@ -1,6 +1,4 @@
-# CI iof: статические проверки и прогон на тестовом стенде из двух серверов в Docker:
-# old — управляющий сервер (он же VPN-узел), node1 — обычный узел.
-# То же локально: bash ci/lint.sh, а стенд — bash stand/stand.sh up old node1, setup, test.
+# CI iof: быстрый предварительный выпуск каждой вершины master и независимая полная проверка.
 name: CI
 
 on:
@@ -8,22 +6,107 @@ on:
     branches: [master]
   pull_request:
   workflow_dispatch:
+    inputs:
+      action:
+        description: Ручное действие с уже существующим коммитом или предварительным выпуском
+        required: true
+        type: choice
+        options: [publish, promote]
+      target:
+        description: Полный SHA коммита для publish (предварительный выпуск) или тег v0.N для promote
+        required: true
+        type: string
 
 permissions:
   contents: read
 
-# Новый push в ту же ветку отменяет недоделанную проверку старого
-concurrency:
-  group: ci-${{ github.event_name }}-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
+  resolve:
+    name: Выбрать проверяемый коммит
+    runs-on: ubuntu-24.04
+    outputs:
+      mode: ${{ steps.target.outputs.mode }}
+      sha: ${{ steps.target.outputs.sha }}
+      tag: ${{ steps.target.outputs.tag }}
+    steps:
+      # Для pull request это merge-коммит проверки, для остальных событий — исходный SHA.
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - id: target
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_SHA: ${{ github.sha }}
+          INPUT_ACTION: ${{ inputs.action }}
+          INPUT_TARGET: ${{ inputs.target }}
+        run: |
+          set -euo pipefail
+          git fetch --quiet origin master --tags
+          if [[ "$EVENT_NAME" == push ]]; then
+            mode=prerelease
+            sha="$(git rev-parse "$EVENT_SHA^{commit}")"
+            tag=
+          elif [[ "$EVENT_NAME" == pull_request ]]; then
+            mode=none
+            sha="$(git rev-parse "$EVENT_SHA^{commit}")"
+            tag=
+          else
+            case "$INPUT_ACTION" in
+              publish)
+                [[ "$INPUT_TARGET" =~ ^[0-9a-fA-F]{40}$ ]] || {
+                  echo "Для публикации нужен полный SHA-1 коммита" >&2; exit 1;
+                }
+                mode=prerelease
+                sha="$(git rev-parse --verify --end-of-options "$INPUT_TARGET^{commit}")"
+                tag=
+                ;;
+              promote)
+                [[ "$INPUT_TARGET" =~ ^v0\.[0-9]+$ ]] || {
+                  echo "Для повышения нужен тег v0.N" >&2; exit 1;
+                }
+                mode=promote
+                tag="$INPUT_TARGET"
+                sha="$(git rev-parse "refs/tags/$tag^{commit}")"
+                ;;
+              *) echo "Неизвестное ручное действие" >&2; exit 1 ;;
+            esac
+          fi
+          if [[ "$EVENT_NAME" != pull_request ]]; then
+            git merge-base --is-ancestor "$sha" origin/master || {
+              echo "Коммит не достижим из origin/master" >&2; exit 1;
+            }
+          fi
+          {
+            echo "mode=$mode"
+            echo "sha=$sha"
+            echo "tag=$tag"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Быстрая проверка сборки
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/master') ||
+      (github.event_name == 'workflow_dispatch' && inputs.action == 'publish')
+    needs: resolve
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+      - name: bash ci/test-build.sh
+        run: bash ci/test-build.sh
+
   lint:
     name: Проверки кода
+    needs: resolve
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
       - name: Поставить shellcheck и pyflakes
         run: |
           command -v shellcheck >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck; }
@@ -32,13 +115,23 @@ jobs:
         run: bash ci/lint.sh
       - name: Проверить ссылки бота и переименование узла
         run: python3 ci/test-panel.py
+      # Исторический коммит может ещё не содержать издателя и его регрессий.
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          path: publisher
+      - name: Проверить издатель релизов
+        run: bash publisher/ci/test-release.sh
 
   stand:
     name: Стенд из двух серверов
+    needs: resolve
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
       - name: Поднять серверы old и node1
         run: bash stand/stand.sh up old node1
       - name: Проверить вход по HTTPS и через SSH-туннель
@@ -64,19 +157,72 @@ jobs:
             echo "::endgroup::"
           done
 
-  release:
-    name: Опубликовать релиз
-    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
-    needs: [lint, stand]
+  prerelease:
+    name: Предварительно опубликовать выпуск
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/master') ||
+      (github.event_name == 'workflow_dispatch' && inputs.action == 'publish')
+    needs: [resolve, build]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       contents: write
+    concurrency:
+      group: release-${{ needs.resolve.outputs.sha }}
+      cancel-in-progress: false
+    steps:
+      # Издатель берётся из ревизии workflow, а не из исторического проверяемого коммита.
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          path: publisher
+      - name: Получить проверенный коммит и теги
+        working-directory: publisher
+        env:
+          TARGET_SHA: ${{ needs.resolve.outputs.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --quiet --tags origin "$TARGET_SHA"
+          git cat-file -e "$TARGET_SHA^{commit}"
+      - name: Опубликовать предварительный выпуск
+        working-directory: publisher
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PUBLISH_SHA: ${{ needs.resolve.outputs.sha }}
+        run: bash ci/release.sh prerelease "$PUBLISH_SHA"
+
+  promote:
+    name: Вручную повысить предварительный выпуск
+    if: github.event_name == 'workflow_dispatch' && inputs.action == 'promote'
+    needs: [resolve, lint, stand]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    concurrency:
+      group: release-${{ needs.resolve.outputs.sha }}
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v5
         with:
+          ref: ${{ github.sha }}
           fetch-depth: 0
-      - name: Опубликовать следующую версию
+          path: publisher
+      - name: Получить проверенный коммит и теги
+        working-directory: publisher
+        env:
+          TARGET_SHA: ${{ needs.resolve.outputs.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --quiet --tags origin "$TARGET_SHA"
+          git cat-file -e "$TARGET_SHA^{commit}"
+      - name: Повысить предварительный выпуск
+        working-directory: publisher
         env:
           GH_TOKEN: ${{ github.token }}
-        run: bash ci/release.sh
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PUBLISH_SHA: ${{ needs.resolve.outputs.sha }}
+          PUBLISH_TAG: ${{ needs.resolve.outputs.tag }}
+        run: bash ci/release.sh promote "$PUBLISH_TAG" "$PUBLISH_SHA"

@@ -661,12 +661,12 @@ def iof_api(iof, args, timeout):
     if p.returncode != 0:
         err = p.stderr.decode("utf-8", "replace").strip().splitlines()
         return {}, (err[-1] if err else f"iof завершился с кодом {p.returncode}").removeprefix("Ошибка: ")
-    out = {"cron": [], "commit": []}
+    out = {key: [] for key in ("cron", "commit", "stable_commit_log", "test_commit_log")}
     for line in p.stdout.decode("utf-8", "replace").splitlines():
         k, sep, v = line.partition("=")
         if not sep:
             continue
-        if k in ("cron", "commit"):
+        if k in ("cron", "commit", "stable_commit_log", "test_commit_log"):
             out[k].append(v)
         else:
             out[k] = v
@@ -1063,14 +1063,33 @@ def service_steps(iof, body):
     и всё, что она запустила, поэтому iof update идёт отдельным юнитом systemd: он доработает,
     даже когда панель перезапустится. Лог идёт в задачу, пока панель жива, и в UPDATE_LOG целиком:
     tee -p продолжает писать в файл, когда читать из трубы уже некому."""
-    if body.get("action") != "update":
+    action = body.get("action")
+    if action not in ("update", "rollback"):
         raise ValueError("неизвестное действие")
-    script = f"set -o pipefail; {shlex.quote(iof)} update --release 2>&1 | tee -p {shlex.quote(str(UPDATE_LOG))}"
-    argv = ["systemd-run", "--unit=iof-update", "--collect", "--quiet", "--wait", "--pipe", "--setenv=LC_ALL=C.UTF-8"]
+    channel = body.get("channel", "stable")
+    tag = body.get("tag", "")
+    revision = body.get("revision", "")
+    if channel not in ("stable", "test"):
+        raise ValueError("неизвестный канал обновления")
+    if not isinstance(tag, str) or not re.fullmatch(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", tag):
+        raise ValueError("сначала выбери опубликованный тег релиза")
+    if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}", revision):
+        raise ValueError("нужен проверенный SHA выбранного релиза")
+    if action == "rollback" and (channel != "stable" or body.get("confirm_rollback") is not True):
+        raise ValueError("возврат на стабильную версию требует явного подтверждения")
+    if action == "update" and body.get("confirm_rollback"):
+        raise ValueError("возврат — отдельное действие")
+    command = [iof, "update", "--release", "--channel", channel, "--tag", tag, "--revision", revision]
+    if action == "rollback":
+        command.append("--allow-downgrade")
+    shown = shlex.join(command)
+    script = f"set -o pipefail; {shown} 2>&1 | tee -p {shlex.quote(str(UPDATE_LOG))}"
+    argv = ["systemd-run", f"--unit=iof-update-{secrets.token_hex(6)}", "--collect", "--quiet", "--wait", "--pipe", "--setenv=LC_ALL=C.UTF-8"]
     if release_api := os.environ.get("IOF_RELEASE_API"):
         argv.append(f"--setenv=IOF_RELEASE_API={release_api}")
     argv += ["/bin/bash", "-c", script]
-    return "Обновление iof и панели", [("iof update --release", argv, None)]
+    title = "Возврат на стабильную версию" if action == "rollback" else "Обновление iof и панели"
+    return f"{title}: {tag}", [(shown, argv, None)]
 
 
 # Блоки страницы «Безопасность», которые умеет проверять iof audit run
@@ -1854,6 +1873,8 @@ def service_view(srv, fetch):
     info, error = iof_api(srv.iof, ["api", "service"], 20)
     data = {
         "version": info.get("version", ""),
+        "revision": info.get("revision", ""),
+        "update_busy": info.get("update_busy") == "yes",
         "src": info.get("src", ""),
         "src_version": info.get("src_version", ""),
         "tg": info.get("tg") == "yes",
@@ -1876,6 +1897,16 @@ def service_view(srv, fetch):
             "release": upd.get("release", ""),
             "available": upd.get("available") == "yes",
             "commits": [dict(zip(("hash", "date", "subject"), c.split("\t", 2))) for c in upd.get("commit", [])],
+            "installed_channel": upd.get("installed_channel", "unknown"),
+            "channels": {
+                channel: {
+                    "tag": upd.get(f"{channel}_release", ""),
+                    "revision": upd.get(f"{channel}_commit", ""),
+                    "state": upd.get(f"{channel}_state", "missing"),
+                    "commits": [dict(zip(("hash", "date", "subject"), c.split("\t", 2)))
+                                for c in upd.get(f"{channel}_commit_log", [])],
+                } for channel in ("stable", "test")
+            },
         }
     return data
 

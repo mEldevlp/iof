@@ -246,59 +246,169 @@ def updates():
     return json.loads(data)["updates"]
 
 
-assert updates() == {"error": None, "release": "", "available": False, "commits": []}
-release_file = Path("/run/iof-test-release.json")
-release = json.loads(release_file.read_text())
-release_file.write_text(json.dumps(dict(release, tag_name="v0.9", prerelease=False)))
-update = updates()
-assert update["available"] and update["release"] == "v0.9", update
-assert [c["subject"] for c in update["commits"]] == ["Стабильный выпуск для проверки обновления"]
-
-
 def repo(*args):
     return subprocess.check_output(["git", "-C", "/opt/iof", *args]).strip()
 
 
-dirty = Path("/opt/iof/README-test")
-dirty.write_text("локальные данные")
-try:
-    blocked = subprocess.run(["iof", "update", "--release"], env=dict(os.environ, IOF_RELEASE_API=release_file.as_uri()),
-                             capture_output=True, text=True)
-    assert blocked.returncode and "локальные изменения" in blocked.stderr
-    assert dirty.read_text() == "локальные данные"
-finally:
-    dirty.unlink()
-assert subprocess.check_output(["iof", "version"]) == version
+def remote(*args):
+    return subprocess.check_output(["git", "-C", "/tmp/iof-new-version", *args]).strip()
+
+
+def wait_updates(check, message):
+    for _ in range(100):
+        try:
+            current = updates()
+            if check(current):
+                return current
+        except (OSError, AssertionError):
+            pass
+        time.sleep(0.1)
+    raise AssertionError(message)
+
+
+release_file = Path("/run/iof-test-release.json")
+baseline = repo("rev-parse", "HEAD").decode()
+stable = remote("rev-parse", "v0.10").decode()
+test = remote("rev-parse", "v0.11").decode()
+master = remote("rev-parse", "master").decode()
+assert baseline == remote("rev-parse", "v0.9").decode()
+assert stable != test != master and remote("merge-base", "v0.11", "master").decode() == test
+
+# Ранний v0.9 указывает на установленный, но ещё нетегированный при install.sh коммит.
+# Стабильный канал видит его, а тестовый не имеет опубликованного выпуска.
+initial = updates()
+assert initial["release"] == "v0.9" and not initial["available"] and initial["commits"] == [], initial
+assert initial["installed_channel"] == "unknown", initial
+assert initial["channels"]["stable"] == {
+    "tag": "v0.9", "revision": baseline, "state": "current", "commits": [],
+}, initial
+assert initial["channels"]["test"] == {
+    "tag": "", "revision": "", "state": "missing", "commits": [],
+}, initial
+
+# Тот же SHA не должен повторно вызывать install.sh при явном выборе стабильного выпуска.
+iof_mtime = Path("/usr/local/bin/iof").stat().st_mtime_ns
+same = subprocess.run(["iof", "update", "--release", "--channel", "stable", "--tag", "v0.9", "--revision", baseline],
+                      env=dict(os.environ, IOF_RELEASE_API=release_file.as_uri()), capture_output=True, text=True)
+assert same.returncode == 0, same.stderr
+assert Path("/usr/local/bin/iof").stat().st_mtime_ns == iof_mtime
 
 def panel_pid():
     return subprocess.check_output(["systemctl", "show", "--property=MainPID", "--value", "iof-web"]).strip()
 
 
-old_pid = panel_pid()
-request(domain, "/admin/api/service", 202, cookie=cookie, body={"action": "update"})
-for _ in range(100):
-    if panel_pid() not in (b"0", old_pid) and subprocess.check_output(["iof", "version"]).startswith(b"iof v0.9 "):
-        try:
-            current = updates()
-            if current == {"error": None, "release": "v0.9", "available": False, "commits": []}:
-                break
-        except (OSError, AssertionError):
-            pass
-    time.sleep(0.1)
-else:
-    raise AssertionError("панель не установила опубликованный релиз")
-assert repo("rev-parse", "HEAD") == repo("rev-parse", "v0.9") != repo("rev-parse", "master")
-assert auth.read_bytes() == before
-print("ok: панель установила опубликованный релиз, пропустив более свежий тег и коммит master")
+def install_idle():
+    return subprocess.run(["flock", "-n", "/root/iof/update.lock", "true"]).returncode == 0
 
-subprocess.run(["flock", "-w", "10", str(base / "update.lock"), "true"], check=True)
-subprocess.run(["git", "-C", "/opt/iof", "switch", "-q", "master"], check=True)
-subprocess.run(["iof", "update"], check=True, stdout=subprocess.DEVNULL)
-assert subprocess.check_output(["iof", "version"]).startswith(b"iof v0.10 ")
+
+# В актуальном ответе стабильный выпуск задаёт latest, а тестовый выбирается по самой поздней публикации.
+release_file.write_text(json.dumps({"latest": "v0.10", "releases": [
+    {"tag_name": "v0.9", "draft": False, "prerelease": False, "published_at": "2026-11-20T00:00:00Z"},
+    {"tag_name": "v0.10", "draft": False, "prerelease": False, "published_at": "2026-11-21T00:00:00Z"},
+    {"tag_name": "v0.11", "draft": False, "prerelease": True, "published_at": "2026-11-22T00:00:00Z"},
+]}))
+update = updates()
+assert update["release"] == "v0.10" and update["available"], update
+assert [c["subject"] for c in update["commits"]] == ["Стабильный выпуск для проверки обновления"], update
+assert update["installed_channel"] == "unknown", update
+assert update["channels"]["stable"] == {
+    "tag": "v0.10", "revision": stable, "state": "update",
+    "commits": update["commits"],
+}, update
+assert update["channels"]["test"]["tag"] == "v0.11" and update["channels"]["test"]["revision"] == test, update
+assert update["channels"]["test"]["state"] == "update", update
+assert [c["subject"] for c in update["channels"]["test"]["commits"]] == [
+    "Тестовый выпуск для проверки обновления", "Стабильный выпуск для проверки обновления",
+], update
+
+# Сервер не допускает неполный или поддельный выбор версии, а возврат требует явного подтверждения.
+for body in (
+    {"action": "update", "channel": "stable", "revision": stable},
+    {"action": "update", "channel": "stable", "tag": "v0.10"},
+    {"action": "update", "channel": "nightly", "tag": "v0.10", "revision": stable},
+    {"action": "update", "channel": "stable", "tag": "v10", "revision": stable},
+    {"action": "rollback", "channel": "stable", "tag": "v0.10", "revision": stable},
+):
+    request(domain, "/admin/api/service", 400, cookie=cookie, body=body)
+
+# Выбор на стороне CLI также не должен перезаписывать локальные данные в клоне.
+dirty = Path("/opt/iof/README-test")
+dirty.write_text("локальные данные")
+try:
+    blocked = subprocess.run(["iof", "update", "--release", "--channel", "test", "--tag", "v0.11", "--revision", test],
+                             env=dict(os.environ, IOF_RELEASE_API=release_file.as_uri()), capture_output=True, text=True)
+    assert blocked.returncode and "локальные изменения" in blocked.stderr
+    assert dirty.read_text() == "локальные данные"
+finally:
+    dirty.unlink()
+assert subprocess.check_output(["iof", "version"]) == version
+mismatch = subprocess.run(["iof", "update", "--channel", "test", "--tag", "v0.11", "--revision", stable],
+                          env=dict(os.environ, IOF_RELEASE_API=release_file.as_uri()), capture_output=True, text=True)
+assert mismatch.returncode and "коммит выбранного релиза изменился" in mismatch.stderr
+
+# После выбора v0.11 появилась новая test-публикация. Старый выбранный тег остаётся целью.
+# Черновик и ещё один голый тег не становятся кандидатами.
+new_catalog = json.loads(release_file.read_text())
+new_catalog["releases"] += [
+    {"tag_name": "v0.12", "draft": False, "prerelease": True, "published_at": "2026-11-24T00:00:00Z"},
+    {"tag_name": "v0.13", "draft": True, "prerelease": False, "published_at": "2026-11-25T00:00:00Z"},
+]
+release_file.write_text(json.dumps(new_catalog))
+assert updates()["channels"]["test"]["tag"] == "v0.12"
+for tag in ("v0.13", "v0.14"):
+    rejected = subprocess.run(["iof", "update", "--channel", "test", "--tag", tag],
+                              env=dict(os.environ, IOF_RELEASE_API=release_file.as_uri()), capture_output=True, text=True)
+    assert rejected.returncode and "не опубликован" in rejected.stderr, rejected.stderr
+
+# Тестовый канал ставит ровно выбранный опубликованный тег, а не более свежий master.
+old_pid = panel_pid()
+request(domain, "/admin/api/service", 202, cookie=cookie,
+        body={"action": "update", "channel": "test", "tag": "v0.11", "revision": test})
+installed_test = wait_updates(lambda data: install_idle() and panel_pid() not in (b"0", old_pid)
+                              and repo("rev-parse", "HEAD").decode() == test
+                              and data["installed_channel"] == "test", "панель не установила тестовый выпуск")
+assert panel_pid() not in (b"0", old_pid)
+assert repo("rev-parse", "HEAD").decode() == test != master
+assert installed_test["channels"]["test"]["tag"] == "v0.12" and installed_test["channels"]["test"]["state"] == "update", installed_test
+assert installed_test["channels"]["stable"]["state"] == "older", installed_test
+assert not installed_test["available"] and installed_test["release"] == "v0.10", installed_test
 assert auth.read_bytes() == before
-request(domain, "/admin/api/setup", cookie=cookies[domain])
-assert updates() == {"error": None, "release": "v0.9", "available": False, "commits": []}
-print("ok: обновление из ветки в CLI, сохранение учётных данных, панель не понижает версию")
+implicit_downgrade = subprocess.run(["iof", "update", "--channel", "stable", "--tag", "v0.10"],
+                                   env=dict(os.environ, IOF_RELEASE_API=release_file.as_uri()), capture_output=True, text=True)
+assert implicit_downgrade.returncode and "старее установленного" in implicit_downgrade.stderr
+assert repo("rev-parse", "HEAD").decode() == test
+
+# Повышение того же тега до стабильного меняет только канал: install.sh и панель не перезапускаются.
+release_file.write_text(json.dumps({"latest": "v0.11", "releases": [
+    {"tag_name": "v0.9", "draft": False, "prerelease": False, "published_at": "2026-11-20T00:00:00Z"},
+    {"tag_name": "v0.10", "draft": False, "prerelease": False, "published_at": "2026-11-21T00:00:00Z"},
+    {"tag_name": "v0.11", "draft": False, "prerelease": False, "published_at": "2026-11-23T00:00:00Z"},
+    {"tag_name": "v0.12", "draft": False, "prerelease": True, "published_at": "2026-11-24T00:00:00Z"},
+]}))
+old_pid = panel_pid()
+_, promotion_job = request(domain, "/admin/api/service", 202, cookie=cookie,
+                          body={"action": "update", "channel": "stable", "tag": "v0.11", "revision": test})
+wait_job(cookie, lambda j: j["id"] == json.loads(promotion_job)["job"])
+promoted_test = wait_updates(lambda data: data["installed_channel"] == "stable"
+                             and data["channels"]["stable"]["state"] == "current",
+                             "панель не отметила повышение выпуска до стабильного")
+assert panel_pid() == old_pid and repo("rev-parse", "HEAD").decode() == test
+assert promoted_test["channels"]["stable"]["revision"] == test, promoted_test
+
+# Стабильный выпуск теперь старее тестового: без confirm_rollback отклонён, с ним ставится точный SHA.
+old_pid = panel_pid()
+request(domain, "/admin/api/service", 202, cookie=cookie,
+        body={"action": "rollback", "channel": "stable", "tag": "v0.10", "revision": stable,
+              "confirm_rollback": True})
+rolled_back = wait_updates(lambda data: install_idle() and panel_pid() not in (b"0", old_pid)
+                            and repo("rev-parse", "HEAD").decode() == stable
+                            and data["installed_channel"] == "stable", "панель не вернула стабильный выпуск")
+assert panel_pid() not in (b"0", old_pid)
+assert repo("rev-parse", "HEAD").decode() == stable != master
+assert rolled_back["channels"]["stable"]["state"] == "update", rolled_back
+assert rolled_back["channels"]["test"]["tag"] == "v0.12" and rolled_back["channels"]["test"]["state"] == "update", rolled_back
+assert auth.read_bytes() == before
+print("ok: каналы стабильных и тестовых релизов, точный SHA, подтверждённый возврат и отсутствие лишнего перезапуска")
 
 cookie = cookies[domain]
 nodes_file = base / "nodes.conf"

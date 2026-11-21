@@ -617,6 +617,75 @@ class RenameNode(unittest.TestCase):
                 web.node_steps("iof", {**body, **patch}, conf, [], Path("unused"), migrate)
 
 
+class ServiceReleases(unittest.TestCase):
+    stable = "a" * 40
+    test = "b" * 40
+
+    def test_update_and_rollback_steps_require_exact_release(self):
+        with self.assertRaises(ValueError):
+            web.service_steps("/usr/local/bin/iof", {"action": "update"})
+        for body in (
+            {"action": "update", "channel": "stable", "tag": "v0.10"},
+            {"action": "update", "channel": "stable", "revision": self.stable},
+            {"action": "update", "channel": "other", "tag": "v0.10", "revision": self.stable},
+            {"action": "update", "channel": "stable", "tag": "v10", "revision": self.stable},
+            {"action": "update", "channel": "stable", "tag": "v0.10", "revision": "a" * 39},
+            {"action": "rollback", "channel": "test", "tag": "v0.10", "revision": self.stable,
+             "confirm_rollback": True},
+            {"action": "rollback", "channel": "stable", "tag": "v0.10", "revision": self.stable},
+            {"action": "update", "channel": "stable", "tag": "v0.10", "revision": self.stable,
+             "confirm_rollback": True},
+        ):
+            with self.subTest(body=body), self.assertRaises(ValueError):
+                web.service_steps("/usr/local/bin/iof", body)
+
+        title, steps = web.service_steps("/usr/local/bin/iof", {
+            "action": "update", "channel": "test", "tag": "v0.11", "revision": self.test,
+        })
+        self.assertEqual(title, "Обновление iof и панели: v0.11")
+        shown, argv, codes = steps[0]
+        expected = f"/usr/local/bin/iof update --release --channel test --tag v0.11 --revision {self.test}"
+        self.assertEqual(shown, expected)
+        self.assertIn(expected + " 2>&1", argv[-1])
+        self.assertNotIn("--allow-downgrade", argv[-1])
+        self.assertIsNone(codes)
+
+        title, steps = web.service_steps("/usr/local/bin/iof", {
+            "action": "rollback", "channel": "stable", "tag": "v0.10", "revision": self.stable,
+            "confirm_rollback": True,
+        })
+        self.assertEqual(title, "Возврат на стабильную версию: v0.10")
+        self.assertIn(f"--revision {self.stable} --allow-downgrade", steps[0][0])
+
+    def test_service_view_exposes_channels_and_legacy_stable_fields(self):
+        info = {"version": "v0.10 2026-11-21", "revision": self.stable, "src": "/opt/iof", "tg": "no"}
+        updates = {
+            "release": "v0.10", "available": "yes", "commit": ["aaaaaaa\t2026-11-21\tСтабильный выпуск"],
+            "installed_channel": "test",
+            "stable_release": "v0.10", "stable_commit": self.stable, "stable_state": "update",
+            "stable_commit_log": ["aaaaaaa\t2026-11-21\tСтабильный выпуск"],
+            "test_release": "v0.11", "test_commit": self.test, "test_state": "current",
+            "test_commit_log": ["bbbbbbb\t2026-11-22\tТестовый выпуск"],
+        }
+        with tempfile.TemporaryDirectory() as folder:
+            srv = SimpleNamespace(base=Path(folder), iof="/usr/local/bin/iof", jobs=SimpleNamespace(busy=lambda: False))
+            with mock_patch.object(web, "iof_api", side_effect=[(info, None), (updates, None)]), \
+                 mock_patch.object(web, "bot_notify", return_value=None), \
+                 mock_patch.object(web, "read_migrate", return_value=None):
+                view = web.service_view(srv, True)
+        self.assertEqual(view["revision"], self.stable)
+        self.assertEqual(view["updates"]["release"], "v0.10")
+        self.assertTrue(view["updates"]["available"])
+        self.assertEqual(view["updates"]["commits"], [{"hash": "aaaaaaa", "date": "2026-11-21", "subject": "Стабильный выпуск"}])
+        self.assertEqual(view["updates"]["installed_channel"], "test")
+        self.assertEqual(view["updates"]["channels"], {
+            "stable": {"tag": "v0.10", "revision": self.stable, "state": "update",
+                       "commits": [{"hash": "aaaaaaa", "date": "2026-11-21", "subject": "Стабильный выпуск"}]},
+            "test": {"tag": "v0.11", "revision": self.test, "state": "current",
+                     "commits": [{"hash": "bbbbbbb", "date": "2026-11-22", "subject": "Тестовый выпуск"}]},
+        })
+
+
 class Setup(unittest.TestCase):
     def test_steps(self):
         _, steps = web.setup_steps("/usr/bin/iof", {"mode": "local", "name": "main", "addr": "vpn.example", "port": 443, "obfs": "salamander"})

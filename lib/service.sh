@@ -75,21 +75,29 @@ cmd_init() {
 
 # Рабочая ветка сохраняет git pull. Панель и клон на теге устанавливают только опубликованные релизы.
 cmd_update() {
-  local old new release=0 flag installer_args=()
-  for flag in "$@"; do
-    case "$flag" in
+  local old new release=0 channel=stable tag="" downgrade=0 expected="" installer_args=()
+  while (( $# )); do
+    case "$1" in
       --release) release=1 ;;
+      --channel) (( $# >= 2 )) || die "после --channel нужен stable или test"; channel="$2"; release=1; shift ;;
+      --tag) (( $# >= 2 )) || die "после --tag нужен тег vN.N"; tag="$2"; release=1; shift ;;
+      --revision) (( $# >= 2 )) || die "после --revision нужен полный SHA"; expected="$2"; release=1; shift ;;
+      --allow-downgrade) downgrade=1; release=1 ;;
       --no-web) installer_args=(--no-web) ;;
-      *) die "используй: iof update [--release] [--no-web]" ;;
+      *) die "используй: iof update [--release] [--channel stable|test] [--tag vN.N] [--allow-downgrade] [--no-web]" ;;
     esac
+    shift
   done
+  [[ "$channel" == stable || "$channel" == test ]] || die "неизвестный канал обновления"
+  [[ -z "$expected" || "$expected" =~ ^[0-9a-f]{40}$ ]] || die "неверный SHA релиза"
+  [[ "$downgrade" == 0 || ( "$channel" == stable && -n "$tag" ) ]] || die "для возврата нужны --channel stable и --tag vN.N"
   [[ -d "$IOF_SRC/.git" ]] || die "нет клона репозитория в $IOF_SRC, сначала: git clone https://github.com/mEldevlp/iof $IOF_SRC"
   have git || die "нет git: apt install git"
   (umask 077; mkdir -p "$BASE")
   exec 9>>"$BASE/update.lock"
   flock -n 9 || die "iof уже обновляется"
   if (( release )) || ! git -C "$IOF_SRC" symbolic-ref -q HEAD >/dev/null; then
-    update_release "${installer_args[@]}"
+    update_release "$channel" "$tag" "$downgrade" "$expected" "${installer_args[@]}"
     return
   fi
   old="$(git -C "$IOF_SRC" rev-parse --short HEAD)"

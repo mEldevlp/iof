@@ -2,7 +2,7 @@
 
 // Страница «Сервис»: обновление iof, расписание обслуживания, задания и журнал cron, запуски из панели.
 
-const svc = { info: null, jobs: [], schedule: null, saving: null, updates: null, checking: false, updating: null, request: null };
+const svc = { info: null, channel: "stable", jobs: [], schedule: null, saving: null, updates: null, checking: false, updating: null, request: null };
 const scheduleDefaults = { nightly: "04:00", reach: "04:10" };
 
 
@@ -73,32 +73,45 @@ function renderVersion() {
 }
 
 function renderUpdates() {
-  const i = svc.info;
-  const u = svc.updates;
+  const i = svc.info, u = svc.updates;
+  const target = u?.channels?.[svc.channel];
+  const names = { stable: "Стабильная", test: "Тестовая" };
   let html = "";
   if (i.error) {
     html = `<div class="note crit">${icon("crit")}<div>iof не ответил: ${esc(i.error)}</div></div>`;
   } else if (svc.checking) {
-    html = `<div class="note"><span class="spinner" aria-hidden="true"></span><div>Проверяю опубликованные релизы…</div></div>
-      <ul class="commits" aria-hidden="true">${`<li>${skeletonBar("long")}</li>`.repeat(u?.commits.length || 2)}</ul>`;
-  } else if (u && u.error) {
+    html = `<div class="note"><span class="spinner" aria-hidden="true"></span><div>Проверяю опубликованные релизы…</div></div>`;
+  } else if (u?.error) {
     html = `<div class="note crit">${icon("crit")}<div>Не удалось проверить: ${esc(u.error)}</div></div>`;
-  } else if (u && !u.available) {
-    const status = u.release ? `Обновлений нет. Последний релиз <code>${esc(u.release)}</code>.` : "Опубликованных релизов пока нет.";
-    html = `<div class="note good">${icon("good")}<div>${status}</div></div>`;
-  } else if (u) {
-    html = `<div class="note warn">${icon("warn")}<div>Доступен релиз <code>${esc(u.release)}</code></div></div>`;
-    if (u.commits.length) {
-      html += `<ul class="commits">${u.commits.map((c) => `<li><code>${esc(c.hash)}</code>${esc(c.subject)} <span class="muted">${esc(c.date)}</span></li>`).join("")}</ul>`;
-    }
-  } else if (i.src_version && i.version && i.src_version.split(" ")[0] !== i.version.split(" ")[0]) {
-    html = `<div class="note warn">${icon("warn")}<div>Версии клона и установленной панели различаются.</div></div>`;
+  } else if (u?.channels) {
+    html = `<dl class="kv">${kv(Object.entries(names).map(([channel, name]) => [name,
+      u.channels[channel]?.tag ? `<code>${esc(u.channels[channel].tag)}</code>` : '<span class="muted">нет публикации</span>']))}</dl>`;
+    const installed = names[u.installed_channel] || "не определён";
+    html += `<p class="hint pad">Канал установленной версии: ${esc(installed)}.</p>`;
+    const state = target?.state || "missing";
+    const messages = {
+      missing: "В выбранном канале пока нет опубликованных релизов.",
+      current: "Этот коммит уже установлен. Переустановка не нужна.",
+      older: svc.channel === "stable" ? "Стабильная версия старее установленной. Возврат доступен отдельным действием с подтверждением." : "Тестовый выпуск старее установленного коммита. Понижение не предлагается.",
+      diverged: "История выбранного релиза разошлась с установленной версией. Установка запрещена.",
+      update: `Можно установить ${svc.channel === "test" ? "тестовую" : "стабильную"} версию ${target?.tag || ""}.`,
+    };
+    const level = state === "current" ? "good" : ["older", "update"].includes(state) ? "warn" : "none";
+    html += `<div class="note ${level}">${icon(level)}<div>${esc(messages[state] || messages.missing)}</div></div>`;
+    if (target?.commits?.length) html += `<ul class="commits">${target.commits.map((c) => `<li><code>${esc(c.hash)}</code>${esc(c.subject)} <span class="muted">${esc(c.date)}</span></li>`).join("")}</ul>`;
   }
   $("#updates").innerHTML = html;
   if (svc.checking) $("#updates").setAttribute("aria-busy", "true");
   else $("#updates").removeAttribute("aria-busy");
-  $("#check-updates").disabled = svc.checking || !i.src_version;
-  $("#update").disabled = !!svc.updating || !i.src_version;
+  const busy = !!svc.updating || !!i.update_busy || svc.checking;
+  $("#check-updates").disabled = busy || !i.src_version;
+  $("#update-channel").disabled = busy || !u?.channels || !!u.error;
+  $("#update-channel").value = svc.channel;
+  $("#update").disabled = busy || !!u?.error || target?.state !== "update";
+  const stable = u?.channels?.stable;
+  $("#rollback").hidden = stable?.state !== "older" || !!u?.error;
+  $("#rollback").disabled = busy;
+  $("#rollback").textContent = `Вернуться на стабильную ${stable?.tag || ""}`;
 }
 
 function renderCheck() {
@@ -451,7 +464,11 @@ async function loadJobs(request, replace) {
     // Страницу открыли, пока обновление уже идёт.
     const running = jobs.find((j) => j.kind === "service" && j.state === "running");
     if (running && !svc.updating) {
-      svc.updating = { id: running.id, from: svc.info?.version, last: running };
+      const command = running.log.join("\n");
+      const revision = /--revision ([0-9a-f]{40})\b/.exec(command)?.[1];
+      const tag = /--tag (v\d+\.\d+)\b/.exec(command)?.[1];
+      svc.updating = { id: running.id, target: revision && tag ? { revision, tag } : null,
+        from: svc.info?.version, last: running, started: running.started };
       renderUpdateJob(running);
       pollUpdate();
     }
@@ -480,12 +497,20 @@ async function checkUpdates() {
 // Обновление. Пока панель жива, в карточке идёт лог задачи. Потом install.sh перезапускает панель:
 // запросы не проходят, а после перезапуска задачи уже нет. Тогда сравниваем версию с той, что была
 
-async function update() {
-  if (!confirm("Установить последний опубликованный релиз iof и панели с GitHub? После установки панель перезапустится.")) return;
+async function update(rollback = false) {
+  const channel = rollback ? "stable" : svc.channel;
+  const target = svc.updates?.channels?.[channel];
+  if (!target?.tag || svc.updating || svc.checking) return;
+  const question = rollback
+    ? `Вернуться на стабильную ${target.tag}? Это понижение версии iof и панели. Настройки сохраняются, но старый код может не поддерживать новые возможности. Подтверждаешь возврат?`
+    : `Установить ${channel === "test" ? "тестовую" : "стабильную"} версию ${target.tag}? Будет установлен именно этот тег. После установки панель перезапустится.`;
+  if (!confirm(question)) return;
   formError("", "#action-error");
   try {
-    const id = DEMO ? demoUpdateJob() : (await postJson("api/service", { action: "update" })).job;
-    svc.updating = { id, from: svc.info.version, last: null, started: Date.now() / 1000 };
+    const body = { action: rollback ? "rollback" : "update", channel, tag: target.tag, revision: target.revision };
+    if (rollback) body.confirm_rollback = true;
+    const id = DEMO ? demoUpdateJob(body) : (await postJson("api/service", body)).job;
+    svc.updating = { id, target: { ...target }, channel, from: svc.info.version, last: null, started: Date.now() / 1000 };
     renderUpdates();
     $("#job").scrollIntoView({ behavior: "smooth", block: "nearest" });
     pollUpdate();
@@ -530,27 +555,34 @@ async function pollUpdate() {
   }
   // Задачи нет: установщик перезапустил панель.
   svc.updating = null;
-  if (!(await loadInfo())) return;
+  if (!(await loadInfo())) { svc.updating = u; setTimeout(pollUpdate, 2000); return; }
+  if (svc.info.update_busy) { svc.updating = u; setTimeout(pollUpdate, 1000); return; }
   const to = svc.info.version;
   $("#job").hidden = false;
   $("#job-hide").hidden = false;
   $("#job-title").textContent = "Обновление iof и панели";
-  $("#job-state").innerHTML = badge("good", "готово");
+  const reached = u.target && svc.info.revision === u.target.revision;
+  $("#job-state").innerHTML = badge(reached ? "good" : "crit", reached ? "готово" : "цель не подтверждена");
   // Полный вывод — из /var/log/iof-update.log: задача успела показать только начало
   const ul = svc.info.update_log;
   $("#job-log").textContent = ul && ul.at > u.started - 60
     ? ["$ iof update --release", ...ul.lines].join("\n")
     : [...(u.last ? u.last.log : ["$ iof update --release"]), "… панель перезапущена"].join("\n");
-  jobResult("good", to === u.from
-    ? `${icon("good")}<div>Релиз ${fmtVersion(to)} переустановлен. Панель перезапущена.</div>`
-    : `${icon("good")}<div>Обновлено: ${fmtVersion(u.from)} → ${fmtVersion(to)}.
-        <a href="${location.pathname}${location.search}">Перезагрузи страницу</a>, чтобы панель открылась в новой версии.</div>`);
+  jobResult(reached ? "good" : "crit", !reached
+    ? `${icon("crit")}<div>Панель доступна, но установка выбранного релиза ${esc(u.target?.tag || "")} не подтверждена. Проверь журнал обновления.</div>`
+    : to === u.from
+      ? `${icon("good")}<div>Версия ${fmtVersion(to)} уже установлена.</div>`
+      : `${icon("good")}<div>Обновлено: ${fmtVersion(u.from)} → ${fmtVersion(to)}.
+          <a href="${location.pathname}${location.search}">Перезагрузи страницу</a>, чтобы панель открылась в новой версии.</div>`);
+  checkUpdates();
 }
 
 document.addEventListener("DOMContentLoaded", () => {
   $("#refresh").addEventListener("click", () => loadInfo({ replace: true }));
   $("#check-updates").addEventListener("click", checkUpdates);
-  $("#update").addEventListener("click", update);
+  $("#update").addEventListener("click", () => update());
+  $("#rollback").addEventListener("click", () => update(true));
+  $("#update-channel").addEventListener("change", (event) => { svc.channel = event.target.value; renderUpdates(); });
   $("#job-hide").addEventListener("click", () => { $("#job").hidden = true; });
   for (const kind of Object.keys(scheduleDefaults)) {
     $(`#schedule-${kind}`).addEventListener("submit", (event) => saveSchedule(event, kind));

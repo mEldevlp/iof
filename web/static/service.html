@@ -142,13 +142,22 @@
           <section class="card">
             <div class="card-head"><h2>Версия iof</h2></div>
             <dl id="version" data-skeleton="kv 2" class="kv"></dl>
+            <div class="btn-row">
+              <label for="update-channel">Канал обновлений</label>
+              <select id="update-channel" disabled>
+                <option value="stable">Стабильная</option>
+                <option value="test">Тестовая</option>
+              </select>
+            </div>
             <div id="updates"></div>
             <div class="btn-row">
               <button id="check-updates" class="btn" type="button" disabled>Проверить обновления</button>
               <button id="update" class="btn primary" type="button" disabled>Обновить iof и панель</button>
+              <button id="rollback" class="btn danger" type="button" hidden>Вернуться на стабильную</button>
             </div>
-            <p class="hint pad">«Обновить» — это <code>sudo iof update</code>: git pull в клоне репозитория и install.sh.
-              В конце панель перезапустится, страница дождётся её сама.</p>
+            <p class="hint pad">Устанавливается выбранный опубликованный тег, а не вершина master.
+              Тестовая версия прошла быструю проверку сборки; полный CI может ещё выполняться.
+              В конце установки панель перезапустится, страница дождётся её сама.</p>
           </section>
           <section class="card">
             <div class="card-head"><h2>Проверка узлов</h2></div>

@@ -277,6 +277,7 @@ function demoCronLog() {
 function demoService(fetch) {
   const data = {
     version: demoState.version,
+    revision: demoState.releaseRevision || "9".repeat(40),
     src: "/opt/iof",
     src_version: demoState.version,
     tg: false,
@@ -304,13 +305,22 @@ function demoService(fetch) {
     migrate: null,
   };
   if (fetch) {
-    data.updates = demoState.version.startsWith("v0.9 ") ? {
-      error: null, release: "v0.10", available: true,
-      commits: [
-        { hash: "9c41d2e", date: "2026-11-02", subject: "iof: hy2 restart проверяет, что сервис поднялся" },
-        { hash: "51ab0f7", date: "2026-11-02", subject: "iof-web: страница узла" },
-      ],
-    } : { error: null, release: "v0.10", available: false, commits: [] };
+    const tag = demoState.version.split(" ")[0];
+    const mode = new URLSearchParams(location.search).get("demo");
+    const promoted = mode === "promoted" || demoState.promoted;
+    const stableTag = promoted ? "v0.11" : "v0.10";
+    const revision = (tag === "v0.11" ? "b" : tag === "v0.10" ? "a" : "9").repeat(40);
+    data.revision = demoState.releaseRevision || revision;
+    data.updates = {
+      error: null, release: stableTag, available: tag === "v0.9", commits: [],
+      installed_channel: tag === "v0.11" && !promoted ? "test" : "stable",
+      channels: {
+        stable: { tag: mode === "no-stable" ? "" : stableTag, revision: (promoted ? "b" : "a").repeat(40),
+          state: mode === "no-stable" ? "missing" : tag === stableTag ? "current" : tag === "v0.11" ? "older" : "update", commits: [] },
+        test: { tag: mode === "no-test" || promoted ? "" : "v0.11", revision: "b".repeat(40),
+          state: mode === "no-test" || promoted ? "missing" : tag === "v0.11" ? "current" : "update", commits: [] },
+      },
+    };
   }
   return demoDelay(data);
 }
@@ -417,13 +427,14 @@ function demoNodeJob(body) {
 }
 
 // Обновление в демо: после задачи «панель перезапускается», и задача пропадает, как на сервере
-function demoUpdateJob() {
-  const out = ["Устанавливаю опубликованный релиз v0.10", "iof: /usr/local/bin/iof (v0.10 2026-11-02)",
+function demoUpdateJob(target) {
+  const out = [`Устанавливаю опубликованный релиз ${target.tag}`, `iof: /usr/local/bin/iof (${target.tag} 2026-11-02)`,
     "iof-nightly: /usr/local/sbin/iof-nightly"];
   // Как на сервере: задача успевает показать только начало, полный вывод остаётся в файле
   return demoRunJob("service", "Обновление iof и панели", ["$ iof update --release", ...out.slice(0, 2)], "ok", (job) => {
     demoState.updateLog = { at: Date.now() / 1000, lines: [...out, "iof-web: работает, http://127.0.0.1:8088/ (с компьютера через SSH-туннель)"] };
-    demoState.version = "v0.10 2026-11-02";
+    demoState.version = `${target.tag} 2026-11-02`;
+    demoState.releaseRevision = target.revision;
     demoState.jobs = demoState.jobs.filter((j) => j !== job);
   });
 }

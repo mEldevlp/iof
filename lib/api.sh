@@ -15,7 +15,12 @@ cmd_api() {
 
 # Для страницы «Сервис»: версия, клон репозитория, настроен ли Telegram, задания cron iof
 api_service() {
-  printf 'version=%s\nsrc=%s\n' "$IOF_VERSION" "$IOF_SRC"
+  printf 'version=%s\nrevision=%s\nsrc=%s\n' "$IOF_VERSION" "${IOF_REVISION:-}" "$IOF_SRC"
+  if [[ -f "$BASE/update.lock" ]] && ! (flock -n 9) 9<"$BASE/update.lock"; then
+    echo 'update_busy=yes'
+  else
+    echo 'update_busy=no'
+  fi
   if [[ -d "$IOF_SRC/.git" ]] && have git; then
     printf 'src_version=%s\n' "$(source_version "$IOF_SRC" || true)"
   fi
@@ -27,11 +32,25 @@ api_service() {
 api_updates() {
   [[ -d "$IOF_SRC/.git" ]] || die "нет клона репозитория в $IOF_SRC"
   have git || die "нет git: apt install git"
-  release_info
-  printf 'release=%s\navailable=%s\n' "$REL_TAG" "$REL_AVAILABLE"
-  if [[ "$REL_AVAILABLE" == yes && -n "$REL_INSTALLED" ]]; then
-    git -C "$IOF_SRC" log --format='commit=%h%x09%cd%x09%s' --date=short "$REL_INSTALLED..$REL_COMMIT"
-  fi
+  local channel kind tag published_channel installed_channel=unknown
+  REL_CATALOG="$(release_catalog)" || die "не удалось проверить опубликованные релизы"
+  for channel in stable test; do
+    release_info "$channel"
+    printf '%s_release=%s\n%s_commit=%s\n%s_state=%s\n' "$channel" "$REL_TAG" "$channel" "$REL_COMMIT" "$channel" "$REL_STATE"
+    if [[ "$channel" == stable ]]; then
+      printf 'release=%s\navailable=%s\n' "$REL_TAG" "$REL_AVAILABLE"
+    fi
+    if [[ "$REL_AVAILABLE" == yes && -n "$REL_INSTALLED" ]]; then
+      git -C "$IOF_SRC" log --format="${channel}_commit_log=%h%x09%cd%x09%s" --date=short "$REL_INSTALLED..$REL_COMMIT"
+      if [[ "$channel" == stable ]]; then
+        git -C "$IOF_SRC" log --format='commit=%h%x09%cd%x09%s' --date=short "$REL_INSTALLED..$REL_COMMIT"
+      fi
+    fi
+  done
+  while IFS=$'\t' read -r kind tag published_channel; do
+    if [[ "$kind" == published && "$tag" == "${IOF_VERSION%% *}" ]]; then installed_channel="$published_channel"; break; fi
+  done <<< "$REL_CATALOG"
+  printf 'installed_channel=%s\n' "$installed_channel"
 }
 
 api_status() {

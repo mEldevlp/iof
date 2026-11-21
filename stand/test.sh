@@ -1630,6 +1630,8 @@ def check_notify():
     git("tag", "v0.10", cwd=f"{UPD}/work")
     git("push", "-q", "--tags", f"{UPD}/origin.git", "master", cwd=f"{UPD}/work")
     release_file = f"{UPD}/release.json"
+    # Старый одиночный ответ /releases/latest оставляем намеренно: release_catalog обязан его понимать.
+    # Расширенный список каналов проверяется в отдельном stand/test-web.sh.
     with open(release_file, "w", encoding="utf-8") as f:
         json.dump(dict(tag_name="v0.10", draft=False, prerelease=False, published_at="2026-11-21T00:00:00Z"), f)
     env_with(env0, RU_TARGETS="", IOF_SRC=f"{UPD}/src", IOF_RELEASE_API=f"file://{release_file}")
