@@ -22,7 +22,8 @@ for c in "$LOCAL" "$CONTROL" "$PEER"; do
     -v "$ROOT:/opt/iof:ro" iof-stand >/dev/null
 done
 for c in "$LOCAL" "$CONTROL"; do
-  docker exec "$c" bash -c 'apt-get update -qq && apt-get install -y -qq python3 git qrencode >/dev/null && bash /opt/iof/install.sh' >/dev/null
+  docker exec "$c" bash -c 'apt-get update -qq && apt-get install -y -qq python3 git qrencode >/dev/null &&
+    bash /opt/iof/install.sh && printf "%s\n" iof-stand-panel | iof web reset-password --password-stdin' >/dev/null
 done
 local_ip="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$LOCAL")"
 peer_ip="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$PEER")"
@@ -30,13 +31,17 @@ peer_ip="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{
 for c in "$LOCAL" "$CONTROL"; do
   mode=local; addr="$local_ip"
   if [[ "$c" == "$CONTROL" ]]; then mode=template-only; addr=""; fi
-  docker exec -i "$c" python3 - "$mode" "$addr" <<'PY'
+  docker exec -i -e PYTHONPATH=/opt/iof/stand "$c" python3 - "$mode" "$addr" <<'PY'
 import json, pathlib, sys, time, urllib.error, urllib.request
+from panel_client import panel_cookie
+
 mode, addr = sys.argv[1:]
+BASE = 'http://127.0.0.1:8088'
+COOKIE = panel_cookie(BASE)
 def api(path, body=None):
-    req = urllib.request.Request('http://127.0.0.1:8088/api/' + path,
+    req = urllib.request.Request(BASE + '/api/' + path,
         data=json.dumps(body).encode() if body is not None else None,
-        headers={'X-IOF-Request': '1', 'Content-Type': 'application/json'})
+        headers={'X-IOF-Request': '1', 'Content-Type': 'application/json', 'Cookie': COOKIE})
     with urllib.request.urlopen(req, timeout=30) as r:
         return json.load(r)
 def wait(job):

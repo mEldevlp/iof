@@ -41,6 +41,8 @@ jobs:
       - uses: actions/checkout@v5
       - name: Поднять серверы old и node1
         run: bash stand/stand.sh up old node1
+      - name: Проверить вход по HTTPS и через SSH-туннель
+        run: bash stand/test-web.sh
       - name: Проверить первый запуск на чистых серверах
         run: bash stand/test-setup.sh
       - name: Поставить iof на old, подключить node1, Hysteria2 на обоих

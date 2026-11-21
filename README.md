@@ -53,10 +53,15 @@ sudo git clone https://github.com/mEldevlp/iof /opt/iof
 sudo bash /opt/iof/install.sh
 ```
 
+При первой установке в терминале задайте логин и пароль панели. Логин по умолчанию — `admin`.
+Нажмите Enter вместо ввода пароля, чтобы получить случайный пароль из 16 шестнадцатеричных
+символов. Установщик покажет его один раз в терминале. При установке без терминала пароль
+генерируется без вывода. Задать известный пароль можно командой `sudo iof web reset-password`.
+
 ## Первый запуск на чистом сервере
 
-Установщик запускает панель, но сам не устанавливает VPN. Откройте её через SSH-туннель
-(см. ниже): на «Обзоре» появится мастер первого запуска.
+Установщик запускает панель. Откройте её через SSH-туннель или по настроенному адресу HTTPS
+и войдите. На «Обзоре» появится мастер установки VPN.
 
 - **VPN на этом сервере** — укажите имя, IPv4 или домен для VPN-клиентов и подпись.
   Мастер создаст шаблон со случайным паролем, добавит управляющий сервер как узел `local`
@@ -119,7 +124,13 @@ sudo iof awg keys "Моё устройство"
 sudo iof update
 ```
 
+Обновление и повторная установка сохраняют логин и пароль панели. При переходе со старой версии
+установщик переносит `IOF_WEB_PASSWORD` из `/root/iof/web.env` в хеш и удаляет строку с паролем.
+После перехода войдите с логином `admin` и прежним паролем.
+
 ## Веб-панель
+
+### Через SSH-туннель
 
 На своём компьютере откройте SSH-туннель к управляющему серверу:
 
@@ -127,4 +138,96 @@ sudo iof update
 ssh -N -L 127.0.0.1:8088:127.0.0.1:8088 пользователь@сервер
 ```
 
-Откройте <http://localhost:8088/> в браузере. Оставьте SSH-туннель работающим, пока пользуетесь панелью.
+Откройте <http://127.0.0.1:8088/> или <http://127.0.0.1:8088/admin/> в браузере и войдите. Оставьте SSH-туннель
+работающим, пока пользуетесь панелью. `8088/tcp` слушает только `127.0.0.1` на сервере.
+
+### Напрямую по HTTPS
+
+Для адреса `https://ostrovsvobodi.ru/admin` направьте DNS-запись `A` домена на публичный IPv4
+управляющего сервера. Добавляйте `AAAA`, только если сервер принимает входящие подключения по IPv6
+на тех же портах. Для входа без домена используйте `https://ПУБЛИЧНЫЙ_IP/admin` и отдельный сертификат
+с этим IP. Сертификат домена подходит для входа по домену.
+
+Откройте `80/tcp` для проверки ACME и перенаправления на HTTPS, а `443/tcp` для панели в файрволе сервера
+и у провайдера. Hysteria2 по умолчанию использует `443/udp`. Если на сервере уже есть nginx с HTTPS,
+подключите [настройку панели](web/nginx-iof.conf) внутри соответствующего HTTPS-блока `server`.
+
+Для новой настройки установите nginx и [Certbot из snap](https://certbot.eff.org/instructions?os=snap&ws=nginx).
+Для сертификата IP нужен Certbot 5.4 или новее. В примерах замените `203.0.113.10` публичным IPv4 сервера.
+Оставьте в `server_name` адреса, которыми будете пользоваться. Создайте каталог `/var/www/iof-acme`,
+сохраните HTTP-блок в `/etc/nginx/conf.d/iof.conf` и проверьте его командой `sudo nginx -t`.
+Запустите nginx командой `sudo systemctl enable --now nginx` и перечитайте настройки командой
+`sudo systemctl reload nginx`.
+
+```nginx
+server {
+    listen 80;
+    server_name ostrovsvobodi.ru 203.0.113.10;
+    location ^~ /.well-known/acme-challenge/ { root /var/www/iof-acme; }
+    location / { return 308 https://$host$request_uri; }
+}
+```
+
+Выполните команду для домена, IP или обе. Let's Encrypt выпускает сертификаты для IP с профилем
+`shortlived`, поэтому они требуют автоматического продления. [Справка Let's Encrypt](https://letsencrypt.org/2026/03/11/shorter-certs-certbot)
+
+```bash
+sudo certbot certonly --webroot -w /var/www/iof-acme --cert-name iof-domain -d ostrovsvobodi.ru
+sudo certbot certonly --webroot -w /var/www/iof-acme --cert-name iof-ip --preferred-profile shortlived --ip-address 203.0.113.10
+```
+
+Добавьте в тот же файл HTTPS-блоки для выпущенных сертификатов. Если `443/tcp` уже обслуживает сайты,
+включите фрагмент в действующую конфигурацию. Для входа по IP сертификат IP должен отдаваться сайтом по
+умолчанию на этом адресе, так как клиент может открыть TLS-соединение без имени SNI.
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name ostrovsvobodi.ru;
+    ssl_certificate /etc/letsencrypt/live/iof-domain/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/iof-domain/privkey.pem;
+    include /opt/iof/web/nginx-iof.conf;
+    location / { return 404; }
+}
+
+server {
+    listen 443 ssl default_server;
+    server_name 203.0.113.10;
+    ssl_certificate /etc/letsencrypt/live/iof-ip/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/iof-ip/privkey.pem;
+    include /opt/iof/web/nginx-iof.conf;
+    location / { return 404; }
+}
+```
+
+Если настроили `AAAA`, добавьте в HTTP-блок `listen [::]:80;` и в HTTPS-блок домена `listen [::]:443 ssl;`.
+В файле `/root/iof/web.env` задайте `IOF_WEB_HOSTS=ostrovsvobodi.ru,203.0.113.10` с нужными адресами
+через запятую. Проверьте и примените конфигурацию:
+
+```bash
+sudo systemctl restart iof-web
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+Убедитесь, что таймер продления Certbot включён (`systemctl list-timers --all | grep certbot`).
+Чтобы nginx перечитывал обновлённые сертификаты, создайте исполняемый файл
+`/etc/letsencrypt/renewal-hooks/deploy/iof-nginx` с таким содержимым и проверьте продление
+командой `sudo certbot renew --dry-run`:
+
+```sh
+#!/bin/sh
+systemctl reload nginx
+```
+
+### Смена и сброс пароля
+
+В меню панели откройте «Настройки». Введите текущий пароль, новый пароль и его подтверждение.
+Если забыли пароль, зайдите на управляющий сервер по SSH и выполните:
+
+```bash
+sudo iof web reset-password
+```
+
+Введите новый пароль дважды или нажмите Enter, чтобы получить случайный. Логин сохраняется.
+После смены или сброса все сеансы панели и открытые в ней терминалы закрываются. Войдите снова
+через HTTPS или SSH-туннель. Пароль хранится в виде хеша в `/root/iof/web-auth.json`.

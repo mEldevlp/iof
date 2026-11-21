@@ -126,7 +126,12 @@ apt-get update -qq >/dev/null
 # nftables: с ним Hysteria2 ставит правила смены портов через nft (в ядре WSL нет fib для IPv6,
 # и iof переходит на iptables), на остальных узлах — через iptables. Так test проверяет оба пути
 apt-get install -y -qq git python3 qrencode sshpass nftables >/dev/null
+auth_exists=0
+if [[ -f /root/iof/web-auth.json ]]; then auth_exists=1; fi
 bash /opt/iof/install.sh
+if (( ! auth_exists )); then
+  printf '%s\n' 'iof-stand-panel' | iof web reset-password --password-stdin
+fi
 
 echo "== old: шаблон Hysteria2 и nodes.conf"
 mkdir -p /etc/hysteria /root/iof
@@ -200,7 +205,12 @@ cmd_sync() {
     if [[ $# -eq 0 ]] && ! on "$s" test -x /usr/local/bin/iof; then continue; fi
     echo "== $s"
     push_src "$s"
-    on "$s" bash /opt/iof/install.sh
+    on "$s" bash -c '
+      if [[ -f /root/iof/web-auth.json ]]; then
+        bash /opt/iof/install.sh
+      else
+        bash /opt/iof/install.sh && printf "%s\n" iof-stand-panel | iof web reset-password --password-stdin
+      fi'
     # Поддельный Bot API запущен из /opt/iof: после замены рабочей копии — заново
     on "$s" bash -c 'if systemctl is-enabled --quiet fake-tg 2>/dev/null; then systemctl restart fake-tg; fi'
   done

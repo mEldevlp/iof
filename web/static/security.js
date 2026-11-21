@@ -511,10 +511,12 @@ function renderProbeWait(stage) {
         и положи <code>hysteria.exe</code> в папку, где запускаешь скрипт. Он спросит согласие, пароли из ссылок с ПК не уходят.`,
     ];
     if (p.ticket) {
-      steps.push(`Выполни в окне PowerShell на ПК, пока открыт SSH-туннель к панели. Команда сохранит скрипт
+      const link = new URL(`api/probe/script?t=${p.ticket}`, `${p.origin}/`);
+      const tunnel = link.protocol === "http:" ? " Оставь SSH-туннель к панели открытым до конца проверки." : "";
+      steps.push(`Выполни в окне PowerShell на ПК.${tunnel} Команда сохранит скрипт
         в <code>iof-probe.ps1</code> в текущей папке и запустит его:
         <div class="cmd"><pre class="code">${esc(probeCommand(p))}</pre><button class="btn small" type="button" data-copy>Копировать</button></div>
-        <span class="check-detail">Или <a href="${DEMO ? "#" : esc(`api/probe/script?t=${p.ticket}`)}" download="iof-probe.ps1" data-script>скачай скрипт</a>
+        <span class="check-detail">Или <a href="${DEMO ? "#" : esc(link.href)}" download="iof-probe.ps1" data-script>скачай скрипт</a>
         и запусти <code>powershell -ExecutionPolicy Bypass -File .\\iof-probe.ps1</code>. Скрипт выдаётся один раз: по команде или по ссылке.
         Его можно прочитать перед запуском, а после проверки удалить: билет и токен в нём одноразовые.</span>`);
     } else {
@@ -634,7 +636,7 @@ async function pollProbe(was) {
 async function probeStart() {
   formError("", "#action-error");
   const node = $("#probe-node").value;
-  const body = { action: "start", nodes: node ? [node] : [], origin: location.origin };
+  const body = { action: "start", nodes: node ? [node] : [] };
   try {
     const id = DEMO ? demoProbeJob(body) : (await postJson("api/probe", body)).job;
     sec.kind = "probe";
@@ -835,7 +837,7 @@ const DEMO_DPI_CATALOG = [
   ["icmp", "probe", "Ответ на ping", "Обычный сервер чаще отвечает на ping. Молчание само ничего не выдаёт: так настроено у многих хостеров."],
   ["names", "probe", "Имя сервера и PTR", "Обратную запись DNS (PTR) видит любой по адресу узла, имя сервера попадает в приветствия служб. Слова vpn, proxy, wg в них говорят о назначении сервера."],
   ["banners", "probe", "Лишние порты снаружи", "Служба на лишнем порту отвечает приветствием с названием и версией программы. По нему сканер понимает, что стоит на сервере."],
-  ["panel", "probe", "Панель iof-web", "Панель управляет всеми узлами от root. Она должна слушать только 127.0.0.1 и открываться через SSH-туннель: на внешнем адресе её найдёт любой сканер."],
+  ["panel", "probe", "Панель iof-web", "Панель управляет всеми узлами от root. Служба iof-web должна слушать только 127.0.0.1. Открывай панель через SSH-туннель или через настроенный HTTPS-прокси."],
   ["blocklist", "scan", "Блок-лист сканеров", "Список адресов, с которых узлы сканируют и зондируют. Если пакеты от них отбрасывать, сканер с этих адресов видит закрытый сервер. Это снижает заметность, но не прячет узел: сканеры меняют адреса. Применяет и обновляет список iof block."],
   ["asn", "rep", "Сеть и хостер", "Сети крупных хостеров VPS фильтры знают и относятся к ним строже, чем к домашним. Это справка: изменить её можно только переездом к другому хостеру."],
   ["registry", "rep", "Адрес в реестре", "Если адрес узла есть в выгрузке реестра блокировок, у части провайдеров он уже недоступен и клиенты до него не дойдут."],

@@ -3,6 +3,7 @@
 import base64
 import html
 import importlib.util
+from email.message import Message
 from io import BytesIO
 import json
 from pathlib import Path
@@ -17,6 +18,7 @@ import zlib
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.dont_write_bytecode = True
+sys.path.insert(0, str(ROOT / "web"))
 
 
 def module(name, path):
@@ -117,8 +119,10 @@ migrate_finish
             base = Path(tmp)
             (base / "nodes.conf").write_text("home | 8.8.8.8 | root@77.1.2.3\n", encoding="utf-8")
             handler = web.Handler.__new__(web.Handler)
-            handler.server = SimpleNamespace(base=base, countries=cache, hosts={"localhost"}, password="")
-            handler.headers = {"Host": "localhost"}
+            handler.server = SimpleNamespace(base=base, countries=cache, hosts={"localhost"})
+            handler.headers = Message()
+            handler.headers["Host"] = "localhost"
+            handler.authorized = Mock(return_value=True)
             handler.path = "/api/nodes/countries"
             handler.send_json = Mock()
             started, release = Event(), Event()
@@ -230,15 +234,17 @@ class AwgLinks(unittest.TestCase):
                 web.read_awg_keys(base, "../other")
 
             handler = web.Handler.__new__(web.Handler)
-            handler.server = SimpleNamespace(base=base, hosts={"localhost"}, password="test")
+            auth = web.Credentials(base)
+            auth.save("admin", "test")
+            handler.server = SimpleNamespace(base=base, hosts={"localhost"}, auth=auth)
             handler.path = "/api/awg/keys?name=family"
-            handler.headers = {"Host": "localhost"}
-            handler.send_response, handler.send_header, handler.end_headers = Mock(), Mock(), Mock()
+            handler.headers = Message()
+            handler.headers["Host"] = "localhost"
             handler.send_body = Mock()
             handler.do_GET()
-            handler.send_response.assert_called_once_with(401)
-            handler.send_body.assert_not_called()
-            handler.headers["Authorization"] = "Basic " + base64.b64encode(b"iof:test").decode()
+            self.assertEqual(handler.send_body.call_args.args[3], 401)
+            self.assertNotIn(key, str(handler.send_body.call_args))
+            handler.headers["Cookie"] = "iof_session=" + auth.issue(auth.read(), "http://localhost")
             handler.do_GET()
             payload, _, cache, status = handler.send_body.call_args.args
             self.assertEqual(status, 200)

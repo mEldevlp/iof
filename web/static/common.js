@@ -62,7 +62,8 @@ function initDrawer() {
 function keepDemoInLinks() {
   if (!DEMO) return;
   document.querySelectorAll(".sidebar a").forEach((a) => { a.href += "?demo"; });
-  $("#demo-chip").hidden = false;
+  const chip = $("#demo-chip");
+  if (chip) chip.hidden = false;
 }
 
 document.addEventListener("DOMContentLoaded", () => {
@@ -285,6 +286,7 @@ const JOB_STATES = {
 
 async function getJson(url) {
   const r = await fetch(url, { cache: "no-store", credentials: "same-origin" });
+  if (r.status === 401) location.replace("login.html");
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return r.json();
 }
@@ -298,6 +300,7 @@ async function postJson(url, data) {
     body: JSON.stringify(data),
   });
   const body = await r.json().catch(() => ({}));
+  if (r.status === 401 && url !== "api/login") location.replace("login.html");
   if (!r.ok) throw new Error(body.error || `HTTP ${r.status}`);
   return body;
 }
@@ -494,6 +497,7 @@ function startPage(page) {
         const url = typeof page.url === "function" ? page.url() : page.url;
         const r = await fetch(force ? `${url}${url.includes("?") ? "&" : "?"}force=1` : url,
           { cache: "no-store", credentials: "same-origin" });
+        if (r.status === 401) location.replace("login.html");
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         state.data = await r.json();
       }

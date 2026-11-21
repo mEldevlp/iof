@@ -2083,10 +2083,8 @@ n_migrate_receive() {
   rm -rf /opt/iof
   mv /opt/iof.migrate-new /opt/iof
   chown -R root:root /opt/iof
-  echo "[$(hostname)] ставлю iof и панель" >&2
-  # stdin пустой: сам этот скрипт пришёл через stdin (run_on), install.sh не должен его читать
-  bash /opt/iof/install.sh </dev/null >&2 || n_err "install.sh завершился с ошибкой"
-
+  # Останавливаем прежнюю панель до замены данных и ключей на этом сервере.
+  systemctl stop iof-web 2>/dev/null || true
   if [[ -d "$IOF_HOME" ]]; then
     if [[ -f "$IOF_HOME/migrate.conf" ]] && grep -qxF "id=$id" "$IOF_HOME/migrate.conf"; then
       rm -rf "$IOF_HOME"
@@ -2114,10 +2112,10 @@ n_migrate_receive() {
     chmod 600 /root/.ssh/known_hosts
     grep -vxF -f /root/.ssh/known_hosts "$inbox/ssh/known_hosts" >> /root/.ssh/known_hosts || true
   fi
+  echo "[$(hostname)] ставлю iof и панель с присланными учётными данными" >&2
+  # stdin пустой: сам этот скрипт пришёл через stdin (run_on), install.sh не должен его читать.
+  bash /opt/iof/install.sh </dev/null >&2 || n_err "install.sh завершился с ошибкой"
   rm -rf "$inbox"
-
-  # Панель запущена install.sh до того, как появился web.env
-  systemctl restart iof-web || echo "[$(hostname)] iof-web не перезапустился: journalctl -u iof-web -n 30" >&2
   echo "received $(git -C /opt/iof log -1 --format=%h 2>/dev/null || echo '?')"
 }
 

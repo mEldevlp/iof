@@ -91,6 +91,16 @@ cmd_update() {
   exec bash "$IOF_SRC/install.sh" "$@"
 }
 
+# Локальное восстановление входа в панель. Пароль принимает только Python через терминал или stdin.
+cmd_web() {
+  [[ "${1:-}" == reset-password && $# -le 2 && ( $# == 1 || "$2" == --password-stdin ) ]] \
+    || die "использование: iof web reset-password [--password-stdin]"
+  local auth=/opt/iof-web/iof_auth.py
+  [[ -f "$auth" ]] || die "панель не установлена: sudo bash $IOF_SRC/install.sh"
+  shift
+  exec python3 "$auth" reset "$BASE" "$@"
+}
+
 exec_job() {
   local i="$1"
   if [[ "${N_SSH[$i]}" == "local" ]]; then

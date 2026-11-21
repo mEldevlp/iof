@@ -16,12 +16,10 @@ WebSocket, включается отдельно, IOF_WEB_TERMINAL=1) и стр�
 бот берёт у панели (BotViews): тот же разбор, ссылки Hysteria2 — отдельным методом и только админу.
 Действия бота (BotActions) — задачи в той же очереди с теми же шагами, что у кнопок панели.
 
-Без зависимостей, нужен только python3. По умолчанию слушает 127.0.0.1:8088,
-снаружи заходить через SSH-туннель:  ssh -L 8088:127.0.0.1:8088 admin@сервер
+Нужен только python3. Слушает на loopback: через SSH-туннель по HTTP или через
+локальный обратный прокси с HTTPS по /admin/. Учётные данные хранятся в web-auth.json.
 
 Запуск:  python3 iof-web.py [--listen 127.0.0.1:8088] [--iof /usr/local/bin/iof]
-Пароль:  переменная IOF_WEB_PASSWORD (HTTP Basic, имя пользователя любое).
-Слушать не на loopback без пароля сервер откажется.
 """
 
 import argparse
@@ -47,10 +45,13 @@ import threading
 import time
 from http import HTTPStatus
 from http.client import HTTPException
+from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 from urllib.request import Request, urlopen
+
+from iof_auth import Credentials, SESSION_TTL, password_ok
 
 # Telegram-бот: модуль рядом с панелью. Если он не загрузился, панель работает без бота
 try:
@@ -81,6 +82,10 @@ STATIC_FILES = {
     "/node.js": ("node.js", "text/javascript; charset=utf-8"),
     "/service.html": ("service.html", "text/html; charset=utf-8"),
     "/service.js": ("service.js", "text/javascript; charset=utf-8"),
+    "/settings.html": ("settings.html", "text/html; charset=utf-8"),
+    "/settings.js": ("settings.js", "text/javascript; charset=utf-8"),
+    "/login.html": ("login.html", "text/html; charset=utf-8"),
+    "/login.js": ("login.js", "text/javascript; charset=utf-8"),
     "/security.html": ("security.html", "text/html; charset=utf-8"),
     "/security.js": ("security.js", "text/javascript; charset=utf-8"),
     "/bot.html": ("bot.html", "text/html; charset=utf-8"),
@@ -104,7 +109,7 @@ SECURITY_HEADERS = {
     "X-Content-Type-Options": "nosniff",
     "X-Frame-Options": "DENY",
     "Referrer-Policy": "no-referrer",
-    "Content-Security-Policy": "default-src 'self'; img-src 'self' data:; frame-ancestors 'none'",
+    "Content-Security-Policy": "default-src 'self'; img-src 'self' data:; frame-ancestors 'none'; form-action 'self'",
 }
 
 
@@ -1098,7 +1103,6 @@ def action_steps(srv, kind, body):
 
 PROBE_SCRIPT = Path(__file__).resolve().parent / "probe.ps1"
 PROBE_PLACEHOLDER = "__IOF_PROBE_CONFIG__"
-PANEL_ORIGIN = re.compile(r"^https?://[A-Za-z0-9.:\[\]-]+$")
 
 
 class Probes:
@@ -1572,8 +1576,9 @@ class Terminals:
         self.lock = threading.Lock()
         self.tickets = {}
         self.active = 0
+        self.connections = {}
 
-    def issue(self, name, ssh, cols, rows):
+    def issue(self, name, ssh, cols, rows, scope, token):
         """Билет на терминал узла. ValueError с текстом для страницы."""
         if ssh != "local" and not TERM_SSH.match(ssh):
             raise ValueError(f"у узла {name} в nodes.conf непонятный адрес SSH: {ssh}")
@@ -1584,21 +1589,37 @@ class Terminals:
                 raise ValueError(f"открыто уже {self.MAX} терминала, закрой лишний")
             ticket = secrets.token_urlsafe(24)
             self.tickets[ticket] = {"name": name, "ssh": ssh, "cols": cols, "rows": rows,
-                                    "expires": now + self.TICKET_TTL}
+                                    "expires": now + self.TICKET_TTL, "scope": scope, "token": token}
         return ticket
 
-    def take(self, ticket):
+    def take(self, ticket, scope, token, sock, authorized):
         """Билет погашается сразу, повторно по нему не войти."""
         with self.lock:
-            s = self.tickets.pop(ticket, None)
-            if s is None or s["expires"] < time.time():
+            s = self.tickets.get(ticket)
+            if (s is None or s["expires"] < time.time() or s["scope"] != scope
+                    or s["token"] != token or not authorized()):
                 return None
+            del self.tickets[ticket]
             self.active += 1
+            self.connections[sock] = s
             return s
 
-    def release(self):
+    def release(self, sock):
         with self.lock:
+            self.connections.pop(sock, None)
             self.active -= 1
+
+    def revoke(self, valid):
+        with self.lock:
+            now = time.time()
+            self.tickets = {t: s for t, s in self.tickets.items() if s["expires"] > now and valid(s)}
+            for sock, s in self.connections.items():
+                if valid(s):
+                    continue
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
 
     def command(self, s, pw):
         """argv терминала: ssh с ключом iof и теми же настройками, что ssh_cmd в iof, или оболочка root."""
@@ -1622,7 +1643,7 @@ class Terminals:
 
     @staticmethod
     def environment(pw):
-        # Окружение с нуля: в окружении панели лежит web.env, в том числе пароль панели
+        # Окружение с нуля: служебные настройки из web.env в оболочку не передаём
         return {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
                 "HOME": pw.pw_dir, "USER": pw.pw_name, "LOGNAME": pw.pw_name, "SHELL": pw.pw_shell or "/bin/bash",
                 "TERM": "xterm-256color", "COLORTERM": "truecolor", "LANG": "C.UTF-8"}
@@ -1632,7 +1653,7 @@ class Terminals:
         try:
             self.session(s, ws, sock)
         finally:
-            self.release()
+            self.release(sock)
 
     def session(self, s, ws, sock):
         pw = pwd.getpwuid(os.getuid())
@@ -1877,14 +1898,42 @@ def log(text):
 
 # HTTP
 
-def host_only(value):
-    """Имя хоста из заголовка Host или Origin без схемы и порта, в нижнем регистре."""
-    h = (value or "").strip().lower()
-    if "://" in h:
-        h = urlsplit(h).netloc
-    if h.startswith("["):
-        return h[1:h.find("]")] if "]" in h else ""
-    return h.rsplit(":", 1)[0] if ":" in h else h
+LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
+HOST_HEADER = re.compile(r"(\[[0-9a-f:.]+\]|[a-z0-9][a-z0-9.-]{0,252})(?::([0-9]{1,5}))?")
+PUBLIC_FILES = {"/login.html", "/login.js", "/common.js", "/app.css", "/favicon.svg"}
+SESSION_COOKIE = "iof_session"
+
+
+class LoginLimit:
+    """Общий лимит внешнего входа для всех имён и IP панели."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.allowed = 10
+        self.updated = time.monotonic()
+
+    def take(self):
+        with self.lock:
+            now = time.monotonic()
+            self.allowed = min(10, self.allowed + (now - self.updated) / 6)
+            self.updated = now
+            if self.allowed < 1:
+                return False
+            self.allowed -= 1
+            return True
+
+
+class PanelServer(ThreadingHTTPServer):
+    def service_actions(self):
+        # Вход проверяется по файлу на каждом запросе. Здесь закрываем уже открытые сокеты
+        # после локального сброса или истечения сеанса, не перезапуская панель и её задачи.
+        if not (self.terms.active or self.terms.tickets):
+            return
+        try:
+            cfg = self.auth.read()
+        except OSError:
+            cfg = None
+        self.terms.revoke(lambda s: cfg is not None and self.auth.valid(cfg, s["scope"], s["token"]))
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1892,74 +1941,82 @@ class Handler(BaseHTTPRequestHandler):
     sys_version = ""
 
     def do_GET(self):
-        if not self.host_allowed():
+        route = self.route()
+        if route is None:
             return
-        url = urlsplit(self.path)
-        query = {k: v[0] for k, v in parse_qs(url.query).items()}
-        # Вместо пароля панели здесь одноразовый билет: его выдаёт POST /api/term, уже с паролем.
-        # Заголовок Authorization на WebSocket браузеры отправляют не всегда
-        if url.path == "/api/term/ws":
+        path, query = route
+        if path in PUBLIC_FILES:
+            return self.static(*STATIC_FILES[path])
+        if path == "/api/term/ws":
             return self.term_ws(query.get("t", ""))
         # Скрипт проверки с ПК тоже по одноразовому билету: его забирает PowerShell без пароля панели
-        if url.path == "/api/probe/script":
+        if path == "/api/probe/script":
             return self.probe_script(query.get("t", ""))
         if not self.authorized():
+            if path in STATIC_FILES and STATIC_FILES[path][0].endswith(".html"):
+                return self.redirect(self.prefix + "/login.html")
+            self.auth_required()
             return
         force = query.get("force") == "1"
-        if url.path == "/api/setup":
+        if path == "/api/setup":
             return self.send_json(setup_view(self.server))
-        if url.path == "/api/dashboard":
+        if path == "/api/dashboard":
             return self.dashboard(force)
-        if url.path == "/api/hy2":
+        if path == "/api/hy2":
             return self.hy2(force)
-        if url.path == "/api/hy2/qr":
+        if path == "/api/hy2/qr":
             return self.hy2_qr(query.get("g", ""), query.get("i", ""))
-        if url.path == "/api/awg":
+        if path == "/api/awg":
             data = self.server.cache.get(force)
             data.update(clients=read_awg_clients(self.server.base), migrate=read_migrate(self.server.base))
             return self.send_json(data)
-        if url.path == "/api/awg/keys":
+        if path == "/api/awg/keys":
             try:
                 return self.send_json({"links": read_awg_keys(self.server.base, query.get("name", ""))})
             except ValueError as e:
                 return self.send_json({"error": str(e)}, HTTPStatus.NOT_FOUND)
-        if url.path == "/api/nodes/add-info":
+        if path == "/api/nodes/add-info":
             return self.add_info()
-        if url.path == "/api/nodes/countries":
+        if path == "/api/nodes/countries":
             rows = read_conf(self.server.base / "nodes.conf", 4)
             return self.send_json(self.server.countries.get(addr for _, addr, _, _ in rows if addr))
-        if url.path == "/api/migrate":
+        if path == "/api/migrate":
             return self.migrate_info()
-        if url.path == "/api/node":
+        if path == "/api/node":
             return self.node_info(query.get("n", ""), force)
-        if url.path == "/api/service":
+        if path == "/api/service":
             return self.service_info(query.get("fetch") == "1")
-        if url.path == "/api/security":
+        if path == "/api/security":
             return self.security_info()
-        if url.path == "/api/probe":
+        if path == "/api/probe":
             return self.send_json(self.server.probes.state())
-        if url.path == "/api/bot":
+        if path == "/api/bot":
             return self.send_json(self.bot_info())
-        if url.path == "/api/jobs":
+        if path == "/api/jobs":
             return self.send_json({"jobs": self.server.jobs.list()})
-        if url.path in STATIC_FILES:
-            return self.static(*STATIC_FILES[url.path])
+        if path in STATIC_FILES:
+            return self.static(*STATIC_FILES[path])
         self.send_json({"error": "не найдено"}, HTTPStatus.NOT_FOUND)
 
     def do_POST(self):
-        if not self.host_allowed():
+        route = self.route()
+        if route is None:
             return
-        url = urlsplit(self.path)
-        path = url.path
+        path, query = route
+        if not self.same_origin(require_origin=path in ("/api/login", "/api/password")):
+            return
         # Отчёт скрипта с ПК: вместо пароля панели одноразовый билет, остальная защита как у всех POST
         if path == "/api/probe/result":
-            if self.same_origin():
-                self.probe_result(parse_qs(url.query).get("t", [""])[0])
+            return self.probe_result(query.get("t", ""))
+        if path == "/api/login":
+            body = self.read_json()
+            if body is not None:
+                self.login(body)
             return
-        if not self.authorized() or not self.same_origin():
-            return
+        if not self.authorized():
+            return self.auth_required()
         if path not in ("/api/nodes", "/api/migrate", "/api/hy2", "/api/awg", "/api/node", "/api/service", "/api/security",
-                        "/api/term", "/api/probe", "/api/bot", "/api/setup"):
+                        "/api/term", "/api/probe", "/api/bot", "/api/setup", "/api/password"):
             return self.send_json({"error": "не найдено"}, HTTPStatus.NOT_FOUND)
         body = self.read_json()
         if body is None:
@@ -1970,6 +2027,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.probe_action(body)
         if path == "/api/bot":
             return self.bot_action(body)
+        if path == "/api/password":
+            return self.change_password(body)
         try:
             kind, title, steps = self.job_for(path, body)
         except ValueError as e:
@@ -2001,20 +2060,39 @@ class Handler(BaseHTTPRequestHandler):
             return action_steps(srv, kind, body)
         return ("service", *service_steps(srv.iof, body))
 
-    # Защита от DNS rebinding: чужой домен, указывающий на 127.0.0.1, не получит ответ панели
-    def host_allowed(self):
-        if host_only(self.headers.get("Host")) in self.server.hosts:
-            return True
-        self.send_json({"error": "неизвестный Host, см. IOF_WEB_HOSTS"}, HTTPStatus.FORBIDDEN)
-        return False
+    def route(self):
+        # Внешний HTTPS-прокси заменяет X-IOF-HTTPS. Имена по-прежнему проверяем по Host.
+        values = self.headers.get_all("Host", [])
+        host = HOST_HEADER.fullmatch(values[0].lower()) if len(values) == 1 else None
+        name = host[1].strip("[]") if host else ""
+        port = int(host[2]) if host and host[2] else None
+        if name not in self.server.hosts or (port is not None and not 1 <= port <= 65535):
+            self.send_json({"error": "неизвестный Host, см. IOF_WEB_HOSTS"}, HTTPStatus.FORBIDDEN)
+            return None
+        self.secure = name not in LOCAL_HOSTS
+        if self.secure != (self.headers.get("X-IOF-HTTPS") == "1"):
+            self.send_json({"error": "неверный способ подключения к панели"}, HTTPStatus.FORBIDDEN)
+            return None
+        scheme, default_port = ("https", 443) if self.secure else ("http", 80)
+        authority = host[1] + (f":{port}" if port and port != default_port else "")
+        self.origin = f"{scheme}://{authority}"
+        path, _, query = self.path.partition("?")
+        if path == "/admin" and self.command == "GET":
+            self.redirect("/admin/")
+            return None
+        self.prefix = "/admin" if path.startswith("/admin/") else ""
+        if not self.prefix and (self.secure or not path.startswith("/")):
+            self.send_json({"error": "не найдено"}, HTTPStatus.NOT_FOUND)
+            return None
+        return path.removeprefix(self.prefix), {k: v[0] for k, v in parse_qs(query).items()}
 
     # Защита от CSRF: менять что-то можно только со страниц самой панели. Свой заголовок
     # браузер не даст отправить с чужого сайта без preflight, а на него сервер не отвечает
-    def same_origin(self):
+    def same_origin(self, require_origin):
         origin = self.headers.get("Origin")
         ok = (self.headers.get("X-IOF-Request") == "1"
-              and self.headers.get("Content-Type", "").startswith("application/json")
-              and (origin is None or host_only(origin) in self.server.hosts))
+              and self.headers.get_content_type() == "application/json"
+              and (origin == self.origin or (origin is None and not require_origin)))
         if not ok:
             self.send_json({"error": "запрос не со страницы панели"}, HTTPStatus.FORBIDDEN)
         return ok
@@ -2067,23 +2145,63 @@ class Handler(BaseHTTPRequestHandler):
             "busy": self.server.jobs.busy(),
         })
 
+    def session_token(self):
+        try:
+            cookie = SimpleCookie(self.headers.get("Cookie", "")).get(SESSION_COOKIE)
+            return cookie.value if cookie else ""
+        except CookieError:
+            return ""
+
     def authorized(self):
-        password = self.server.password
-        if not password:
-            return True
-        header = self.headers.get("Authorization", "")
-        if header.startswith("Basic "):
-            try:
-                given = base64.b64decode(header[6:]).decode("utf-8").split(":", 1)[1]
-            except (ValueError, IndexError, UnicodeDecodeError):
-                given = ""
-            if hmac.compare_digest(given.encode(), password.encode()):
-                return True
-        self.send_response(HTTPStatus.UNAUTHORIZED)
-        self.send_header("WWW-Authenticate", 'Basic realm="iof", charset="UTF-8"')
-        self.send_header("Content-Length", "0")
-        self.end_headers()
-        return False
+        token = self.session_token()
+        if not token:
+            return False
+        auth = self.server.auth
+        try:
+            return auth.valid(auth.read(), self.origin, token)
+        except OSError:
+            return False
+
+    def auth_required(self):
+        self.send_json({"error": "Войдите в панель."}, HTTPStatus.UNAUTHORIZED)
+
+    def cookie(self, token, age):
+        path = "/admin/" if self.secure else "/"
+        return (f"{SESSION_COOKIE}={token}; Path={path}; Max-Age={age}; HttpOnly; SameSite=Strict"
+                + ("; Secure" if self.secure else ""))
+
+    def login(self, body):
+        if not self.server.login_limits[self.secure].take():
+            return self.send_json({"error": "Слишком много попыток. Повторите через несколько секунд."},
+                                  HTTPStatus.TOO_MANY_REQUESTS)
+        auth = self.server.auth
+        try:
+            cfg = auth.read()
+        except OSError:
+            return self.send_json({"error": "Учётные данные панели недоступны."}, HTTPStatus.SERVICE_UNAVAILABLE)
+        if not auth.verify(cfg, body.get("password")) or body.get("login") != cfg["login"]:
+            return self.send_json({"error": "Неверный логин или пароль."}, HTTPStatus.UNAUTHORIZED)
+        token = auth.issue(cfg, self.origin)
+        self.send_json({"ok": True}, extra={"Set-Cookie": self.cookie(token, SESSION_TTL)})
+
+    def change_password(self, body):
+        try:
+            not_migrating(read_migrate(self.server.base))
+        except ValueError as e:
+            return self.send_json({"error": str(e)}, HTTPStatus.CONFLICT)
+        password = body.get("password")
+        if not password_ok(password):
+            return self.send_json({"error": "Введите новый пароль длиной до 1024 символов."}, HTTPStatus.BAD_REQUEST)
+        if password != body.get("confirmation"):
+            return self.send_json({"error": "Пароли не совпадают."}, HTTPStatus.BAD_REQUEST)
+        try:
+            error = self.server.auth.change(self.origin, self.session_token(), body.get("current"), password)
+        except OSError:
+            return self.send_json({"error": "Не удалось сохранить пароль."}, HTTPStatus.SERVICE_UNAVAILABLE)
+        if error:
+            return self.send_json({"error": error}, HTTPStatus.BAD_REQUEST)
+        self.server.service_actions()
+        self.send_json({"ok": True}, extra={"Set-Cookie": self.cookie("", 0)})
 
     def dashboard(self, force):
         base = self.server.base
@@ -2125,7 +2243,8 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError(f"узла {name} нет в nodes.conf")
             if not term_size_ok(body.get("cols"), body.get("rows")):
                 raise ValueError("размер терминала: cols от 2 до 500, rows от 2 до 200")
-            ticket = terms.issue(name, row[2] or "local", body["cols"], body["rows"])
+            ticket = terms.issue(name, row[2] or "local", body["cols"], body["rows"],
+                                 self.origin, self.session_token())
         except ValueError as e:
             return self.send_json({"error": str(e)}, HTTPStatus.BAD_REQUEST)
         self.send_json({"ticket": ticket})
@@ -2134,13 +2253,13 @@ class Handler(BaseHTTPRequestHandler):
     # ставит на WebSocket всегда, по нему отсекаются чужие сайты
     def term_ws(self, ticket):
         origin = self.headers.get("Origin")
-        if not origin or host_only(origin) not in self.server.hosts:
+        if origin != self.origin:
             return self.send_json({"error": "запрос не со страницы панели"}, HTTPStatus.FORBIDDEN)
         key = self.headers.get("Sec-WebSocket-Key", "")
         if (self.headers.get("Upgrade", "").lower() != "websocket"
                 or self.headers.get("Sec-WebSocket-Version") != "13" or len(key) != 24):
             return self.send_json({"error": "здесь только WebSocket"}, HTTPStatus.BAD_REQUEST)
-        session = self.server.terms.take(ticket)
+        session = self.server.terms.take(ticket, self.origin, self.session_token(), self.connection, self.authorized)
         if session is None:
             return self.send_json({"error": "билет терминала неверный или устарел"}, HTTPStatus.FORBIDDEN)
         self.close_connection = True
@@ -2148,7 +2267,7 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
                               f"Sec-WebSocket-Accept: {ws_accept(key)}\r\n\r\n").encode())
         except OSError:
-            self.server.terms.release()
+            self.server.terms.release(self.connection)
             return
         self.log_request(101)
         self.server.terms.run(session, WebSocket(self.rfile, self.wfile), self.connection)
@@ -2210,17 +2329,13 @@ class Handler(BaseHTTPRequestHandler):
                               "link": f"https://t.me/{cfg['username']}?start={code}" if cfg.get("username") else None}
         self.send_json(data)
 
-    # POST /api/probe {action: start, nodes, origin} — мишени и билет для ПК; {action: cancel} — остановить.
-    # origin — адрес панели в браузере: по нему скрипт с ПК сдаст отчёт
+    # POST /api/probe {action: start, nodes} — мишени и билет для ПК; {action: cancel} — остановить.
     def probe_action(self, body):
         srv = self.server
         action, ticket = body.get("action"), None
         try:
             not_migrating(read_migrate(srv.base))
             if action == "start":
-                origin = text_field(body, "origin", 300).rstrip("/")
-                if not PANEL_ORIGIN.match(origin) or host_only(origin) not in srv.hosts:
-                    raise ValueError("адрес панели не из IOF_WEB_HOSTS: открой панель по имени из этого списка")
                 names = body.get("nodes") or []
                 if not isinstance(names, list) or len(names) > 500 or not all(isinstance(n, str) for n in names):
                     raise ValueError("узлы: список имён")
@@ -2244,7 +2359,7 @@ class Handler(BaseHTTPRequestHandler):
         if job is None:
             return self.send_json({"error": "уже идёт другая задача, дождись её окончания"}, HTTPStatus.CONFLICT)
         if action == "start":
-            ticket = srv.probes.begin(origin, job["id"])
+            ticket = srv.probes.begin(self.origin + self.prefix, job["id"])
         else:
             srv.probes.cancel()
         self.send_json({"job": job["id"], "ticket": ticket}, HTTPStatus.ACCEPTED)
@@ -2301,11 +2416,15 @@ class Handler(BaseHTTPRequestHandler):
             body = (STATIC_DIR / name).read_bytes()
         except OSError:
             return self.send_json({"error": "не найдено"}, HTTPStatus.NOT_FOUND)
-        self.send_body(body, ctype, "no-cache")
+        self.send_body(body, ctype, "no-store" if ctype.startswith("text/html") else "no-cache")
 
-    def send_json(self, obj, status=HTTPStatus.OK):
+    def redirect(self, location):
+        self.send_body(b"", "text/plain; charset=utf-8", "no-store", HTTPStatus.SEE_OTHER,
+                       extra={"Location": location})
+
+    def send_json(self, obj, status=HTTPStatus.OK, extra=None):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-        self.send_body(body, "application/json; charset=utf-8", "no-store", status)
+        self.send_body(body, "application/json; charset=utf-8", "no-store", status, extra=extra)
 
     def send_body(self, body, ctype, cache, status=HTTPStatus.OK, extra=None):
         self.send_response(status)
@@ -2327,31 +2446,36 @@ def main():
                     help="адрес:порт, по умолчанию 127.0.0.1:8088")
     ap.add_argument("--iof", default=os.environ.get("IOF_BIN", "/usr/local/bin/iof"))
     ap.add_argument("--base", default=os.environ.get("IOF_BASE", "/root/iof"))
+    ap.add_argument("--auth-base", type=Path, help="каталог web-auth.json (по умолчанию тот же, что --base)")
     ap.add_argument("--ttl", type=int, default=int(os.environ.get("IOF_WEB_TTL", "20")),
                     help="сколько секунд держать результат опроса узлов")
     args = ap.parse_args()
 
     host, _, port = args.listen.rpartition(":")
     host = host.strip("[]") or "127.0.0.1"
-    password = os.environ.get("IOF_WEB_PASSWORD", "")
     try:
-        loopback = ipaddress.ip_address(host).is_loopback
+        loopback = ipaddress.IPv4Address(host).is_loopback
     except ValueError:
         loopback = host == "localhost"
-    if not loopback and not password:
-        sys.exit(f"Отказываюсь слушать {host} без пароля: задай IOF_WEB_PASSWORD "
-                 "или оставь 127.0.0.1 и заходи через SSH-туннель")
+    if not loopback:
+        sys.exit("Панель слушает только на loopback. Для внешнего входа настрой HTTPS-прокси.")
+
+    auth = Credentials(args.auth_base or Path(args.base))
+    try:
+        auth.read()
+    except OSError:
+        sys.exit("Учётные данные панели недоступны. Проверь web-auth.json и запусти install.sh.")
 
     # Имена, по которым панель открывают в браузере. Через SSH-туннель это 127.0.0.1 или
     # localhost; за nginx с доменом добавь домен в IOF_WEB_HOSTS (через запятую)
-    hosts = {"127.0.0.1", "localhost", "::1", host.lower()}
-    hosts |= {host_only(h) for h in os.environ.get("IOF_WEB_HOSTS", "").split(",") if h.strip()}
+    hosts = LOCAL_HOSTS | {h.strip().lower().strip("[]") for h in os.environ.get("IOF_WEB_HOSTS", "").split(",") if h.strip()}
 
-    srv = ThreadingHTTPServer((host, int(port)), Handler)
+    srv = PanelServer((host, int(port)), Handler)
     srv.daemon_threads = True
     srv.base = Path(args.base)
     srv.iof = args.iof
-    srv.password = password
+    srv.auth = auth
+    srv.login_limits = {False: LoginLimit(), True: LoginLimit()}
     srv.hosts = hosts
     ssh_key = os.environ.get("IOF_SSH_KEY", "/root/.ssh/iof_ed25519")
     srv.ssh_pub = Path(ssh_key + ".pub")

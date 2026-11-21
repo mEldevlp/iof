@@ -50,6 +50,7 @@ Island of Freedom управление VPN-серверами // by meldevlp
   iof check                   проверка для cron, уведомление в Telegram при изменениях; раз в сутки ещё
                               обновления iof и доступ к российским серверам с узлов (RU_TARGETS), --daily — сейчас
   iof notify тип [текст]      уведомление в Telegram (без текста — со stdin), типы: nodes audit nightly updates ru admins
+  iof web reset-password     сбросить пароль панели без старого пароля и отозвать сеансы
   iof exec "команда"          выполнить команду на узлах
   iof refresh                 пересобрать все ссылки hy2 и ключи awg
   iof init                    первичная настройка управляющего сервера
@@ -176,6 +177,7 @@ case "$cmd:${1:-}" in
   hy2:add|hy2:del|hy2:refresh|hy2:install|hy2:hop|hy2:upgrade|awg:install|awg:add|awg:del|awg:refresh) migrate_guard ;;
   block:on|block:update|block:off) migrate_guard ;;
   bot:token|bot:on|bot:off|bot:set|bot:invite|bot:redeem|bot:admin) migrate_guard ;;
+  web:reset-password) migrate_guard ;;
 esac
 # Мишени проверки с ПК меняют узлы, а import пишет результат сюда, а не на новый сервер
 case "$cmd:${1:-}:${2:-}" in
@@ -195,6 +197,7 @@ case "$cmd" in
   status)  cmd_status ;;
   check)   cmd_check "$@" ;;
   notify)  cmd_notify "$@" ;;
+  web)     cmd_web "$@" ;;
   exec)    cmd_exec "$@" ;;
   refresh) cmd_refresh ;;
   api)     cmd_api "$@" ;;

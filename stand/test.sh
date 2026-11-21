@@ -200,8 +200,12 @@ panel_act() {
   on_in "$M" python3 - "$1" <<'PY'
 import json, sys, time, urllib.error, urllib.request
 
+sys.path.insert(0, "/opt/iof/stand")
+from panel_client import panel_cookie
+
 BASE = "http://127.0.0.1:8088"
-POST = {"X-IOF-Request": "1", "Content-Type": "application/json", "Origin": BASE}
+COOKIE = panel_cookie(BASE)
+POST = {"X-IOF-Request": "1", "Content-Type": "application/json", "Origin": BASE, "Cookie": COOKIE}
 r = urllib.request.Request(BASE + "/api/security", data=sys.argv[1].encode(), method="POST", headers=POST)
 try:
     with urllib.request.urlopen(r, timeout=30) as resp:
@@ -212,7 +216,8 @@ if code != 202:
     print(f"refused {code} {data.get('error', '')}")
     sys.exit(0)
 for _ in range(600):
-    with urllib.request.urlopen(BASE + "/api/jobs", timeout=30) as resp:
+    req = urllib.request.Request(BASE + "/api/jobs", headers={"Cookie": COOKIE})
+    with urllib.request.urlopen(req, timeout=30) as resp:
         job = next((j for j in json.loads(resp.read())["jobs"] if j["id"] == data["job"]), None)
     if job and job["state"] != "running":
         print(job["state"], job["title"])
@@ -697,8 +702,12 @@ check_bot() {
 import glob, hashlib, json, os, re, shutil, subprocess, sys, time, urllib.error, urllib.request
 from html import escape
 
+sys.path.insert(0, "/opt/iof/stand")
+from panel_client import panel_cookie
+
 FAKE = "http://127.0.0.1:8089"
 PANEL = "http://127.0.0.1:8088"
+COOKIE = panel_cookie(PANEL)
 POST = {"X-IOF-Request": "1", "Content-Type": "application/json", "Origin": PANEL}
 # Токены для поддельного API: номер 0 он считает отозванным. Настоящего токена здесь нет
 TOKEN = "777000:AAEstandFakeTokenForIofBotTests_x1"
@@ -728,7 +737,7 @@ def panel(path, body=None, headers=None):
     """Запрос к панели: без тела GET, с телом POST с обычной защитой. -> (код, JSON-ответ)."""
     data = json.dumps(body).encode() if body is not None else None
     r = urllib.request.Request(PANEL + path, data=data, method="POST" if data else "GET",
-                               headers=headers if headers is not None else (POST if data else {}))
+                               headers={"Cookie": COOKIE, **(headers if headers is not None else (POST if data else {}))})
     try:
         with urllib.request.urlopen(r, timeout=60) as resp:
             return resp.status, json.loads(resp.read())
@@ -2260,7 +2269,11 @@ check_panel() {
   out="$(on_in "$M" python3 - "$PANEL_GROUP" "${NAMES[*]}" "${PROBE_PY[*]}" 2>&1 <<'PY'
 import base64, json, os, re, socket, struct, sys, time, urllib.error, urllib.request
 
+sys.path.insert(0, "/opt/iof/stand")
+from panel_client import panel_cookie
+
 BASE = "http://127.0.0.1:8088"
+COOKIE = panel_cookie(BASE)
 label, nodes = sys.argv[1], set(sys.argv[2].split())
 probe_nodes = sys.argv[3].split() if len(sys.argv) > 3 else []
 POST = {"X-IOF-Request": "1", "Content-Type": "application/json", "Origin": BASE}
@@ -2268,7 +2281,8 @@ POST = {"X-IOF-Request": "1", "Content-Type": "application/json", "Origin": BASE
 
 def req(path, method="GET", body=None, headers=None):
     data = json.dumps(body).encode() if body is not None else None
-    r = urllib.request.Request(BASE + path, data=data, method=method, headers=headers or {})
+    auth = {} if path.startswith(("/api/probe/script?", "/api/probe/result?")) else {"Cookie": COOKIE}
+    r = urllib.request.Request(BASE + path, data=data, method=method, headers={**auth, **(headers or {})})
     try:
         with urllib.request.urlopen(r, timeout=200) as resp:
             return resp.status, resp.read()
@@ -2315,7 +2329,7 @@ def ws_open(path, origin=BASE):
     s = socket.create_connection(("127.0.0.1", 8088), timeout=20)
     key = base64.b64encode(os.urandom(16)).decode()
     s.sendall((f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1:8088\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
-               f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\nOrigin: {origin}\r\n\r\n").encode())
+               f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\nOrigin: {origin}\r\nCookie: {COOKIE}\r\n\r\n").encode())
     head = b""
     while b"\r\n\r\n" not in head:
         c = s.recv(1)

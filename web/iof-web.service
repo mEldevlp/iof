@@ -5,9 +5,10 @@ Wants=network-online.target
 
 [Service]
 # От root: iof требует root и читает /root/iof и /root/.ssh/iof_ed25519
-ExecStart=/usr/bin/python3 /opt/iof-web/iof-web.py --listen 127.0.0.1:8088
-# Необязательно: IOF_WEB_PASSWORD=..., IOF_WEB_LISTEN=..., IOF_WEB_TTL=...
+ExecStart=/usr/bin/python3 /opt/iof-web/iof-web.py --listen 127.0.0.1:8088 --auth-base /root/iof
+# Необязательно: IOF_WEB_HOSTS=..., IOF_WEB_TTL=...
 EnvironmentFile=-/root/iof/web.env
+UnsetEnvironment=IOF_WEB_PASSWORD
 Restart=on-failure
 RestartSec=3
 NoNewPrivileges=yes

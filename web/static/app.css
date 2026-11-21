@@ -485,6 +485,14 @@ img.qr { display: block; width: 100%; max-width: 240px; height: auto; margin: 0 
 .field .hint { margin-top: 4px; font-size: 12px; line-height: 16px; }
 .field [aria-invalid="true"] { border-color: var(--crit); }
 .field-error { margin: 4px 0 0; font-size: 12px; color: var(--crit); font-weight: 500; }
+.login-page { min-height: 100vh; display: grid; place-items: center; padding: 20px; }
+.login-card { width: min(100%, 390px); padding: 24px; }
+.login-card .brand { padding: 0; }
+.login-card h1 { margin: 24px 0 16px; font-size: 22px; }
+.settings-card { max-width: 500px; }
+.password-form { display: grid; gap: 14px; }
+.password-form > .btn { justify-self: start; }
+.password-form .form-error { margin: 0; }
 .input-row { display: flex; gap: 8px; align-items: center; margin-top: 0; }
 .input-row input { flex: 1; }
 .field textarea + .input-row { margin-top: 8px; align-items: flex-start; }
