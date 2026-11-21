@@ -82,7 +82,7 @@
         </button>
         <div class="page-title">
           <h1>Телеграм бот</h1>
-          <p>Бот iof в Telegram: работает внутри панели и отвечает только админам в личном чате</p>
+          <p>Бот iof в Telegram отвечает админам в личном чате</p>
         </div>
         <div class="controls">
           <button id="refresh" class="btn" type="button">
@@ -109,6 +109,17 @@
             </div>
             <div id="bot-state" class="health" role="status"></div>
             <dl id="bot-kv" class="kv"></dl>
+            <form id="server-form" class="form">
+              <div class="field">
+                <label for="bot-server">Сервер бота</label>
+                <div class="input-row">
+                  <select id="bot-server" data-lock></select>
+                  <button id="bot-move" class="btn" type="submit" data-lock>Перенести</button>
+                </div>
+                <p class="hint">Выбери сервер, с которого доступен Telegram.</p>
+                <p id="bot-move-state" class="hint" role="status" hidden></p>
+              </div>
+            </form>
             <form id="token-form" class="form" novalidate autocomplete="off">
               <fieldset>
                 <legend>Токен</legend>
@@ -198,7 +209,7 @@
         </section>
       </main>
 
-      <footer class="foot">iof-web · бот работает внутри панели: остановится панель — остановится и бот. Токен и коды приглашений на сервере не показываются</footer>
+      <footer class="foot">iof-web · панель запускает бота и восстанавливает связь с выбранным сервером после перезапуска</footer>
     </div>
   </div>
 

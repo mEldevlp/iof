@@ -9,10 +9,9 @@
 обновление: iof update; перенос управляющего сервера: iof migrate; проверка безопасности:
 iof audit run, она узлы только читает; проверка с ПК: iof audit probe), по одной задаче за раз,
 с логом выполнения. Исключения — терминал на узел со страницы узла (ssh с ключом iof через
-WebSocket, включается отдельно, IOF_WEB_TERMINAL=1) и страница «Телеграм бот»: её команды iof bot
-быстрые и узлы не трогают, поэтому идут сразу, а не задачей. Скрипт проверки с ПК и его отчёт ходят
-по одноразовому билету вместо пароля панели. Telegram-бот (iof_bot.py рядом) работает потоком
-внутри панели; включает его iof bot on, без модуля панель работает как раньше. Данные страниц
+WebSocket, включается отдельно, IOF_WEB_TERMINAL=1) и страница «Телеграм бот», у которой свой ход
+операции переноса. Скрипт проверки с ПК и его отчёт ходят по одноразовому билету вместо пароля
+панели. Telegram-бот работает потоком в панели или отдельным процессом на узле по SSH. Данные страниц
 бот берёт у панели (BotViews): тот же разбор, ссылки Hysteria2 — отдельным методом и только админу.
 Действия бота (BotActions) — задачи в той же очереди с теми же шагами, что у кнопок панели.
 
@@ -55,10 +54,10 @@ from iof_auth import Credentials, SESSION_TTL, password_ok
 
 # Telegram-бот: модуль рядом с панелью. Если он не загрузился, панель работает без бота
 try:
-    import iof_bot
+    import iof_bot_host
     BOT_IMPORT_ERROR = None
 except Exception as e:  # ошибка в модуле бота не должна ронять панель
-    iof_bot = None
+    iof_bot_host = None
     BOT_IMPORT_ERROR = f"{type(e).__name__}: {e}"
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -1387,6 +1386,19 @@ def bot_args(body):
     raise ValueError("неизвестное действие")
 
 
+def bot_servers(base):
+    servers = [{"name": "", "title": "Управляющий сервер", "route": ""}]
+    if iof_bot_host:
+        for name, _, ssh, title in read_conf(base / "nodes.conf", 4):
+            try:
+                route = iof_bot_host.route_for(ssh)
+            except ValueError:
+                continue
+            if route and not any(s["route"] == route for s in servers):
+                servers.append({"name": name, "title": title or name, "route": route})
+    return servers
+
+
 def bot_notify(base):
     """Куда идут уведомления iof для страниц «Сервис» и «Безопасность»: через бота (включён, есть токен,
     сервер не принимает управление при переносе) — {username, subs: {тип: сколько админов подписано}},
@@ -2279,7 +2291,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(security_view(self.server))
 
     # Страница «Телеграм бот»: bot.json без хэшей приглашений (только начало), есть ли токен (сам токен
-    # не отдаётся) и состояние потока бота. thread = None — модуль бота не загрузился, причина в thread_error
+    # не отдаётся), состояние бота и ход переноса. thread = None — модуль бота не загрузился
     def bot_info(self):
         srv = self.server
         cfg, error = read_bot(srv.base)
@@ -2287,6 +2299,9 @@ class Handler(BaseHTTPRequestHandler):
             token = (srv.base / "bot.token").stat().st_size > 0
         except OSError:
             token = False
+        servers = bot_servers(srv.base)
+        route = srv.bot.route if srv.bot else ""
+        current = next((s for s in servers if s["route"] == route), {"name": None, "title": "Узел вне списка"})
         return {
             "config": cfg,
             "config_error": error,
@@ -2296,6 +2311,9 @@ class Handler(BaseHTTPRequestHandler):
             "tz": time.strftime("%z"),
             "now": time.time(),
             "migrate": read_migrate(srv.base),
+            "server": {"name": current["name"], "title": current["title"]},
+            "servers": [{k: s[k] for k in ("name", "title")} for s in servers],
+            "move": srv.bot.progress if srv.bot else None,
         }
 
     # POST /api/bot {action, ...}: iof bot сразу, без очереди задач. Ответ — первая строка вывода iof
@@ -2304,6 +2322,18 @@ class Handler(BaseHTTPRequestHandler):
         srv = self.server
         try:
             not_migrating(read_migrate(srv.base))
+            if body.get("action") == "move":
+                if not srv.bot:
+                    raise ValueError("Модуль бота недоступен")
+                target = next((s for s in bot_servers(srv.base) if s["name"] == body.get("server")), None)
+                if target is None:
+                    raise ValueError("Выбери сервер из списка")
+                route = target["route"]
+                srv.bot.submit(route, target["title"],
+                               lambda: any(s["route"] == route for s in bot_servers(srv.base)))
+                return self.send_json({"bot": self.bot_info()}, HTTPStatus.ACCEPTED)
+            if srv.bot and srv.bot.progress and srv.bot.progress["running"]:
+                raise ValueError("Дождись окончания переноса бота")
             args, stdin, secret = bot_args(body)
         except ValueError as e:
             return self.send_json({"error": str(e)}, HTTPStatus.BAD_REQUEST)
@@ -2492,26 +2522,34 @@ def main():
     srv.jobs = Jobs(on_done=on_done)
     srv.terms = Terminals(os.environ.get("IOF_WEB_TERMINAL", "").strip() == "1", ssh_key)
 
-    # Telegram-бот: поток внутри панели с общей очередью задач и опросом узлов. Работает, когда
-    # включён (iof bot on) и есть токен; адрес Bot API меняет только IOF_TG_API (стенд, CI)
+    # Telegram-бот использует общую очередь задач независимо от выбранного сервера
     # Без бота страница «Телеграм бот» показывает причину из bot_error
     srv.bot, srv.bot_error = None, None
-    if iof_bot is None:
+    if iof_bot_host is None:
         srv.bot_error = f"модуль iof_bot не загрузился: {BOT_IMPORT_ERROR}"
         log(f"бот: {srv.bot_error}, панель работает без бота")
     else:
         try:
-            srv.bot = iof_bot.Bot(srv.base, args.iof, jobs=srv.jobs, cache=srv.cache, views=BotViews(srv),
-                                  actions=BotActions(srv), api=os.environ.get("IOF_TG_API"), log=log)
+            srv.bot = iof_bot_host.BotHost(srv.base, args.iof, ssh_key, jobs=srv.jobs, cache=srv.cache,
+                                           views=BotViews(srv), actions=BotActions(srv),
+                                           api=os.environ.get("IOF_TG_API"), log=log)
             srv.bot.start()
         except Exception as e:
             srv.bot, srv.bot_error = None, f"бот не запустился: {type(e).__name__}: {e}"
             log(f"бот: {srv.bot_error}, панель работает без бота")
     print(f"iof-web: http://{args.listen}/" + ("  (терминал включён)" if srv.terms.enabled else ""), file=sys.stderr)
+
+    def shutdown(signum, frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, shutdown)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         pass
+    finally:
+        if srv.bot:
+            srv.bot.close()
 
 
 if __name__ == "__main__":

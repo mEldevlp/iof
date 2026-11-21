@@ -1,8 +1,8 @@
 "use strict";
 
 // Страница «Телеграм бот»: выключатель и токен, настройки, админы и приглашения. Данные: GET api/bot
-// (bot.json без хэшей приглашений, есть ли токен, состояние потока бота в панели), изменения:
-// POST api/bot (iof bot сразу, без очереди задач). Токен панель не отдаёт, код приглашения
+// (bot.json без хэшей приглашений, есть ли токен, сервер и состояние бота), изменения:
+// POST api/bot. Токен панель не отдаёт, код приглашения
 // приходит один раз в ответе на invite и живёт только в окне диалога
 
 const ROLES = { main: "главный", regular: "обычный" };
@@ -22,7 +22,7 @@ const NOTIFY = [
 const NOTIFY_MAIN = ["admins"];
 const TOKEN_RE = /^[0-9]{1,20}:[A-Za-z0-9_-]{20,100}$/;
 
-const bot = { data: null, busy: false, timer: null, shown: {} };
+const bot = { data: null, busy: false, timer: null, loading: 0, shown: {} };
 
 
 // Форматирование
@@ -78,19 +78,20 @@ function stateView(d) {
   const c = d.config, t = d.thread;
   if (!t) {
     return ["crit", "Бот не работает: модуль не загрузился",
-      `${d.thread_error || "причина в журнале панели"}. Панель работает без бота. Переустанови: <code>sudo iof update</code>, подробности: <code>journalctl -u iof-web</code>`];
+      `${esc(d.thread_error || "причина в журнале панели")}. Панель работает без бота. Переустанови: <code>sudo iof update</code>, подробности: <code>journalctl -u iof-web</code>`];
   }
   if (!c) return ["crit", "bot.json не читается", esc(d.config_error)];
   if (t.state === "migrate") {
     return ["warn", "Не работает: идёт перенос", "Этот сервер принимает управление. Бот запустится сам после завершения переноса: иначе один токен опрашивали бы два сервера."];
   }
-  if (!c.enabled) {
-    if (["running", "error", "conflict", "starting"].includes(t.state)) {
+  if (d.move?.running) return ["none", "Переносится…", esc(d.move.message), true];
+  if (!c.enabled && t.state !== "error") {
+    if (["running", "conflict", "starting"].includes(t.state)) {
       return ["none", "Выключается…", "Бот закончит текущий запрос к Telegram, это до 50 секунд", true];
     }
     return ["none", "Выключен", d.token ? "Включи выключателем справа вверху." : "Сначала токен: создай бота у @BotFather и вставь токен ниже."];
   }
-  if (!d.token || t.state === "no_token") {
+  if ((!d.token || t.state === "no_token") && t.state !== "error") {
     return ["warn", "Нет токена", "Бот включён, но токена нет. Создай бота у @BotFather и вставь его токен ниже."];
   }
   const since = t.since ? ` ${fmtSince(t.since)}` : "";
@@ -103,7 +104,7 @@ function stateView(d) {
     const title = /не принял токен/.test(t.error || "") ? "Telegram не принял токен"
       : /^нет связи/.test(t.error || "") ? "Нет связи с Telegram" : "Ошибка бота";
     const text = String(t.error || "");
-    return ["crit", title, `${esc(text.charAt(0).toUpperCase() + text.slice(1))}. Так${since}, бот повторяет попытки сам, пауза растёт до минуты.`];
+    return ["crit", title, `${esc(text.charAt(0).toUpperCase() + text.slice(1))}. Бот повторяет попытки сам.`];
   }
   return ["none", "Запускается…", "Бот проверяет токен и ставит меню команд", true];
 }
@@ -120,6 +121,7 @@ function renderState(d) {
   const admins = c.admins || [], mains = admins.filter((a) => a.role === "main").length;
   const rows = [
     ["Бот", name ? tgName(name) : '<span class="muted">появится, когда будет токен</span>'],
+    ["Текущий сервер", esc(serverLabel(d.server))],
     ["Админов", admins.length ? `${admins.length}: главных ${mains}, обычных ${admins.length - mains}` : '<span class="muted">нет</span>'],
   ];
   if (t && t.api) rows.push(["Bot API", `<span class="mono">${esc(t.api)}</span> <span class="muted">(IOF_TG_API в web.env)</span>`]);
@@ -129,9 +131,29 @@ function renderState(d) {
   $("#token-label").textContent = d.token ? "Новый токен от @BotFather" : "Токен от @BotFather";
   $("#f-token").placeholder = d.token ? "сохранён; введи новый, чтобы заменить" : "123456789:AAF…";
   $("#token-hint").innerHTML = d.token
-    ? "Панель токен не показывает. Новый проверяется запросом getMe и заменяет прежний."
-    : "У @BotFather: команда /newbot, имя и username бота. Он пришлёт токен — вставь его сюда.";
+    ? "Панель проверяет новый токен запросом getMe с текущего сервера бота."
+    : "Вставь токен от @BotFather. Сначала можно выбрать сервер, с которого доступен Telegram.";
   $("#token-del").hidden = !d.token;
+}
+
+function serverLabel(server) {
+  return server.name && server.name !== server.title ? `${server.title} (${server.name})` : server.title;
+}
+
+function renderServer(d) {
+  const select = $("#bot-server");
+  const key = JSON.stringify([d.server, d.servers]);
+  if (bot.shown.servers !== key) {
+    const selected = bot.shown.servers ? select.value : d.server.name;
+    bot.shown.servers = key;
+    select.replaceChildren(...d.servers.map((s) => new Option(serverLabel(s), s.name)));
+    if (d.server.name === null) select.add(new Option(d.server.title, "?", false, true));
+    select.value = d.servers.some((s) => s.name === selected) ? selected : d.server.name ?? "?";
+  }
+  const message = $("#bot-move-state");
+  message.hidden = !d.move || d.move.running;
+  message.className = d.move?.error ? "form-error" : "hint";
+  message.textContent = d.move?.message || "";
 }
 
 // Настройки перерисовываются, только когда поменялись: иначе опрос сбросил бы недописанное время
@@ -259,10 +281,12 @@ function renderNotify(d) {
 // поэтому всё заблокировано сразу
 function lock() {
   const d = bot.data;
-  const frozen = bot.busy || !d || !d.config || (d.migrate && d.migrate.role === "source");
+  const frozen = bot.busy || !d || !d.config || !!d.migrate || d.move?.running;
   document.querySelectorAll("[data-lock]").forEach((el) => { el.disabled = frozen; });
   // Включить без токена нельзя, выключить можно всегда
   if (d && d.config && !d.token && !d.config.enabled) $("#bot-enable").disabled = true;
+  const target = $("#bot-server").value;
+  $("#bot-move").disabled = frozen || !d.thread || !d.servers.some((s) => s.name === target) || target === d.server.name;
   $("#quiet-from").disabled = $("#quiet-to").disabled = frozen || !$("#set-quiet").checked;
 }
 
@@ -270,6 +294,7 @@ function render() {
   const d = bot.data;
   renderMigrate(d.migrate);
   renderState(d);
+  renderServer(d);
   renderSettings(d);
   renderAdmins(d);
   renderNotify(d);
@@ -283,20 +308,25 @@ function schedule() {
   bot.timer = setTimeout(async () => {
     if (!document.hidden && !bot.busy) await load();
     schedule();
-  }, spin ? 2000 : 15000);
+  }, spin || bot.data?.move?.running ? 2000 : 15000);
 }
 
 async function load() {
+  if (bot.busy) return;
+  const loading = ++bot.loading;
   $("#refresh").setAttribute("aria-busy", "true");
   try {
-    bot.data = DEMO ? demoGet() : await getJson("api/bot");
+    const data = DEMO ? demoGet() : await getJson("api/bot");
+    if (loading !== bot.loading) return;
+    bot.data = data;
     $("#alert").hidden = true;
     render();
   } catch (e) {
+    if (loading !== bot.loading) return;
     $("#alert").hidden = false;
     $("#alert").innerHTML = `${icon("crit")} Нет связи с панелью: ${esc(e.message)}`;
   } finally {
-    $("#refresh").removeAttribute("aria-busy");
+    if (loading === bot.loading) $("#refresh").removeAttribute("aria-busy");
   }
 }
 
@@ -304,6 +334,8 @@ async function load() {
 // а выключатели и выбор возвращаются к сохранённому
 async function act(body) {
   formError("", "#action-error");
+  bot.loading++;
+  $("#refresh").removeAttribute("aria-busy");
   bot.busy = true;
   lock();
   let res = null;
@@ -425,6 +457,8 @@ function demoInit() {
     },
     thread: { state: "running", error: null, since: now - 3600 * 7, username: "island_of_freedom_bot", api: null },
     thread_error: null, tz: "+0300", migrate: null,
+    move: null, server: { name: "", title: "Управляющий сервер" },
+    servers: [{ name: "", title: "Управляющий сервер" }, { name: "fi", title: "Хельсинки" }],
   };
   if (DEMO_KIND === "notoken") {
     Object.assign(s, { token: false });
@@ -460,7 +494,10 @@ async function demoPost(b) {
   const fail = (text) => { throw new Error(text); };
   const admin = () => c.admins.find((a) => a.id === b.id) || fail(`админа с ID ${b.id} нет: sudo iof bot show`);
   let message = "Готово", invite = null;
-  if (b.action === "token" && b.delete) {
+  if (b.action === "move") {
+    s.server = s.servers.find((server) => server.name === b.server);
+    s.move = { running: false, error: false, message: `Сервер бота изменён на «${s.server.title}»` };
+  } else if (b.action === "token" && b.delete) {
     Object.assign(s, { token: false });
     Object.assign(c, { enabled: false, username: "" });
     Object.assign(s.thread || {}, { state: "off", error: "выключен", username: "" });
@@ -528,6 +565,11 @@ async function demoPost(b) {
 
 document.addEventListener("DOMContentLoaded", async () => {
   $("#refresh").addEventListener("click", load);
+  $("#bot-server").addEventListener("change", lock);
+  $("#server-form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    if (!$("#bot-move").disabled) act({ action: "move", server: $("#bot-server").value });
+  });
   $("#bot-enable").addEventListener("change", (e) => act({ action: "enable", on: e.target.checked }));
   $("#set-actions").addEventListener("change", (e) => act({ action: "set", key: "actions", on: e.target.checked }));
   $("#set-links").addEventListener("change", (e) => act({ action: "set", key: "links", on: e.target.checked }));

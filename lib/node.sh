@@ -234,10 +234,17 @@ cmd_node_add() {
 
 # Убирает узел из nodes.conf, сам сервер не трогает
 cmd_node_del() {
-  local name="${1:-}" r
+  local name="${1:-}" r idx target server
   [[ -n "$name" ]] || die "используй: iof node del <имя>"
+  bot_place_lock
   read_nodes
-  node_index "$name" >/dev/null || die "узла '$name' нет"
+  idx="$(node_index "$name")" || die "узла '$name' нет"
+  server="$(bot_server)"
+  target="${N_SSH[$idx]}"
+  if [[ -n "$server" && "$target" != local ]]; then
+    if [[ "$target" != *@* ]]; then target="root@$target"; fi
+    ssh_same "${target,,}" "$server" && die "на узле работает бот, сначала перенеси его на другой сервер в панели"
+  fi
   read_relays
   for r in "${!R_NODE[@]}"; do
     if [[ "${R_NODE[$r]}" == "$name" || "${R_VIA[$r]}" == "$name" ]]; then

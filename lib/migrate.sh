@@ -80,7 +80,8 @@ migrate_bundle() {
   local stage="$1" id="$2" self="$3" target="$4" tpl cn
   mkdir -p "$stage/ssh"
   cp -a "$BASE" "$stage/data"
-  rm -rf "$stage/data/migrate.conf" "$stage/data/.migrate-probe" "$stage/data"/.key.*
+  rm -rf "$stage/data/migrate.conf" "$stage/data/.migrate-probe" "$stage/data"/.key.* \
+    "$stage/data/bot.poll" "$stage/data/bot.poll.lock" "$stage/data/bot.host.lock" "$stage/data/bot.server.lock"
   cp -a "$IOF_SRC" "$stage/src"
   cp -p "$SSH_KEY" "$SSH_KEY.pub" "$stage/ssh/"
   if [[ -f /root/.ssh/known_hosts ]]; then cp -p /root/.ssh/known_hosts "$stage/ssh/"; fi
@@ -313,7 +314,10 @@ cmd_migrate() {
       ;;
   esac
   case "$action" in
-    start)  migrate_start "$@" ;;
+    start)
+      bot_place_lock
+      [[ -z "$(bot_server)" ]] || die "перед переносом управления выбери для бота управляющий сервер в панели"
+      migrate_start "$@" ;;
     finish) migrate_finish "$@" ;;
     cancel) migrate_cancel ;;
     status) migrate_status ;;

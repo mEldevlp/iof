@@ -495,6 +495,7 @@ img.qr { display: block; width: 100%; max-width: 240px; height: auto; margin: 0 
 .password-form .form-error { margin: 0; }
 .input-row { display: flex; gap: 8px; align-items: center; margin-top: 0; }
 .input-row input { flex: 1; }
+#bot-server { flex: 1; min-width: 0; }
 .field textarea + .input-row { margin-top: 8px; align-items: flex-start; }
 .file-btn { cursor: pointer; flex: none; }
 .seg {

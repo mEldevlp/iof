@@ -21,6 +21,7 @@ deleteWebhook. Параметры — JSON, форма или multipart, как 
   GET  /fake/state    {offset, polls, waiting, queued, commands, sent}: offset — с какого номера бот
                       подтвердил апдейты, polls — сколько было getUpdates, waiting — сколько ждут сейчас
   POST /fake/reset    очистить очередь апдейтов и журнал вызовов
+  POST /fake/fail-poll {sender}: возвращать 503 только на getUpdates с этого IP; null отменяет отказ
 Токен в журнал не пишется, в журнале вызовов вместо него номер бота.
 
 Запуск:  python3 fake-tg.py [--listen 127.0.0.1:8089] [--max-wait 5]
@@ -52,6 +53,9 @@ class Fake:
         self.sent = []        # вызовы методов бота
         self.polls = 0
         self.waiting = 0
+        self.conflicts = 0
+        self.poller = None
+        self.reject_poll = None
         self.gen = 0          # номер последнего getUpdates: по нему ждущий опрос узнаёт, что его оборвали
         self.commands = []
         self.message_id = 1
@@ -90,17 +94,18 @@ class Fake:
             msg["entities"] = [{"type": "bot_command", "offset": 0, "length": len(cmd.group(0))}]
         return self.add({"message": msg})
 
-    def record(self, bot, method, params):
+    def record(self, bot, method, params, sender):
         """Вызов метода в журнал. message_id — номер нового сообщения (у sendMessage, sendPhoto): по нему
         тест собирает нажатие кнопки под этим сообщением."""
         with self.cond:
             n = len(self.sent) + 1
             mid = self.message_id
             self.message_id += 1
-            self.sent.append({"n": n, "method": method, "bot": bot, "params": params, "message_id": mid})
+            self.sent.append({"n": n, "method": method, "bot": bot, "params": params, "message_id": mid,
+                              "sender": sender})
         return mid
 
-    def get_updates(self, params):
+    def get_updates(self, params, sender):
         """(код, ответ). Новый опрос обрывает ждущий ответом 409, как Telegram."""
         try:
             offset = int(params.get("offset") or 0)
@@ -108,7 +113,10 @@ class Fake:
         except (TypeError, ValueError):
             return 400, "Bad Request: wrong parameter"
         with self.cond:
+            if self.reject_poll == sender:
+                return 503, "Проверка отката: опрос с этого адреса отключён"
             self.polls += 1
+            self.poller = sender
             self.gen += 1
             gen = self.gen
             if offset > 0:
@@ -120,6 +128,7 @@ class Fake:
             try:
                 while True:
                     if self.gen != gen:
+                        self.conflicts += 1
                         return 409, ("Conflict: terminated by other getUpdates request; "
                                      "make sure that only one bot instance is running")
                     ready = [u for u in self.updates if u["update_id"] >= offset][:100]
@@ -133,6 +142,7 @@ class Fake:
     def state(self):
         with self.cond:
             return {"offset": self.offset, "polls": self.polls, "waiting": self.waiting,
+                    "poller": self.poller, "conflicts": self.conflicts,
                     "queued": len(self.updates), "commands": self.commands, "sent": len(self.sent)}
 
     def reset(self):
@@ -228,7 +238,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.ok({**me, "can_join_groups": True, "can_read_all_group_messages": False,
                             "supports_inline_queries": False})
         if method == "getUpdates":
-            code, result = fake.get_updates(params)
+            code, result = fake.get_updates(params, self.client_address[0])
             if code != 200:
                 return self.reply(code, {"ok": False, "error_code": code, "description": result})
             return self.ok(result)
@@ -237,12 +247,12 @@ class Handler(BaseHTTPRequestHandler):
             if isinstance(commands, str):
                 commands = json.loads(commands)
             fake.commands = commands if isinstance(commands, list) else []
-            fake.record(bot, method, params)
+            fake.record(bot, method, params, self.client_address[0])
             return self.ok(True)
         if method == "getMyCommands":
             return self.ok(fake.commands)
         if method in ("answerCallbackQuery", "deleteWebhook"):
-            fake.record(bot, method, params)
+            fake.record(bot, method, params, self.client_address[0])
             return self.ok(True)
         if method in ("sendMessage", "sendPhoto", "editMessageText"):
             chat_id = params.get("chat_id")
@@ -270,7 +280,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self.reply(400, {"ok": False, "error_code": 400, "description": (
                         "Bad Request: message is not modified: specified new message content and reply markup "
                         "are exactly the same as a current content and reply markup of the message")})
-            mid = fake.record(bot, method, params)
+            mid = fake.record(bot, method, params, self.client_address[0])
             if method != "sendPhoto":
                 with fake.cond:
                     fake.messages[(bot, str(chat_id), str(params.get("message_id") or mid))] = content
@@ -286,6 +296,10 @@ class Handler(BaseHTTPRequestHandler):
         self.reply(404, {"ok": False, "error_code": 404, "description": "Not Found: method not found"})
 
     def service(self, path, params):
+        if path == "/fake/fail-poll" and self.command == "POST":
+            with self.server.fake.cond:
+                self.server.fake.reject_poll = params.get("sender")
+            return self.ok(True)
         fake = self.server.fake
         if path == "/fake/message" and self.command == "POST":
             try:

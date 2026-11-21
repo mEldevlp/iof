@@ -45,6 +45,8 @@ jobs:
         run: bash stand/test-web.sh
       - name: Проверить первый запуск на чистых серверах
         run: bash stand/test-setup.sh
+      - name: Проверить перенос Telegram-бота между серверами
+        run: bash stand/test-bot-host.sh
       - name: Поставить iof на old, подключить node1, Hysteria2 на обоих
         run: bash stand/stand.sh setup
       - name: Проверить узлы, туннели, ретранслятор и панель

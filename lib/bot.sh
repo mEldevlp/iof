@@ -9,7 +9,7 @@ NOTIFY_VERBOSE=0
 tg_send() {
   local kind="$1" text="$2" rc=0 out
   if [[ -s "$BOT_TOKEN" && -f "$BOT_FILE" ]] && have python3 && [[ "$(migrate_get role)" != "target" ]]; then
-    out="$(printf '%s' "$text" | bot_py notify "$BOT_FILE" "$BOT_TOKEN" "$(bot_api)" "$kind")" || rc=$?
+    out="$(printf '%s' "$text" | bot_py notify "$BOT_FILE" "$BOT_TOKEN" "$(bot_api)" "$kind" "$(bot_server)")" || rc=$?
     # 3 — бот выключен: тогда старый путь
     if (( rc != 3 )); then
       if (( NOTIFY_VERBOSE )) && [[ -n "$out" ]]; then printf '%s\n' "$out"; fi
@@ -21,7 +21,7 @@ tg_send() {
 
 # Старый путь без бота: TG_TOKEN и TG_CHAT из iof.env, простым текстом. Остальные типы — только через бота
 tg_chat_send() {
-  local kind="$1" text="$2" api
+  local kind="$1" text="$2" api server
   case "$kind" in
     nodes) ;;
     audit) text="Аудит безопасности, стало хуже:"$'\n'"$text" ;;
@@ -33,6 +33,13 @@ tg_chat_send() {
     return 0
   fi
   api="$(bot_api)"
+  server="$(bot_server)"
+  if [[ -n "$server" ]]; then
+    if printf '%s\n%s\n%s' "$TG_TOKEN" "$TG_CHAT" "$text" | bot_py legacy "$api" "$server"; then
+      if (( NOTIFY_VERBOSE )); then echo "Отправлено в TG_CHAT из $ENV_FILE"; fi
+    fi
+    return 0
+  fi
   # Адрес с токеном curl читает из конфига на stdin (-K -): printf встроен в bash, в аргументах токена нет
   if printf 'url = "%s/bot%s/sendMessage"\n' "${api%/}" "$TG_TOKEN" \
       | curl -fsS --max-time 10 -K - --data-urlencode "chat_id=${TG_CHAT}" --data-urlencode "text=$text" >/dev/null 2>&1; then
@@ -60,12 +67,12 @@ cmd_notify() {
   tg_send "$kind" "$text"
 }
 
-# Telegram-бот: iof bot. Сам бот — поток внутри панели iof-web (web/iof_bot.py): он только читает
-# bot.json и bot.token, а меняет их эта команда, и из консоли, и из панели, и из бота (redeem).
+# Telegram-бот: iof bot. Бот работает потоком панели или отдельным процессом на узле. bot.json
+# и bot.token меняет эта команда: из консоли, из панели и из бота (redeem).
 # Секреты (токен, код приглашения) идут через stdin. В bot.json от кода приглашения только sha256
 
 BOT_PY=$(cat <<'EOF'
-import hashlib, hmac, html, http.client, json, os, re, secrets, sys, time, urllib.error, urllib.request
+import hashlib, hmac, html, http.client, json, os, re, secrets, shlex, subprocess, sys, time, urllib.error, urllib.request
 
 ROLES = {"main": "главный", "regular": "обычный"}
 INVITE_TTL = 86400   # секунд живёт приглашение
@@ -144,10 +151,48 @@ class ApiError(Exception):
         self.code = code
 
 
-def api_call(api, token, method, params, timeout=10):
+def ssh_api(route, api, token, method, params, timeout):
+    target = re.fullmatch(r"([a-z_][a-z0-9_-]*@[A-Za-z0-9][A-Za-z0-9.-]*)(?::([0-9]{1,5}))?", route)
+    if not target:
+        raise ApiError(-1, "Некорректный адрес SSH сервера бота")
+    dest, port = target.groups()
+    remote = ["python3", "-c", os.environ["IOF_BOT_SOURCE"], "api", api]
+    if not dest.startswith("root@"):
+        remote[:0] = ["sudo", "-n"]
+    cmd = ["ssh", "-T", "-i", os.environ["IOF_BOT_SSH_KEY"], "-p", port or "22",
+           "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "ServerAliveInterval=5",
+           "-o", "ServerAliveCountMax=2", "-o", "StrictHostKeyChecking=accept-new",
+           "-o", "LogLevel=ERROR", "--", dest, shlex.join(remote)]
+    try:
+        p = subprocess.run(cmd, input=json.dumps([token, method, params, timeout]).encode(),
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=timeout + 12)
+        reply = json.loads(p.stdout) if not p.returncode else None
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        reply = None
+    if not isinstance(reply, dict):
+        raise ApiError(-1, "не удалось вызвать Telegram с сервера бота, проверь SSH и python3 на узле")
+    if "error" in reply:
+        raise ApiError(reply["code"], reply["error"].replace(token, "***"))
+    return reply.get("result")
+
+
+def remote_api(api):
+    token, method, params, timeout = json.load(sys.stdin)
+    try:
+        if method not in ("getMe", "sendMessage"):
+            raise ApiError(-1, "Метод Bot API недоступен для iof")
+        result = api_call(api, token, method, params, timeout)
+        print(json.dumps({"result": result}))
+    except ApiError as error:
+        print(json.dumps({"code": error.code, "error": str(error).replace(token, "***")}))
+
+
+def api_call(api, token, method, params, timeout=10, route=""):
     """Вызов Bot API без прокси -> result. Текст ошибки без токена."""
     if not API.match(api):
-        raise ApiError(-1, f"IOF_TG_API в web.env: нужен адрес вида https://api.telegram.org, а не «{api}»")
+        raise ApiError(-1, "IOF_TG_API в web.env: нужен адрес вида https://api.telegram.org")
+    if route:
+        return ssh_api(route, api, token, method, params, timeout)
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     req = urllib.request.Request(f"{api.rstrip('/')}/bot{token}/{method}", data=json.dumps(params).encode(),
                                  headers={"Content-Type": "application/json"})
@@ -216,11 +261,11 @@ def bot_name(cfg):
     return "@" + cfg["username"] if cfg.get("username") else "бот"
 
 
-def getme(api):
+def getme(api, route):
     """Проверка токена со stdin: getMe. Печатает имя бота. Текст ошибки без токена."""
     token = sys.stdin.readline().strip()
     try:
-        me = api_call(api, token, "getMe", {}, timeout=15)
+        me = api_call(api, token, "getMe", {}, timeout=15, route=route)
     except ApiError as e:
         if e.code in (401, 404):
             die(f"Telegram не принял токен ({e}): проверь его у @BotFather, /mybots → API Token")
@@ -259,7 +304,7 @@ def parts(text):
     return out
 
 
-def notify(path, token_path, api, kind):
+def notify(path, token_path, api, kind, route):
     """Уведомление kind со stdin каждому подписанному админу (tg_send в iof.sh). Код 3 — бот выключен или
     нет токена: тогда iof шлёт старым путём. В тихие часы без звука, кроме админов с sound. Нет связи —
     дальше не пробует: адрес API у всех один."""
@@ -292,7 +337,7 @@ def notify(path, token_path, api, kind):
             params["disable_notification"] = True
         try:
             for part in body:
-                api_call(api, token, "sendMessage", dict(params, text=part))
+                api_call(api, token, "sendMessage", dict(params, text=part), route=route)
             sent += 1
         except ApiError as e:
             errors.append(f"админу {a['id']}: {e}")
@@ -441,7 +486,7 @@ def cols(rows):
     return ["  ".join(c.ljust(width[i]) for i, c in enumerate(r)).rstrip() for r in rows]
 
 
-def show(path, token, api, panel, migrate):
+def show(path, token, api, panel, migrate, route):
     cfg = load(path)
     state = "включён" if cfg["enabled"] else "выключен"
     print(f"Бот: {state}, {bot_name(cfg) if token == 'yes' else 'токена нет: sudo iof bot token'}")
@@ -451,7 +496,8 @@ def show(path, token, api, panel, migrate):
           + ". Ссылки Hysteria2: " + ("выдаются" if cfg["hy2_links"] else "не выдаются")
           + f". Тихие часы: {quiet}")
     panels = {"active": "работает", "none": "не установлена, бота без неё нет: sudo bash /opt/iof/install.sh"}
-    print("Панель iof-web, в ней работает бот: " + panels.get(panel, f"не работает ({panel}): sudo systemctl start iof-web"))
+    print("Сервер бота: " + (route or "управляющий сервер"))
+    print("Панель iof-web: " + panels.get(panel, f"не работает ({panel}): sudo systemctl start iof-web"))
     if api.rstrip("/") != "https://api.telegram.org":
         print(f"Bot API: {api} (IOF_TG_API в web.env)")
     if migrate == "target":
@@ -487,17 +533,53 @@ def show(path, token, api, panel, migrate):
 
 mode = sys.argv[1]
 if mode == "getme":
-    getme(sys.argv[2])
+    getme(*sys.argv[2:4])
 elif mode == "notify":
-    notify(*sys.argv[2:6])
+    notify(*sys.argv[2:7])
+elif mode == "api":
+    remote_api(sys.argv[2])
+elif mode == "legacy":
+    token, chat = sys.stdin.readline().strip(), sys.stdin.readline().strip()
+    try:
+        api_call(sys.argv[2], token, "sendMessage", {"chat_id": chat, "text": sys.stdin.read()}, route=sys.argv[3])
+    except ApiError as error:
+        die(f"Уведомление в TG_CHAT не отправлено: {error}")
 elif mode == "edit":
     edit(sys.argv[2], sys.argv[3], sys.argv[4:])
 elif mode == "show":
-    show(*sys.argv[2:7])
+    show(*sys.argv[2:8])
 EOF
 )
 
-bot_py() { python3 -c "$BOT_PY" "$@"; }
+bot_py() {
+  case "$1" in
+    getme|notify|legacy)
+      IOF_BOT_SOURCE="$BOT_PY" IOF_BOT_SSH_KEY="$(bot_ssh_key)" python3 -c "$BOT_PY" "$@" ;;
+    *) python3 -c "$BOT_PY" "$@" ;;
+  esac
+}
+
+bot_server() {
+  if [[ -f "$BASE/bot.server" ]]; then cat "$BASE/bot.server"; fi
+}
+
+bot_ssh_key() {
+  local key="${IOF_SSH_KEY:-}"
+  if [[ -z "$key" && -f "$BASE/web.env" ]]; then
+    key="$(sed -n 's/^[[:space:]]*IOF_SSH_KEY=//p' "$BASE/web.env" | tail -n 1)"
+    key="$(trim "$key")"
+    if [[ "$key" == \"*\" || "$key" == \'*\' ]]; then key="${key:1:-1}"; fi
+  fi
+  printf '%s' "${key:-$SSH_KEY}"
+}
+
+# Смена токена и удаление узла не могут пройти посреди переноса процесса.
+bot_place_lock() {
+  (umask 077; mkdir -p "$BASE"; : >> "$BASE/bot.server.lock")
+  exec {bot_place_fd}>>"$BASE/bot.server.lock"
+  flock -n "$bot_place_fd" || die "идёт перенос бота или смена его токена, повтори позже"
+  [[ ! -f "$BASE/bot.move.json" ]] || die "дождись восстановления бота после прерванного переноса"
+}
 
 # Адрес Bot API: IOF_TG_API из окружения (так его передаёт панель) или из web.env, иначе Telegram.
 # Другой адрес нужен только стенду и CI с поддельным API
@@ -528,6 +610,8 @@ bot_token() {
     IFS= read -r token || true
   fi
   token="${token//[[:space:]]/}"
+  bot_place_lock
+  migrate_guard
   if [[ -z "$token" ]]; then
     bot_lock
     rm -f "$BOT_TOKEN"
@@ -538,7 +622,7 @@ bot_token() {
   [[ "$token" =~ ^[0-9]{1,20}:[A-Za-z0-9_-]{20,100}$ ]] \
     || die "это не токен бота: он выглядит как 123456789:AAF... (@BotFather, /mybots → API Token)"
   # printf встроен в bash: токена нет в аргументах процессов
-  username="$(printf '%s\n' "$token" | bot_py getme "$(bot_api)")" || exit 1
+  username="$(printf '%s\n' "$token" | bot_py getme "$(bot_api)" "$(bot_server)")" || exit 1
   bot_lock
   (umask 077; printf '%s\n' "$token" > "$BOT_TOKEN.tmp")
   mv -f "$BOT_TOKEN.tmp" "$BOT_TOKEN"
@@ -552,7 +636,7 @@ bot_switch() {
   fi
   bot_py edit "$BOT_FILE" enable "$1"
   if [[ "$1" == "on" ]] && ! systemctl is-active --quiet iof-web 2>/dev/null; then
-    echo "Внимание: панель iof-web не работает, а бот работает внутри неё: sudo systemctl start iof-web"
+    echo "Внимание: панель iof-web не работает. Она запускает бота: sudo systemctl start iof-web"
   fi
 }
 
@@ -576,7 +660,7 @@ bot_show() {
   if [[ -s "$BOT_TOKEN" ]]; then token=yes; fi
   panel="$(systemctl is-active iof-web 2>/dev/null || true)"
   if [[ ! -f /opt/iof-web/iof-web.py ]]; then panel=none; fi
-  bot_py show "$BOT_FILE" "$token" "$(bot_api)" "${panel:-unknown}" "$(migrate_get role)"
+  bot_py show "$BOT_FILE" "$token" "$(bot_api)" "${panel:-unknown}" "$(migrate_get role)" "$(bot_server)"
 }
 
 cmd_bot() {
@@ -586,7 +670,7 @@ cmd_bot() {
   case "$action" in
     show)   bot_show ;;
     token)  bot_token ;;
-    on|off) bot_lock; bot_switch "$action" ;;
+    on|off) bot_place_lock; migrate_guard; bot_lock; bot_switch "$action" ;;
     set)
       bot_lock
       if [[ "${1:-}" == "quiet" ]]; then bot_py edit "$BOT_FILE" quiet "${2:-}"; else bot_py edit "$BOT_FILE" set "${1:-}" "${2:-}"; fi ;;

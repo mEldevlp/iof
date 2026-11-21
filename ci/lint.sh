@@ -8,9 +8,9 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT" || exit 1
-SHELL_FILES=(iof.sh lib/*.sh build.sh iof-nightly install.sh stand/stand.sh stand/test.sh stand/test-setup.sh stand/test-awg.sh stand/test-web.sh ci/lint.sh ci/test-build.sh)
+SHELL_FILES=(iof.sh lib/*.sh build.sh iof-nightly install.sh stand/stand.sh stand/test.sh stand/test-setup.sh stand/test-awg.sh stand/test-web.sh stand/test-bot-host.sh ci/lint.sh ci/test-build.sh)
 # Панель, модуль Telegram-бота и поддельный Bot API стенда
-PY_FILES=(web/iof-web.py web/iof_auth.py web/iof_bot.py stand/fake-tg.py stand/panel_client.py stand/test-web.py ci/test-panel.py)
+PY_FILES=(web/iof-web.py web/iof_auth.py web/iof_bot.py web/iof_bot_host.py stand/fake-tg.py stand/panel_client.py stand/test-web.py stand/test-bot-host.py ci/test-panel.py)
 # Сторонний код в web/static: xterm.js для терминала на странице узла. Правила CSP к нему не применяются:
 # свои <style> он создаёт скриптом, и term.js переносит их в adoptedStyleSheets. Файлы берутся из npm
 # целиком, первая строка называет пакет и версию (CLAUDE.md, «Веб-панель»)
@@ -53,7 +53,7 @@ check_shellcheck() {
   if ! command -v shellcheck >/dev/null 2>&1; then missing shellcheck; return; fi
   # iof.sh проверяется с подключениями; собранный файл ниже ещё раз проверяет весь код вместе.
   # В отдельном модуле SC2034 не видит, что переменная используется другим модулем.
-  if out="$(shellcheck -x --severity=warning iof.sh build.sh iof-nightly install.sh stand/stand.sh stand/test.sh stand/test-setup.sh stand/test-awg.sh stand/test-web.sh ci/lint.sh ci/test-build.sh 2>&1 \
+  if out="$(shellcheck -x --severity=warning iof.sh build.sh iof-nightly install.sh stand/stand.sh stand/test.sh stand/test-setup.sh stand/test-awg.sh stand/test-web.sh stand/test-bot-host.sh ci/lint.sh ci/test-build.sh 2>&1 \
     && shellcheck --severity=warning --exclude=SC2034 lib/*.sh 2>&1)"; then
     ok "shellcheck $(shellcheck --version | sed -n 's/^version: //p')"
   else

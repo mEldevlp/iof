@@ -11,6 +11,9 @@ EnvironmentFile=-/root/iof/web.env
 UnsetEnvironment=IOF_WEB_PASSWORD
 Restart=on-failure
 RestartSec=3
+# При остановке панель сначала даёт боту закончить текущий опрос Telegram
+KillMode=mixed
+TimeoutStopSec=100
 NoNewPrivileges=yes
 
 [Install]

@@ -1,4 +1,4 @@
-"""iof_bot: Telegram-бот iof, работает потоком внутри панели iof-web.
+"""iof_bot: Telegram-бот iof, работает на управляющем сервере или выбранном узле.
 
 Long polling (getUpdates), без webhook: на сервере не открывается порт. Отвечает только админам
 и только в личном чате, групповые чаты и каналы не читает, остальным молчит. Исключение —
@@ -709,6 +709,8 @@ class Bot:
         self.status = {"state": "starting", "error": None, "since": time.time()}
         self.strangers = {}       # чужой id -> когда его сообщение последний раз записано в журнал
         self.tries = {}           # чужой id -> времена попыток кода за последнюю минуту
+        self.stopped = threading.Event()
+        self.verified = False
 
     def start(self):
         threading.Thread(target=self.run, name="iof-bot", daemon=True).start()
@@ -752,7 +754,8 @@ class Bot:
         end = time.time() + seconds
         marks = [self.stat(p) for p in self.files()]
         while time.time() < end:
-            time.sleep(min(1.0, max(0.0, end - time.time())))
+            if self.stopped.wait(min(1.0, max(0.0, end - time.time()))):
+                return
             if [self.stat(p) for p in self.files()] != marks:
                 return
 
@@ -789,6 +792,7 @@ class Bot:
                 token = ""
             if token != self.token:
                 self.token, self.offset, self.ready, self.since = token, None, False, time.time()
+                self.verified = False
 
     def idle(self):
         """Почему бот сейчас не опрашивает Telegram: (состояние, текст) или None."""
@@ -807,7 +811,7 @@ class Bot:
 
     def run(self):
         pause = 0
-        while True:
+        while not self.stopped.is_set():
             try:
                 self.cycle()
                 pause = 0
@@ -833,6 +837,8 @@ class Bot:
 
     def cycle(self):
         self.load()
+        if self.stopped.is_set():
+            return
         why = self.idle()
         if why:
             self.set_state(*why)
@@ -842,19 +848,18 @@ class Bot:
         api = Api(self.api_base, token)
         if not self.ready:
             self.prepare(api)
-        elif self.status["state"] in ("starting", "off", "no_token", "migrate"):
-            # Токен уже проверен, бот снова опрашивает Telegram: «работает» сразу, а не после ответа
-            # на опрос (до POLL секунд). После ошибки — только когда опрос пройдёт
-            self.set_state("running")
-        params = {"timeout": self.POLL, "allowed_updates": ["message", "callback_query"]}
+        if self.stopped.is_set():
+            return
+        params = {"timeout": self.POLL if self.verified else 0, "allowed_updates": ["message", "callback_query"]}
         if self.offset is not None:
             params["offset"] = self.offset
-        updates = api.call("getUpdates", params, timeout=self.POLL + 15)
+        updates = self.poll(api, params)
+        self.verified = True
         self.set_state("running")
         # Пока шёл опрос, бота могли выключить или сменить токен: тогда апдейты не обрабатываются
         # и не подтверждаются
         self.load()
-        if self.token != token or self.idle():
+        if self.stopped.is_set() or self.token != token or self.idle() or not self.accept_updates():
             return
         for upd in updates if isinstance(updates, list) else []:
             if not isinstance(upd, dict) or type(upd.get("update_id")) is not int:
@@ -865,10 +870,19 @@ class Bot:
             except (ApiError, NetError) as e:
                 self.log(f"бот: не удалось ответить: {e}")
 
+    def poll(self, api, params):
+        return api.call("getUpdates", params, timeout=params["timeout"] + 15)
+
+    def accept_updates(self):
+        return True
+
     def prepare(self, api):
         """getMe (токен рабочий, имя бота) и меню команд, при запуске и с новым токеном."""
         me = api.call("getMe")
-        self.username = me.get("username", "") if isinstance(me, dict) else ""
+        username = me.get("username") if isinstance(me, dict) else None
+        if not isinstance(username, str) or not USERNAME.fullmatch(username):
+            raise NetError("Telegram не вернул имя бота")
+        self.username = username
         try:
             api.call("setMyCommands", {"commands": [{"command": c, "description": d} for c, d in COMMANDS]})
         except ApiError as e:
@@ -876,7 +890,6 @@ class Bot:
                 raise
             self.log(f"бот: меню команд не установлено: {e}")
         self.ready = True
-        self.set_state("running")
 
     # Сообщения
 
@@ -1125,7 +1138,7 @@ class Bot:
         if deny:
             del self.pending[num]
             return self.answer(api, qid, deny, True)
-        job = self.jobs.start(title, steps, "bot")
+        job = self.start_job(title, steps, p)
         if job is None:
             running = next((j for j in self.jobs.list() if j["state"] == "running"), None)
             what = f"задача «{running['title']}»" if running else "другая задача"
@@ -1138,6 +1151,9 @@ class Bot:
             pass
         self.follow(api, chat_id, msg_id, job["id"], len(steps), p)
 
+    def start_job(self, title, steps, pending):
+        return self.jobs.start(title, steps, "bot")
+
     def follow(self, api, chat_id, msg_id, job_id, total, p):
         """Ход задачи в сообщении с подтверждением: правка раз в FOLLOW секунд, если в логе новое, в конце
         итог. Свой поток на задачу, а не слот команд просмотра: шаг идёт до 900 с. Бота выключили или
@@ -1147,7 +1163,7 @@ class Bot:
             shown, errors, tries = None, 0, 0
             while True:
                 job = next((j for j in self.jobs.list() if j["id"] == job_id), None)
-                if job is None or self.token != api.token or self.idle():
+                if job is None or self.stopped.is_set() or self.token != api.token or self.idle():
                     return
                 done = job["state"] != "running"
                 text = job_text(job, total, check=p["kind"] == "check")
@@ -1239,7 +1255,7 @@ class Bot:
         """Кнопка 🔗 группы: ссылки одним блоком <pre> и один QR всей группы.
         Без qrencode или если Telegram не принял фото — только ссылки. В ссылках пароль: они уходят только
         админу, в журнал панели (маска LINK_SECRET) и лог задач не попадают."""
-        g = self.views.hy2_links(name)
+        g = self.links_for(name, chat_id)
         if g is None:
             return self.send(api, chat_id, "Группы больше нет.")
         if not g["links"]:
@@ -1264,6 +1280,9 @@ class Bot:
                 if e.code != 400:
                     raise
                 self.log(f"бот: Telegram не принял QR группы {name}: {e}")
+
+    def links_for(self, name, chat_id):
+        return self.views.hy2_links(name)
 
     def greeting(self, admin, user):
         name = clean(user.get("first_name") or admin.get("name"), 64) or "админ"
