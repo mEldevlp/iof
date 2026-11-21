@@ -26,10 +26,10 @@ Hysteria 2 и Amnezia 2.0. Позволяет следить за состоян
 
 ![Веб-панель: обзор всех серверов](docs/panel-overview.png)
 
-![Веб-панель: страница сервера](docs/panel-node.png)
-
 <details>
 <summary>Ещё скриншоты: ссылки Hysteria2, аудит безопасности, терминал, добавление сервера, Telegram-бот</summary>
+
+![Веб-панель: страница сервера](docs/panel-node.png)
 
 ![Веб-панель: группы ссылок Hysteria2](docs/panel-hy2.png)
 
