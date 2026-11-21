@@ -51,6 +51,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 from urllib.request import Request, urlopen
 
 from iof_auth import Credentials, SESSION_TTL, password_ok
+import iof_cron
 
 # Telegram-бот: модуль рядом с панелью. Если он не загрузился, панель работает без бота
 try:
@@ -598,15 +599,14 @@ def tail_lines(path, limit=65536):
 RUN_HEAD = re.compile(r"^== (\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)$")
 
 
-def read_nightly_run(path):
-    """Последний запуск iof-nightly: блок от строки "== дата" до конца. Внутри вывод iof exec:
-    "== узел" и итог "Выполнено на N узлах, с ошибкой: M"."""
+def read_service_run(path, summary_prefix="Выполнено на "):
+    """Последний запуск cron-задачи: блок от строки «== дата» до конца."""
     lines = tail_lines(path)
     starts = [i for i, line in enumerate(lines or []) if RUN_HEAD.match(line)]
     if not starts:
         return None
     block = lines[starts[-1]:]
-    summary = next((line for line in reversed(block) if line.startswith("Выполнено на ")), "")
+    summary = next((line for line in reversed(block) if line.startswith(summary_prefix)), "")
     return {"started": RUN_HEAD.match(block[0]).group(1), "summary": summary, "log": block[1:][-80:]}
 
 
@@ -1850,8 +1850,9 @@ def service_view(srv, fetch):
         "error": error,
         "check": read_check(base),
         "daily": read_daily(base),
-        "nightly": read_nightly_run(NIGHTLY_RUN_LOG),
+        "nightly": read_service_run(NIGHTLY_RUN_LOG),
         "nightly_local": read_nightly_local(NIGHTLY_LOG),
+        "reach": read_service_run(iof_cron.REACH_LOG, "Итог:"),
         "update_log": read_update_log(UPDATE_LOG),
         "busy": srv.jobs.busy(),
         "migrate": read_migrate(base),
@@ -2040,6 +2041,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.node_info(query.get("n", ""), force)
         if path == "/api/service":
             return self.service_info(query.get("fetch") == "1")
+        if path == "/api/service/schedule":
+            return self.send_json(iof_cron.view())
+        if path == "/api/service/cron-log":
+            return self.send_json(iof_cron.journal(tail_lines))
         if path == "/api/security":
             return self.security_info()
         if path == "/api/probe":
@@ -2070,7 +2075,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self.authorized():
             return self.auth_required()
         if path not in ("/api/nodes", "/api/migrate", "/api/hy2", "/api/awg", "/api/node", "/api/service", "/api/security",
-                        "/api/term", "/api/probe", "/api/bot", "/api/setup", "/api/password"):
+                        "/api/term", "/api/probe", "/api/bot", "/api/setup", "/api/password", "/api/service/schedule"):
             return self.send_json({"error": "не найдено"}, HTTPStatus.NOT_FOUND)
         body = self.read_json()
         if body is None:
@@ -2083,6 +2088,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.bot_action(body)
         if path == "/api/password":
             return self.change_password(body)
+        if path == "/api/service/schedule":
+            return self.save_schedule(body)
         try:
             kind, title, steps = self.job_for(path, body)
         except ValueError as e:
@@ -2091,6 +2098,23 @@ class Handler(BaseHTTPRequestHandler):
         if job is None:
             return self.send_json({"error": "уже идёт другая задача, дождись её окончания"}, HTTPStatus.CONFLICT)
         self.send_json({"job": job["id"]}, HTTPStatus.ACCEPTED)
+
+    def save_schedule(self, body):
+        base = self.server.base
+        try:
+            base.mkdir(mode=0o700, parents=True, exist_ok=True)
+            with (base / "setup.lock").open("a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                if read_migrate(base):
+                    raise ValueError("Расписание можно изменить после завершения переноса управления.")
+                iof_cron.save(body)
+        except BlockingIOError:
+            return self.send_json({"error": "Идёт настройка или перенос. Повтори после завершения."}, HTTPStatus.CONFLICT)
+        except ValueError as e:
+            return self.send_json({"error": str(e)}, HTTPStatus.BAD_REQUEST)
+        except (OSError, subprocess.SubprocessError) as e:
+            return self.send_json({"error": f"Не удалось сохранить расписание: {e}"}, HTTPStatus.SERVICE_UNAVAILABLE)
+        self.send_json(iof_cron.view())
 
     def job_for(self, path, body):
         """POST -> (вид задачи, заголовок, шаги). ValueError с текстом для страницы."""

@@ -102,6 +102,42 @@
           <pre id="job-log" class="log" aria-live="polite"></pre>
         </section>
 
+        <section class="card" aria-labelledby="schedule-title">
+          <div class="card-head">
+            <h2 id="schedule-title">Расписание обслуживания</h2>
+            <span id="schedule-zone" class="card-note">Время управляющего сервера</span>
+          </div>
+          <p id="schedule-error" class="form-error banner" role="alert" hidden></p>
+          <div class="schedule">
+            <form id="schedule-nightly" class="schedule-row">
+              <div>
+                <label for="schedule-nightly-time">Ночное обслуживание</label>
+                <p class="hint">Обновление пакетов и перезагрузка всех зарегистрированных узлов.</p>
+                <p class="hint" data-state role="status"></p>
+              </div>
+              <div class="schedule-controls">
+                <input id="schedule-nightly-time" type="time" value="04:00" aria-label="Время ночного обслуживания" required disabled>
+                <button class="btn" type="submit" disabled>Сохранить</button>
+              </div>
+            </form>
+            <form id="schedule-reach" class="schedule-row">
+              <div>
+                <label for="schedule-reach-time">Доступность из РФ</label>
+                <p class="hint">DNS и ping клиентских адресов, TCP до SSH-портов. Запуск с управляющего сервера, при его перезагрузке — после загрузки.</p>
+                <p class="hint" data-state role="status"></p>
+                <details id="reach-more" class="more" hidden>
+                  <summary id="reach-summary">Последняя проверка</summary>
+                  <pre id="reach-log" class="code"></pre>
+                </details>
+              </div>
+              <div class="schedule-controls">
+                <input id="schedule-reach-time" type="time" value="04:10" aria-label="Время проверки доступности из РФ" required disabled>
+                <button class="btn" type="submit" disabled>Сохранить</button>
+              </div>
+            </form>
+          </div>
+        </section>
+
         <div id="service-info" class="grid3">
           <section class="card">
             <div class="card-head"><h2>Версия iof</h2></div>
@@ -130,13 +166,26 @@
           </section>
         </div>
 
-        <section class="card">
+        <section class="card" aria-labelledby="tasks-title">
           <div class="card-head">
-            <h2>Задачи панели <span id="jobs-count" class="count"></span></h2>
-            <span class="card-note">последние 10, хранятся до перезапуска панели</span>
+            <h2 id="tasks-title">Задачи панели</h2>
+            <a href="#cron-journal">Журнал cron</a>
           </div>
+          <h3 class="sub-head">Задания cron на управляющем сервере <span id="cron-count" class="count"></span></h3>
+          <ul id="cron-tasks" class="jobs"></ul>
+          <h3 class="sub-head">Запуски из панели <span id="jobs-count" class="count"></span></h3>
+          <p class="hint pad">Последние 10, хранятся до перезапуска панели.</p>
           <ul id="jobs" class="jobs"></ul>
           <p id="jobs-error" class="form-error" role="alert" hidden></p>
+        </section>
+
+        <section id="cron-journal" class="card" aria-labelledby="cron-journal-title">
+          <div class="card-head">
+            <h2 id="cron-journal-title">Журнал cron</h2>
+            <button id="load-cron-log" class="btn small" type="button">Загрузить журнал</button>
+          </div>
+          <p id="cron-log-source" class="hint pad" role="status">Последние записи о запуске заданий на управляющем сервере.</p>
+          <pre id="cron-log" class="log" tabindex="0" aria-label="Записи cron" hidden></pre>
         </section>
       </main>
 

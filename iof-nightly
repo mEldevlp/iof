@@ -16,8 +16,9 @@ JOB='export DEBIAN_FRONTEND=noninteractive
   apt-get -o DPkg::Lock::Timeout=600 update
   timeout 1800 apt-get -o DPkg::Lock::Timeout=600 -o Dpkg::Options::=--force-confold -y upgrade
   echo "== $(date "+%F %T") перезагрузка"
+  if [ -x /usr/local/bin/iof ]; then touch /run/iof-nightly-reboot; fi
 } >> /var/log/iof-nightly.log 2>&1
-/usr/sbin/shutdown -r now'
+/usr/sbin/shutdown -r now || { rm -f /run/iof-nightly-reboot; exit 1; }'
 
 # base64, чтобы не возиться с кавычками при передаче через iof exec и ssh
 B64="$(printf '%s' "$JOB" | base64 -w0)"

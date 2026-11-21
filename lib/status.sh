@@ -187,6 +187,84 @@ cmd_check() {
   (( bad == 0 ))
 }
 
+# Прямые проверки с управляющего сервера. Адрес для клиентов и SSH-адрес могут различаться.
+reach_job() {
+  local i="$1" addr="${N_ADDR[$1]}" target="${N_SSH[$1]}" ip host dns="нет ответа" icmp="нет ответа" tcp="нет ответа"
+  if [[ "$target" == "local" ]]; then
+    printf '%s: управляющий сервер\n' "${N_NAME[$i]}"
+    return 0
+  fi
+  local T_HOST T_PORT
+  split_target "$target"
+  host="${T_HOST##*@}"
+  if host_ok "$addr"; then
+    ip="$(timeout 5 getent ahostsv4 "$addr" | awk 'NR == 1 { print $1 }' || true)"
+    if [[ -n "$ip" ]]; then
+      dns="$ip"
+      if ! have ping; then icmp="команда ping недоступна"
+      elif ping -4 -n -c 1 -W 2 "$ip" >/dev/null 2>&1; then icmp="ответил"; fi
+    fi
+  fi
+  if host_ok "$host" && port_ok "$T_PORT" \
+    && timeout 5 bash -c 'exec 3<>"/dev/tcp/$1/$2"' bash "$host" "$T_PORT" 2>/dev/null; then
+    tcp="соединение есть"
+  fi
+  printf '%s: %s · DNS: %s · ping: %s · SSH %s:%s: %s\n' "${N_NAME[$i]}" "$addr" "$dns" "$icmp" "$host" "$T_PORT" "$tcp"
+  [[ "$icmp" == "ответил" || "$tcp" == "соединение есть" ]]
+}
+
+check_from_ru() {
+  if ! nodes_present; then
+    echo "Итог: узлы ещё не добавлены"
+    return 0
+  fi
+  read_nodes
+  select_nodes
+  local i total=0 bad=0
+  pmap reach_job "${SEL[@]}"
+  for i in "${SEL[@]}"; do
+    pm_out "$i"
+    [[ "${N_SSH[$i]}" != "local" ]] || continue
+    total=$((total + 1))
+    if ! pm_ok "$i"; then bad=$((bad + 1)); fi
+  done
+  printf 'Итог: ответили %d из %d удалённых узлов, без ответа: %d\n' "$((total - bad))" "$total" "$bad"
+  (( bad == 0 ))
+}
+
+# Дневной cron и @reboot используют один срок и одну отметку. Если время пришлось на перезагрузку,
+# @reboot догоняет пропущенный запуск, в том числе при переходе через полночь.
+cmd_check_from_ru() {
+  if (( $# == 0 )); then check_from_ru; return; fi
+  [[ $# == 3 && "$1" == "--scheduled" && "$2" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ \
+    && "$3" =~ ^[1-9][0-9]{0,11}$ && -z "$IOF_ONLY" ]] || die "используй: iof [-n узлы] check-from-ru"
+  local TZ=:/etc/localtime
+  export TZ
+  local now slot last="" rc=0 tmp
+  now="$(date +%s)"
+  slot="$(date -d "today $2" +%s)"
+  if (( slot > now )); then slot="$(date -d "yesterday $2" +%s)"; fi
+  (( slot >= $3 )) || return 0
+
+  umask 077
+  mkdir -p "$BASE"
+  exec 8>"$BASE/check-from-ru.lock"
+  flock -n 8 || return 0
+  if [[ -f "$BASE/check-from-ru.last" ]]; then read -r last < "$BASE/check-from-ru.last" || true; fi
+  if [[ "$last" =~ ^[1-9][0-9]{0,11}$ ]] && (( last >= slot )); then return 0; fi
+  while [[ -e /run/iof-nightly-reboot ]] || systemctl is-active --quiet iof-nightly.service; do
+    if (( $(date +%s) - now >= 5400 )); then die "ночное обслуживание ещё идёт, проверка ждёт перезагрузки"; fi
+    sleep 15
+  done
+  printf '== %s\n' "$(date '+%F %T')"
+  systemctl start network-online.target || echo "Не удалось дождаться network-online.target"
+  check_from_ru || rc=$?
+  tmp="$(mktemp "$BASE/check-from-ru.XXXXXX")"
+  printf '%s\n' "$slot" > "$tmp"
+  mv -f -- "$tmp" "$BASE/check-from-ru.last"
+  return "$rc"
+}
+
 # Значение ключа из check.daily, пусто, если его нет
 daily_get() {
   if [[ -f "$DAILY_FILE" ]]; then kv_get "$(cat "$DAILY_FILE")" "$1"; fi

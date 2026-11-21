@@ -1,10 +1,9 @@
 "use strict";
 
-// Страница «Сервис»: версия iof и обновление, проверка узлов по cron (iof check), ночное обслуживание
-// и задачи панели. Данные: GET api/service[?fetch=1], GET api/jobs, обновление: POST api/service
-// (задача iof update; в конце install.sh перезапускает панель, задача пропадает вместе с ней)
+// Страница «Сервис»: обновление iof, расписание обслуживания, задания и журнал cron, запуски из панели.
 
-const svc = { info: null, jobs: [], updates: null, checking: false, updating: null, request: null };
+const svc = { info: null, jobs: [], schedule: null, saving: null, updates: null, checking: false, updating: null, request: null };
+const scheduleDefaults = { nightly: "04:00", reach: "04:10" };
 
 
 // Форматирование
@@ -25,16 +24,19 @@ function fmtStamp(s) {
 // Расписание cron по-русски для частых случаев: */5 * * * * и 0 4 * * *
 function cronHuman(line) {
   const f = line.trim().split(/\s+/);
+  if (f[0] === "@reboot") return "при загрузке сервера";
+  if (["@daily", "@midnight"].includes(f[0])) return "каждый день в 00:00";
+  if (f.length < 5) return "";
   let m;
   if ((m = /^\*\/(\d+)$/.exec(f[0])) && f.slice(1, 5).every((x) => x === "*")) return `каждые ${m[1]} мин`;
   if (/^\d+$/.test(f[0]) && /^\d+$/.test(f[1]) && f.slice(2, 5).every((x) => x === "*")) {
-    return `каждый день в ${f[1]}:${f[0].padStart(2, "0")}`;
+    return `каждый день в ${f[1].padStart(2, "0")}:${f[0].padStart(2, "0")}`;
   }
   return "";
 }
 
 function cronCell(line) {
-  const when = line.trim().split(/\s+/).slice(0, 5).join(" ");
+  const when = line.trim().split(/\s+/).slice(0, line.trim().startsWith("@") ? 1 : 5).join(" ");
   const human = cronHuman(line);
   return `<code>${esc(when)}</code>${human ? ` · ${human}` : ""}`;
 }
@@ -146,7 +148,7 @@ function dailyCell(d) {
 
 function renderNightly() {
   const i = svc.info, n = i.nightly, local = i.nightly_local;
-  const cron = i.cron.find((l) => l.includes("iof-nightly"));
+  const cron = svc.schedule?.jobs.find((j) => j.kind === "nightly")?.schedule || i.cron.find((l) => l.includes("iof-nightly"));
   let last = '<span class="muted">ещё не было</span>';
   if (n) {
     const m = /с ошибкой: (\d+)/.exec(n.summary);
@@ -169,13 +171,114 @@ function renderNightly() {
   }
   $("#nightly").innerHTML = kv(rows);
   const hints = [];
-  if (!cron) hints.push("Добавить в cron: <code>sudo crontab -e</code>, строка <code>0 4 * * * /usr/local/sbin/iof-nightly</code>");
   if (n) hints.push("Здесь видно, на скольких узлах запустилось обновление и перезагрузка. Как прошло на узле — в его <code>/var/log/iof-nightly.log</code>");
   if (cron && tgHint) hints.push(tgHint);
   $("#nightly-hint").hidden = !hints.length;
   $("#nightly-hint").innerHTML = hints.join("<br>");
   $("#nightly-more").hidden = !n;
   $("#nightly-log").textContent = n ? n.log.join("\n") : "";
+}
+
+function renderSchedule() {
+  const plan = svc.schedule;
+  if (!plan) return;
+  $("#schedule-zone").textContent = `Время управляющего сервера · ${plan.zone}`;
+  for (const [kind, fallback] of Object.entries(scheduleDefaults)) {
+    const data = plan.schedules[kind];
+    const form = $(`#schedule-${kind}`);
+    const input = form.querySelector("input");
+    const shown = data.time || fallback;
+    if (!input.dataset.saved || input.value === input.dataset.saved) input.value = shown;
+    input.dataset.saved = shown;
+    const busy = !!svc.saving || !!svc.info?.migrate;
+    input.disabled = busy || !!data.error;
+    form.querySelector("button").disabled = input.disabled;
+    form.querySelector("[data-state]").textContent = svc.saving === kind ? "Сохраняю…"
+      : data.error || (data.time ? `Каждый день в ${data.time}` : "Расписание ещё не задано");
+  }
+}
+
+function renderCronTasks() {
+  const list = $("#cron-tasks");
+  const open = new Set([...list.querySelectorAll("details[open]")].map((d) => d.dataset.id));
+  const plan = svc.schedule;
+  $("#cron-count").textContent = plan.jobs.length || "";
+  list.innerHTML = plan.jobs.map((j) => {
+    const id = `${j.source}:${j.number}`;
+    return `<li><details data-id="${esc(id)}"${open.has(id) ? " open" : ""}>
+      <summary><span class="item-title">${esc(j.title)}</span><span class="item-meta">${esc(cronHuman(j.schedule) || j.schedule)}</span></summary>
+      <dl class="kv">${kv([
+        ...(j.description ? [["Действие", esc(j.description)]] : []),
+        ["Расписание", `<code>${esc(j.schedule)}</code>`],
+        ["Пользователь", esc(j.user)],
+        ["Источник", `<code>${esc(j.source)}</code>`],
+      ])}</dl>
+      <pre class="code cron-command">${esc(j.command)}</pre>
+    </details></li>`;
+  }).join("") || `<li class="empty">${plan.error ? "Список cron недоступен." : "Заданий cron пока нет."}</li>`;
+}
+
+function renderReach() {
+  const result = svc.info.reach;
+  $("#reach-more").hidden = !result;
+  if (!result) return;
+  $("#reach-summary").textContent = `Последняя проверка · ${fmtStamp(result.started)}`;
+  $("#reach-log").textContent = result.log.join("\n");
+}
+
+async function loadSchedule(request) {
+  const previous = svc.schedule;
+  try {
+    const plan = DEMO ? demoSchedule() : await getJson("api/service/schedule", request.signal);
+    if (request !== svc.request || svc.saving || previous !== svc.schedule) return;
+    svc.schedule = plan;
+    formError(plan.error, "#schedule-error");
+    renderSchedule();
+    renderCronTasks();
+    if (svc.info) renderNightly();
+  } catch (e) {
+    if (request === svc.request) formError(`Не удалось загрузить расписание: ${e.message}`, "#schedule-error");
+  }
+}
+
+async function saveSchedule(event, kind) {
+  event.preventDefault();
+  if (svc.saving) return;
+  const at = event.currentTarget.querySelector("input").value;
+  formError("", "#schedule-error");
+  svc.saving = kind;
+  renderSchedule();
+  try {
+    svc.schedule = DEMO ? demoSchedule(kind, at) : await postJson("api/service/schedule", { task: kind, time: at });
+    formError(svc.schedule.error, "#schedule-error");
+    renderCronTasks();
+    if (svc.info) renderNightly();
+  } catch (e) {
+    formError(e.message, "#schedule-error");
+  } finally {
+    svc.saving = null;
+    renderSchedule();
+  }
+}
+
+async function loadCronLog() {
+  const button = $("#load-cron-log");
+  if (button.disabled) return;
+  button.disabled = true;
+  const source = $("#cron-log-source");
+  const log = $("#cron-log");
+  source.textContent = "Загружаю журнал…";
+  try {
+    const data = DEMO ? demoCronLog() : await getJson("api/service/cron-log");
+    source.textContent = data.error || `${data.source} · последние ${data.lines.length} ${plural(data.lines.length, ["запись", "записи", "записей"])}`;
+    log.textContent = data.lines.join("\n");
+    log.hidden = !data.lines.length;
+    button.textContent = "Обновить журнал";
+  } catch (e) {
+    source.textContent = `Не удалось загрузить журнал: ${e.message}`;
+  } finally {
+    button.disabled = false;
+  }
 }
 
 // Список задач перерисовывается целиком, раскрытые остаются раскрытыми
@@ -199,6 +302,8 @@ function render() {
   renderVersion();
   renderCheck();
   renderNightly();
+  renderReach();
+  renderSchedule();
 }
 
 async function loadInfo({ replace = false } = {}) {
@@ -207,6 +312,7 @@ async function loadInfo({ replace = false } = {}) {
   const finish = !svc.info || replace ? skeletonRegions($("#service-info")) : null;
   $("#refresh").setAttribute("aria-busy", "true");
   const jobs = loadJobs(request, replace);
+  const schedule = loadSchedule(request);
   try {
     const info = DEMO ? await demoService(false) : await getJson("api/service", request.signal);
     if (request !== svc.request) return false;
@@ -215,7 +321,7 @@ async function loadInfo({ replace = false } = {}) {
     if (svc.updating) svc.updating.from ??= info.version;
     $("#alert").hidden = true;
     render();
-    await jobs;
+    await Promise.all([jobs, schedule]);
     return request === svc.request;
   } catch (e) {
     if (request !== svc.request) return false;
@@ -342,5 +448,12 @@ document.addEventListener("DOMContentLoaded", () => {
   $("#check-updates").addEventListener("click", checkUpdates);
   $("#update").addEventListener("click", update);
   $("#job-hide").addEventListener("click", () => { $("#job").hidden = true; });
+  for (const kind of Object.keys(scheduleDefaults)) {
+    $(`#schedule-${kind}`).addEventListener("submit", (event) => saveSchedule(event, kind));
+  }
+  $("#load-cron-log").addEventListener("click", loadCronLog);
+  $('a[href="#cron-journal"]').addEventListener("click", () => {
+    if ($("#cron-log").hidden) loadCronLog();
+  });
   loadInfo();
 });

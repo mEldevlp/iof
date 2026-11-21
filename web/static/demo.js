@@ -196,6 +196,43 @@ function demoNode(name) {
   });
 }
 
+const demoCronTimes = { nightly: "04:00", reach: "" };
+
+function demoSchedule(task, at) {
+  if (task) demoCronTimes[task] = at;
+  const root = "/var/spool/cron/crontabs/root";
+  const expression = (time) => {
+    const [hour, minute] = time.split(":").map(Number);
+    return `${minute} ${hour} * * *`;
+  };
+  const row = (number, kind, title, description, schedule, command, source = root) =>
+    ({ number, kind, title, description, schedule, command, source, user: "root" });
+  const jobs = [
+    row(0, "nightly", "Ночное обслуживание", "Обновляет пакеты и перезагружает зарегистрированные узлы.",
+      expression(demoCronTimes.nightly), "/usr/local/sbin/iof-nightly"),
+    row(1, "check", "Проверка состояния узлов", "Опрашивает службы и ресурсы узлов.",
+      "*/5 * * * *", "/usr/local/bin/iof check >/dev/null 2>&1"),
+    row(0, "", "run-parts /etc/cron.hourly", "", "17 * * * *", "cd / && run-parts --report /etc/cron.hourly", "/etc/crontab"),
+  ];
+  if (demoCronTimes.reach) {
+    const cmd = `umask 077; /usr/local/bin/iof check-from-ru --scheduled ${demoCronTimes.reach} 1795224000 >>/var/log/iof-check-from-ru.log 2>&1`;
+    const desc = "Проверяет DNS, ping и TCP до SSH-портов узлов с управляющего сервера.";
+    jobs.splice(1, 0, row(2, "reach", "Доступность из РФ", desc, expression(demoCronTimes.reach), cmd),
+      row(3, "reach", "Доступность из РФ", "Догоняет пропущенный запуск после перезагрузки.", "@reboot", cmd));
+  }
+  const schedules = Object.fromEntries(Object.entries(demoCronTimes).map(([kind, time]) =>
+    [kind, { time, installed: !!time, error: "" }]));
+  return { jobs, schedules, zone: "UTC", error: "" };
+}
+
+function demoCronLog() {
+  return { source: "systemd journal", error: "", lines: [
+    "2026-11-21T09:00:45+00:00 ubuntu24 cron[850]: (CRON) INFO (Running @reboot jobs)",
+    "2026-11-21T09:15:01+00:00 ubuntu24 CRON[1319]: (root) CMD (/usr/local/bin/iof check >/dev/null 2>&1)",
+    "2026-11-21T09:17:01+00:00 ubuntu24 CRON[1329]: (root) CMD (cd / && run-parts --report /etc/cron.hourly)",
+  ] };
+}
+
 function demoService(fetch) {
   const data = {
     version: demoState.version,
@@ -203,7 +240,7 @@ function demoService(fetch) {
     src_version: demoState.version,
     tg: false,
     bot: { username: "island_of_freedom_bot", subs: { nodes: 2, audit: 1, nightly: 0, updates: 1, ru: 2, admins: 1 } },
-    cron: ["0 4 * * * /usr/local/sbin/iof-nightly", "*/5 * * * * /usr/local/bin/iof check >/dev/null 2>&1"],
+    cron: demoSchedule().jobs.filter((j) => j.kind).map((j) => `${j.schedule} ${j.command}`),
     error: null,
     check: { at: Date.now() / 1000 - 180, total: 6, bad: 2, problems: ["node-4", "node-5"], changes: 0 },
     daily: {

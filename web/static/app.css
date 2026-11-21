@@ -618,6 +618,23 @@ pre.log {
 .jobs summary, .checks summary { display: flex; align-items: center; gap: 8px 16px; flex-wrap: wrap; padding: 12px 0; cursor: pointer; }
 .jobs summary .item-title { flex: 1 1 200px; }
 .jobs pre.log { margin: 0 0 12px; }
+.schedule { padding: 0 16px 8px; }
+.schedule-row {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: start;
+  gap: 8px 24px; padding: 14px 0; border-top: 1px solid var(--grid);
+}
+.schedule-row label { font-weight: 600; }
+.schedule-row .hint { margin: 4px 0 0; }
+.schedule-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.schedule-controls input {
+  height: 36px; padding: 0 10px; border: 1px solid var(--ring); border-radius: 8px;
+  background: var(--page); color: var(--ink); font: inherit;
+}
+.schedule-controls input:disabled { opacity: .6; }
+.cron-command { margin: 0 0 12px; }
+@media (max-width: 600px) {
+  .schedule-row { grid-template-columns: minmax(0, 1fr); }
+}
 
 /* Страница «Безопасность». Сводка блока — .health внутри карточки. Строка проверки: оценка,
    название, значение; раскрывается в «почему это важно», значения по узлам и «как исправить».

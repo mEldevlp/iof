@@ -32,6 +32,7 @@ Docker Desktop там не запускается: Kaspersky Standard не да�
 | `install.sh` | установка и обновление из клона; `--no-web` ставит без панели | — |
 | `web/iof-web.py` | сервер панели, только stdlib python3 | `/opt/iof-web/iof-web.py` |
 | `web/iof_auth.py` | учётные данные, подпись сеансов, первичная настройка и локальный сброс пароля | `/opt/iof-web/iof_auth.py` |
+| `web/iof_cron.py` | чтение cron и его журнала, запись двух расписаний iof | `/opt/iof-web/iof_cron.py` |
 | `web/iof_bot.py` | Telegram-бот, только stdlib: цикл опроса и обработка команд | `/opt/iof-web/iof_bot.py` |
 | `web/iof_bot_host.py` | запуск бота в панели или на узле, обмен по SSH, перенос и восстановление | `/opt/iof-web/iof_bot_host.py` |
 | `web/iof-web.service` | systemd-юнит панели | `/etc/systemd/system/iof-web.service` |
@@ -99,6 +100,7 @@ Docker Desktop там не запускается: Kaspersky Standard не да�
 | `awg/.lock` | `flock` для установки, изменения клиентов и пересборки ссылок |
 | `check.last` | итог последнего `iof check` для панели: `time`, `total`, `bad`, `problems` (имена через пробел), `changes` |
 | `check.daily` | итог ежедневной части: `time` (unix), `updates` (число коммитов или пусто), `updates_head` (последняя сообщённая вершина upstream), `ru_time`, `ru_off`, `ru_nodes` (число опрошенных узлов), `ru_cut`, `ru_noinet`, `ru_down` (списки имён через пробел) |
+| `check-from-ru.last`, `check-from-ru.lock` | время (unix) последнего выполненного слота cron и блокировка, общая для ежедневного запуска и `@reboot` |
 | `ru/<узел>` | последнее изменившееся состояние доступа к российским серверам: `ok`, `cut`, `noinet`; отсутствие файла означает `ok` |
 | `audit/server.json`, `audit/dpi.json` | последняя проверка блока `iof audit` по узлам: `{"nodes": {имя: {addr, reachable, at, checked, error, checks: [{id, status, value, detail, hint, cmd}]}}}`. Проверка одного узла заменяет только его запись |
 | `audit/history.jsonl` | строка JSON на запуск `iof audit run`: `at`, `block` (`server`, `dpi` или `all`), `nodes`, `counts`, `down`, `worse`; хранится `AUDIT_KEEP` последних (по умолчанию 30, задаётся в `iof.env`) |
@@ -203,7 +205,8 @@ sha1-хэш. Повторный запуск с той же подписью д�
   и, если входящие режутся, два правила ACCEPT в INPUT с комментарием `iof-probe-<номер>`. По сроку или
   `probe stop` `ExecStopPost` снимает правила и удаляет папку, `n_probe_stop` добирает остатки.
 - Ночное обслуживание: юнит `iof-nightly` (systemd-run), лог `/var/log/iof-nightly.log`.
-  На управляющем сервере лог запуска пишется в `/var/log/iof-nightly-run.log`.
+  На управляющем сервере лог запуска пишется в `/var/log/iof-nightly-run.log`. Его ночной юнит
+  перед перезагрузкой ставит метку `/run/iof-nightly-reboot`, она исчезает при загрузке.
 - Перенос управления: новый сервер принимает данные в `/root/.iof-migrate` и удаляет их, когда закончит.
   Чужая папка iof на нём сохраняется в `/root/iof.before-migrate-<ts>`. Старый сервер после
   `migrate finish` хранит прежние данные и ключ iof в `/root/iof.moved-<ts>`.
@@ -458,6 +461,7 @@ sha1-хэш. Повторный запуск с той же подписью д�
   их исходников), блок-лист с Docker и `ufw` на узле.
 
 Команды: `setup [--template-only] [--name main --addr IPv4/домен --title подпись --port 443 --obfs none|salamander]`, `status`, `check [--daily]` (для cron, Telegram, пишет `check.last` и раз в сутки `check.daily`), `notify тип [текст]`, `exec`, `refresh`, `init`,
+`[-n узлы] check-from-ru` (DNS, ICMP и TCP-проверка узлов с управляющего сервера),
 `api status|controller|service|updates|audit` (audit — JSON), `audit run [server|dpi|all]|show|cron`,
 `audit probe start [--ttl с]|stop|import|list`, `update`, `version` (версию подставляет `install.sh` в `IOF_VERSION`),
 `node add|import|del|rename|list`, `hy2 install|add [--hop|--no-hop]|del|list|show|refresh|status|restart|hop on|off|upgrade`,
@@ -599,6 +603,24 @@ sha1-хэш. Повторный запуск с той же подписью д�
   перезапускает панель; вывод через `tee -p` ещё и в `/var/log/iof-update.log`, без этого `iof update`
   падал с кодом 1 на записи в оборванную трубу. Страница «Сервис» ждёт перезапуска, сравнивает
   версию и показывает вывод из этого файла).
+  «Расписание обслуживания» на «Сервисе» задаёт ежедневное время по часовому поясу управляющего
+  сервера (предложены 04:00 и 04:10). `GET /api/service/schedule` отдаёт `zone`, `jobs`, `schedules`
+  и `error`. `POST /api/service/schedule` принимает `{task: "nightly"|"reach", time: "ЧЧ:ММ"}`
+  и сохраняет через `crontab -u root -` под общей с переносом блокировкой `setup.lock`.
+  Обычная ежедневная запись `iof-nightly` в crontab root подхватывается и меняет время с сохранением
+  команды и перенаправлений. Сложные и системные записи доступны для просмотра по источнику.
+  «Задачи панели» показывает все найденные crontab пользователей, `/etc/crontab`, `/etc/cron.d`,
+  `/etc/anacrontab` и исполняемые задания периодических каталогов. В каждой строке есть расписание,
+  команда, пользователь и источник. История запусков из панели по-прежнему приходит из `GET /api/jobs`.
+  `GET /api/service/cron-log` отдаёт последние 120 строк cron из journalctl или файловых логов.
+  Проверка доступности из РФ добавляет ежедневное задание и `@reboot` с той же командой
+  `iof check-from-ru --scheduled ЧЧ:ММ <время создания расписания unix>`. Выполняется один раз на
+  последний наступивший слот, ждёт окончания местного `iof-nightly.service` или перезагрузки,
+  при загрузке догоняет пропущенный слот. С управляющего сервера проверяет DNS и ping клиентского
+  адреса и TCP на SSH-адресе и порту удалённых узлов. Успех узла — ответ на ping или TCP-соединение.
+  Проверка VPN-рукопожатия сюда не входит. Вывод пишется в `/var/log/iof-check-from-ru.log`,
+  последнее выполнение видно на странице через поле `reach` в `GET /api/service`.
+  Оба задания переносятся как остальные строки iof из crontab root.
   `GET /api/bot` (`config` — `bot.json` через `read_bot`: поля по умолчанию как у `iof bot`, у приглашений
   только начало хэша (`BOT_HASH`, 12 знаков, как в `iof bot show`), истёкшие не показываются; `token` —
   `true|false`, сам токен панель не отдаёт; `thread` — `srv.bot.state()` или `null`, тогда причина в

@@ -56,6 +56,83 @@ class PanelAppearance(unittest.TestCase):
             self.assertNotIn("Команды на сервере", (web.STATIC_DIR / name).read_text(encoding="utf-8"))
 
 
+class CronSchedule(unittest.TestCase):
+    def test_save_existing_nightly_and_add_reboot_pair(self):
+        cron = web.iof_cron
+        other = "SHELL=/bin/bash\n# расписание сервера\n\n17 * * * * housekeeping\n"
+        root = [other + "0 4 * * * /usr/local/sbin/iof-nightly >/dev/null 2>&1\n"]
+        writes = []
+
+        def command(args, stdin=None):
+            self.assertEqual(args[:3], ["crontab", "-u", "root"])
+            if stdin is not None:
+                root[0] = stdin
+                writes.append(stdin)
+            return SimpleNamespace(returncode=0, stdout=root[0].encode(), stderr=b"")
+
+        with mock_patch.object(cron, "command", side_effect=command), \
+             mock_patch.object(cron, "system_jobs", return_value=[]), \
+             mock_patch.object(cron.time, "time", return_value=1795224000):
+            self.assertEqual(cron.view()["schedules"]["nightly"]["time"], "04:00")
+            cron.save({"task": "nightly", "time": "03:45"})
+            self.assertEqual(root[0], other + "45 3 * * * /usr/local/sbin/iof-nightly >/dev/null 2>&1\n")
+            cron.save({"task": "reach", "time": "04:10"})
+            cron.save({"task": "reach", "time": "04:10"})
+            self.assertEqual(len(writes), 2)
+            self.assertEqual(cron.view()["schedules"]["reach"]["time"], "04:10")
+            cron.save({"task": "reach", "time": "04:20"})
+            self.assertEqual(root[0].count("check-from-ru --scheduled 04:20"), 2)
+            self.assertEqual(root[0].count("@reboot"), 1)
+            self.assertNotIn("04:10", root[0])
+
+    def test_system_jobs_are_visible_and_leave_existing_nightly_untouched(self):
+        cron = web.iof_cron
+        system = list(cron.tab_jobs("MAILTO=root\n0 4 * * * root /usr/local/sbin/iof-nightly\n"
+                                    "@reboot nobody /bin/true\n", "/etc/cron.d/iof", None))
+        with mock_patch.object(cron, "root_crontab", return_value=""), \
+             mock_patch.object(cron, "system_jobs", return_value=system), mock_patch.object(cron, "command") as command:
+            self.assertEqual(cron.view()["jobs"], system)
+            self.assertEqual(system[1]["user"], "nobody")
+            with self.assertRaises(ValueError):
+                cron.save({"task": "nightly", "time": "04:30"})
+            with self.assertRaises(ValueError):
+                cron.save({"task": "reach", "time": "04:30; reboot"})
+            command.assert_not_called()
+
+    def test_scheduled_check_catches_up_across_midnight_and_runs_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            subprocess.run(["bash", "-c", '''
+set -euo pipefail
+source lib/common.sh
+source lib/status.sh
+BASE="$1"
+date() {
+  case "$*" in
+    '+%s') echo 1800000001 ;;
+    '-d today 23:45 +%s') echo 1800086300 ;;
+    '-d yesterday 23:45 +%s') echo 1799999900 ;;
+    '+%F %T') echo '2027-01-15 00:11:00' ;;
+    *) return 1 ;;
+  esac
+}
+systemctl() {
+  if [[ "$1" == is-active ]]; then
+    [[ ! -e "$BASE/waited" ]]
+  else
+    [[ "$*" == 'start network-online.target' ]]
+  fi
+}
+sleep() { touch "$BASE/waited"; }
+check_from_ru() { echo 'Запуск' >>"$BASE/runs"; }
+(cmd_check_from_ru --scheduled 23:45 1800000000)
+[[ ! -e "$BASE/runs" && ! -e "$BASE/waited" ]]
+(cmd_check_from_ru --scheduled 23:45 1799999800)
+(cmd_check_from_ru --scheduled 23:45 1799999800)
+[[ -e "$BASE/waited" && "$(cat "$BASE/check-from-ru.last")" == 1799999900 ]]
+[[ "$(wc -l < "$BASE/runs")" == 1 ]]
+''', "check-schedule", tmp], cwd=ROOT, capture_output=True, check=True)
+
+
 class Dashboard(unittest.TestCase):
     def test_controller_before_and_after_migrate_finish(self):
         with tempfile.TemporaryDirectory() as tmp:

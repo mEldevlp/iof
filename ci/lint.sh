@@ -10,7 +10,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT" || exit 1
 SHELL_FILES=(iof.sh lib/*.sh build.sh iof-nightly install.sh stand/stand.sh stand/test.sh stand/test-setup.sh stand/test-awg.sh stand/test-web.sh stand/test-bot-host.sh ci/lint.sh ci/test-build.sh)
 # Панель, модуль Telegram-бота и поддельный Bot API стенда
-PY_FILES=(web/iof-web.py web/iof_auth.py web/iof_bot.py web/iof_bot_host.py stand/fake-tg.py stand/panel_client.py stand/test-web.py stand/test-bot-host.py ci/test-panel.py)
+PY_FILES=(web/iof-web.py web/iof_auth.py web/iof_bot.py web/iof_bot_host.py web/iof_cron.py stand/fake-tg.py stand/panel_client.py stand/test-web.py stand/test-bot-host.py ci/test-panel.py)
 # Сторонний код в web/static: xterm.js для терминала на странице узла. Правила CSP к нему не применяются:
 # свои <style> он создаёт скриптом, и term.js переносит их в adoptedStyleSheets. Файлы берутся из npm
 # целиком, первая строка называет пакет и версию (CLAUDE.md, «Веб-панель»)

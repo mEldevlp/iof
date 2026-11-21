@@ -50,6 +50,7 @@ Island of Freedom управление VPN-серверами // by meldevlp
   iof check                   проверка для cron, уведомление в Telegram при изменениях; раз в сутки ещё
                               обновления iof и доступ к российским серверам с узлов (RU_TARGETS), --daily — сейчас
   iof notify тип [текст]      уведомление в Telegram (без текста — со stdin), типы: nodes audit nightly updates ru admins
+  iof check-from-ru           DNS, ping и TCP к SSH-адресам узлов с управляющего сервера
   iof web reset-password     сбросить пароль панели без старого пароля и отозвать сеансы
   iof exec "команда"          выполнить команду на узлах
   iof refresh                 пересобрать все ссылки hy2 и ключи awg
@@ -150,7 +151,7 @@ VLESS
   iof migrate cancel          на старом: отменить перенос
   iof migrate status          идёт ли перенос
 
-Выбор узлов: -n перед командой ограничивает status, check, exec, hy2 status, awg status, awg clients, audit, block update
+Выбор узлов: -n перед командой ограничивает status, check, check-from-ru, exec, hy2 status, awg status, awg clients, audit, block update
   iof -n 'de-*' status
   iof -n de-1,de-2 exec "apt update"
 Сколько узлов одновременно: PARALLEL в /root/iof/iof.env (по умолчанию 20)
@@ -196,6 +197,7 @@ case "$cmd" in
   bot)     cmd_bot "$@" ;;
   status)  cmd_status ;;
   check)   cmd_check "$@" ;;
+  check-from-ru) cmd_check_from_ru "$@" ;;
   notify)  cmd_notify "$@" ;;
   web)     cmd_web "$@" ;;
   exec)    cmd_exec "$@" ;;
