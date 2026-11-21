@@ -111,6 +111,8 @@ def terminal_output(ws, command, expected):
 
 
 def restart_panel():
+    # Явные перезапуски теста могут уложиться в один интервал ограничения запусков systemd.
+    subprocess.run(["systemctl", "reset-failed", "iof-web"], check=True)
     subprocess.run(["systemctl", "restart", "iof-web"], check=True)
     for _ in range(50):
         try:

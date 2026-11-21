@@ -75,5 +75,8 @@ cat /run/iof-test-ssh.pub >> /root/.ssh/authorized_keys
 ssh -fN -L 127.0.0.1:18088:127.0.0.1:8088 -i /run/iof-test-ssh \
   -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
   -o LogLevel=ERROR -o ExitOnForwardFailure=yes "root@$ip"
-python3 -B /src/stand/test-web.py "$ip"
+if ! python3 -B /src/stand/test-web.py "$ip"; then
+  journalctl -u iof-web -u iof-update -n 100 --no-pager >&2
+  exit 1
+fi
 SH
