@@ -2,7 +2,7 @@
 
 # Установка и обновление iof и веб-панели iof-web из клона репозитория.
 # Первый раз:  sudo git clone https://github.com/mEldevlp/iof /opt/iof && sudo bash /opt/iof/install.sh
-# Дальше:      sudo iof update   (git pull + этот скрипт)
+# Дальше:      sudo iof update --release
 # --no-web     поставить только iof, панель не трогать
 set -euo pipefail
 
@@ -22,12 +22,12 @@ bash -n "$SRC/iof-nightly" || die "iof-nightly не проходит bash -n, н
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 bash "$SRC/build.sh" > "$TMP/iof" || die "iof не собран, ничего не менял"
-# Версия (коммит и дата) подставляется в iof: её показывают iof version и страница «Сервис» панели
-VERSION="$(git -C "$SRC" log -1 --format='%h %cd' --date=short 2>/dev/null || echo 'без git')"
-if [[ "$VERSION" != "без git" ]] && ! git -C "$SRC" diff --quiet HEAD -- 2>/dev/null; then
-  VERSION="$VERSION с правками"
-fi
-sed "s|^IOF_VERSION=.*|IOF_VERSION=\"$VERSION\"|" "$TMP/iof" > "$TMP/iof-versioned"
+# shellcheck source=lib/release.sh
+source "$SRC/lib/release.sh"
+VERSION="$(source_version "$SRC" || echo 'без git')"
+REVISION="$(git -C "$SRC" rev-parse --verify HEAD 2>/dev/null || true)"
+sed -e "s|^IOF_VERSION=.*|IOF_VERSION=\"$VERSION\"|" -e "s|^IOF_REVISION=.*|IOF_REVISION=\"$REVISION\"|" \
+  "$TMP/iof" > "$TMP/iof-versioned"
 bash -n "$TMP/iof-versioned" || die "iof с версией не проходит bash -n, ничего не менял"
 install -m 700 "$TMP/iof-versioned" /usr/local/bin/iof
 echo "iof: /usr/local/bin/iof ($VERSION)"

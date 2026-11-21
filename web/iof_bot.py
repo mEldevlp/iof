@@ -415,7 +415,7 @@ def server_time(text):
 
 def service_text(d, pending=False, now=None):
     """/service: версия и обновления, последняя проверка узлов, последнее ночное обслуживание.
-    pending — обновления ещё проверяются (git fetch)."""
+    pending — ещё проверяется последний опубликованный релиз."""
     now = now or time.time()
     lines = []
     mig = d.get("migrate") or {}
@@ -434,19 +434,19 @@ def service_text(d, pending=False, now=None):
         lines.append(f"Git-клона в {esc(src)} нет, обновления не проверить")
     u = d.get("updates")
     if pending:
-        lines.append("⏳ Проверяю обновления (git fetch)…")
+        lines.append("⏳ Проверяю обновления по опубликованным релизам…")
     elif u and u.get("error"):
         lines.append(f"{MARK['warn']} Обновления не проверены: {esc(u['error'])}")
-    elif u and not u.get("commits"):
-        lines.append(f"{MARK['good']} Обновлений нет, ветка <code>{esc(u.get('branch', ''))}</code>")
+    elif u and not u.get("available"):
+        lines.append(f"{MARK['good']} Обновлений нет, последний релиз <code>{esc(u['release'])}</code>"
+                     if u.get("release") else "Опубликованных релизов пока нет")
     elif u:
         k = len(u["commits"])
-        lines.append(f"{MARK['warn']} <b>Доступно обновление</b>: {k} {plural(k, ('коммит', 'коммита', 'коммитов'))} "
-                     f"в <code>{esc(u.get('branch', ''))}</code>")
+        lines.append(f"{MARK['warn']} <b>Доступен релиз</b> <code>{esc(u.get('release', ''))}</code>")
         lines += [f"• <code>{esc(c.get('hash', ''))}</code> {esc(c.get('subject', ''))}" for c in u["commits"][:5]]
         if k > 5:
             lines.append(f"…и ещё {k - 5}")
-        lines.append("Обновить: в панели, страница «Сервис», или <code>sudo iof update</code>")
+        lines.append("Обновить: в панели, страница «Сервис», или <code>sudo iof update --release</code>")
 
     cron = d.get("cron") or []
     lines += ["", "<b>Проверка узлов</b> (iof check)"]
@@ -1239,7 +1239,7 @@ class Bot:
 
     def view_service(self, api, chat_id, arg=""):
         """Сразу — версия, проверка узлов и ночное обслуживание, потом то же сообщение с обновлениями:
-        git fetch идёт до минуты."""
+        проверка последнего релиза занимает до минуты."""
         d = self.views.service(False)
         fetch = bool(d.get("src_version")) and not d.get("error")
         msg = self.send(api, chat_id, service_text(d, pending=fetch))

@@ -17,22 +17,21 @@ cmd_api() {
 api_service() {
   printf 'version=%s\nsrc=%s\n' "$IOF_VERSION" "$IOF_SRC"
   if [[ -d "$IOF_SRC/.git" ]] && have git; then
-    printf 'src_version=%s\n' "$(git -C "$IOF_SRC" log -1 --format='%h %cd' --date=short 2>/dev/null || true)"
+    printf 'src_version=%s\n' "$(source_version "$IOF_SRC" || true)"
   fi
   if [[ -n "$TG_TOKEN" && -n "$TG_CHAT" ]]; then echo "tg=yes"; else echo "tg=no"; fi
   crontab -l -u root 2>/dev/null | grep -v '^[[:space:]]*#' | grep -F 'iof' | sed 's/^/cron=/' || true
 }
 
-# Для страницы «Сервис»: git fetch в клоне, затем коммиты, которые принесёт iof update
+# Для панели и уведомлений: только коммиты до тега последнего опубликованного релиза.
 api_updates() {
-  local err
   [[ -d "$IOF_SRC/.git" ]] || die "нет клона репозитория в $IOF_SRC"
   have git || die "нет git: apt install git"
-  err="$(GIT_TERMINAL_PROMPT=0 git -C "$IOF_SRC" fetch --quiet 2>&1)" || die "git fetch не прошёл: $(tail -n 1 <<<"$err")"
-  git -C "$IOF_SRC" rev-parse --abbrev-ref '@{u}' >/dev/null 2>&1 \
-    || die "у ветки в $IOF_SRC нет вышестоящей (upstream), iof update не сможет сделать git pull"
-  printf 'branch=%s\n' "$(git -C "$IOF_SRC" rev-parse --abbrev-ref '@{u}')"
-  git -C "$IOF_SRC" log --format='commit=%h%x09%cd%x09%s' --date=short 'HEAD..@{u}'
+  release_info
+  printf 'release=%s\navailable=%s\n' "$REL_TAG" "$REL_AVAILABLE"
+  if [[ "$REL_AVAILABLE" == yes && -n "$REL_INSTALLED" ]]; then
+    git -C "$IOF_SRC" log --format='commit=%h%x09%cd%x09%s' --date=short "$REL_INSTALLED..$REL_COMMIT"
+  fi
 }
 
 api_status() {

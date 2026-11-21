@@ -28,12 +28,18 @@ git -C /opt/iof remote add origin /tmp/iof-origin
 git -C /opt/iof push -qu origin master
 
 printf 'IOF_WEB_HOSTS=panel.test,%s\nIOF_WEB_TERMINAL=1\nIOF_WEB_PASSWORD="Прежний пароль iof"\n' "$ip" > /root/iof/web.env
+printf 'IOF_RELEASE_API=file:///run/iof-test-release.json\n' >> /root/iof/web.env
 printf 'panel | %s | local | Панель\n' "$ip" > /root/iof/nodes.conf
 bash /opt/iof/install.sh
 git clone -q /tmp/iof-origin /tmp/iof-new-version
 git -C /tmp/iof-new-version -c user.name='Стенд iof' -c user.email='iof@localhost' \
-  commit --allow-empty -qm 'Следующая версия для проверки обновления'
-git -C /tmp/iof-new-version push -q
+  commit --allow-empty -qm 'Стабильный выпуск для проверки обновления'
+git -C /tmp/iof-new-version tag v0.9
+git -C /tmp/iof-new-version -c user.name='Стенд iof' -c user.email='iof@localhost' \
+  commit --allow-empty -qm 'Неопубликованный коммит master'
+git -C /tmp/iof-new-version tag v0.10
+git -C /tmp/iof-new-version push -q --tags origin master
+printf '{"tag_name":"v0.10","draft":false,"prerelease":true,"published_at":"2026-11-21T00:00:00Z"}\n' > /run/iof-test-release.json
 
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=panel.test \
   -addext 'subjectAltName=DNS:panel.test' -keyout /run/iof-test.key -out /run/iof-test.crt 2>/dev/null

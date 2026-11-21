@@ -33,6 +33,8 @@ source "$IOF_LIB/migrate.sh"
 source "$IOF_LIB/status.sh"
 # shellcheck source=lib/service.sh
 source "$IOF_LIB/service.sh"
+# shellcheck source=lib/release.sh
+source "$IOF_LIB/release.sh"
 # shellcheck source=lib/setup.sh
 source "$IOF_LIB/setup.sh"
 # shellcheck source=lib/api.sh
@@ -56,8 +58,8 @@ Island of Freedom управление VPN-серверами // by meldevlp
   iof refresh                 пересобрать все ссылки hy2 и ключи awg
   iof init                    первичная настройка управляющего сервера
   iof api status|controller|service|updates   данные для веб-панели в виде key=value (api audit — JSON)
-  iof update [--no-web]       обновить iof и веб-панель с GitHub (клон в /opt/iof)
-  iof version                 установленная версия (коммит и дата)
+  iof update [--release] [--no-web]   обновить из ветки или опубликованного релиза
+  iof version                 установленная версия (релиз или коммит и дата)
 
 Узлы
   iof node import файл        добавить много серверов по паролям root (строки: имя | ip | пароль | подпись | ssh_порт)

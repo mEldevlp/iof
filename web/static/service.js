@@ -79,19 +79,20 @@ function renderUpdates() {
   if (i.error) {
     html = `<div class="note crit">${icon("crit")}<div>iof не ответил: ${esc(i.error)}</div></div>`;
   } else if (svc.checking) {
-    html = `<div class="note"><span class="spinner" aria-hidden="true"></span><div>Проверяю: git fetch в ${esc(i.src)}…</div></div>
+    html = `<div class="note"><span class="spinner" aria-hidden="true"></span><div>Проверяю опубликованные релизы…</div></div>
       <ul class="commits" aria-hidden="true">${`<li>${skeletonBar("long")}</li>`.repeat(u?.commits.length || 2)}</ul>`;
   } else if (u && u.error) {
     html = `<div class="note crit">${icon("crit")}<div>Не удалось проверить: ${esc(u.error)}</div></div>`;
-  } else if (u && !u.commits.length) {
-    html = `<div class="note good">${icon("good")}<div>Новых коммитов в <span class="mono">${esc(u.branch)}</span> нет</div></div>`;
+  } else if (u && !u.available) {
+    const status = u.release ? `Обновлений нет. Последний релиз <code>${esc(u.release)}</code>.` : "Опубликованных релизов пока нет.";
+    html = `<div class="note good">${icon("good")}<div>${status}</div></div>`;
   } else if (u) {
-    html = `<div class="note warn">${icon("warn")}<div>Доступно обновление: ${u.commits.length}
-      ${plural(u.commits.length, ["коммит", "коммита", "коммитов"])} в <span class="mono">${esc(u.branch)}</span></div></div>
-      <ul class="commits">${u.commits.map((c) => `<li><code>${esc(c.hash)}</code>${esc(c.subject)} <span class="muted">${esc(c.date)}</span></li>`).join("")}</ul>`;
+    html = `<div class="note warn">${icon("warn")}<div>Доступен релиз <code>${esc(u.release)}</code></div></div>`;
+    if (u.commits.length) {
+      html += `<ul class="commits">${u.commits.map((c) => `<li><code>${esc(c.hash)}</code>${esc(c.subject)} <span class="muted">${esc(c.date)}</span></li>`).join("")}</ul>`;
+    }
   } else if (i.src_version && i.version && i.src_version.split(" ")[0] !== i.version.split(" ")[0]) {
-    html = `<div class="note warn">${icon("warn")}<div>В клоне не та версия, что установлена. Поставить её: «Обновить»
-      или <code>sudo bash ${esc(i.src)}/install.sh</code></div></div>`;
+    html = `<div class="note warn">${icon("warn")}<div>Версии клона и установленной панели различаются.</div></div>`;
   }
   $("#updates").innerHTML = html;
   if (svc.checking) $("#updates").setAttribute("aria-busy", "true");
@@ -135,7 +136,7 @@ function dailyCell(d) {
   const when = new Date(d.at * 1000).toLocaleString("ru-RU", { dateStyle: "short", timeStyle: "short" });
   const lines = [];
   if (d.updates === null) lines.push(badge("none", "обновления не проверены"));
-  else lines.push(d.updates ? badge("warn", `вышла новая версия: ${d.updates} ${plural(d.updates, ["коммит", "коммита", "коммитов"])}`) : badge("good", "обновлений нет"));
+  else lines.push(d.updates_release ? badge("warn", `доступен релиз ${d.updates_release}`) : badge("good", "обновлений нет"));
   const ru = d.ru;
   if (d.ru_off) lines.push(badge("none", "доступ к РФ не проверяется: RU_TARGETS пуст"));
   else if (ru) {
@@ -480,7 +481,7 @@ async function checkUpdates() {
 // запросы не проходят, а после перезапуска задачи уже нет. Тогда сравниваем версию с той, что была
 
 async function update() {
-  if (!confirm("Обновить iof и панель с GitHub? Это sudo iof update: git pull и install.sh. В конце панель перезапустится.")) return;
+  if (!confirm("Установить последний опубликованный релиз iof и панели с GitHub? После установки панель перезапустится.")) return;
   formError("", "#action-error");
   try {
     const id = DEMO ? demoUpdateJob() : (await postJson("api/service", { action: "update" })).job;
@@ -497,7 +498,8 @@ function renderUpdateJob(j) {
   const lvl = renderJobCard(j);
   $("#job-hide").hidden = j.state === "running";
   const reason = failReason(j.log);
-  jobResult(lvl, j.state === "running" ? "" : `${icon("crit")}<div>Обновление не прошло${reason ? `: <b>${esc(reason)}</b>` : ", причина в логе"}</div>`);
+  if (j.state === "ok") jobResult("good", `${icon("good")}<div>Проверка обновления завершена. Подробности в логе.</div>`);
+  else jobResult(lvl, j.state === "running" ? "" : `${icon("crit")}<div>Обновление не прошло${reason ? `: <b>${esc(reason)}</b>` : ", причина в логе"}</div>`);
 }
 
 async function pollUpdate() {
@@ -526,7 +528,7 @@ async function pollUpdate() {
     loadInfo();
     return;
   }
-  // Задачи нет: панель перезапустилась с новой версией (или с той же, если новых коммитов не было)
+  // Задачи нет: установщик перезапустил панель.
   svc.updating = null;
   if (!(await loadInfo())) return;
   const to = svc.info.version;
@@ -537,10 +539,10 @@ async function pollUpdate() {
   // Полный вывод — из /var/log/iof-update.log: задача успела показать только начало
   const ul = svc.info.update_log;
   $("#job-log").textContent = ul && ul.at > u.started - 60
-    ? ["$ iof update", ...ul.lines].join("\n")
-    : [...(u.last ? u.last.log : ["$ iof update"]), "… панель перезапущена"].join("\n");
+    ? ["$ iof update --release", ...ul.lines].join("\n")
+    : [...(u.last ? u.last.log : ["$ iof update --release"]), "… панель перезапущена"].join("\n");
   jobResult("good", to === u.from
-    ? `${icon("good")}<div>Панель перезапущена, версия та же: ${fmtVersion(to)}. Новых коммитов не было.</div>`
+    ? `${icon("good")}<div>Релиз ${fmtVersion(to)} переустановлен. Панель перезапущена.</div>`
     : `${icon("good")}<div>Обновлено: ${fmtVersion(u.from)} → ${fmtVersion(to)}.
         <a href="${location.pathname}${location.search}">Перезагрузи страницу</a>, чтобы панель открылась в новой версии.</div>`);
 }

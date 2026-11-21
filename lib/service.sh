@@ -73,12 +73,25 @@ cmd_init() {
   echo "Проверка: iof status"
 }
 
-# Обновление из клона репозитория GitHub в $IOF_SRC: git pull, затем install.sh
-# ставит новый iof и веб-панель
+# Рабочая ветка сохраняет git pull. Панель и клон на теге устанавливают только опубликованные релизы.
 cmd_update() {
-  local old new
+  local old new release=0 flag installer_args=()
+  for flag in "$@"; do
+    case "$flag" in
+      --release) release=1 ;;
+      --no-web) installer_args=(--no-web) ;;
+      *) die "используй: iof update [--release] [--no-web]" ;;
+    esac
+  done
   [[ -d "$IOF_SRC/.git" ]] || die "нет клона репозитория в $IOF_SRC, сначала: git clone https://github.com/mEldevlp/iof $IOF_SRC"
   have git || die "нет git: apt install git"
+  (umask 077; mkdir -p "$BASE")
+  exec 9>>"$BASE/update.lock"
+  flock -n 9 || die "iof уже обновляется"
+  if (( release )) || ! git -C "$IOF_SRC" symbolic-ref -q HEAD >/dev/null; then
+    update_release "${installer_args[@]}"
+    return
+  fi
   old="$(git -C "$IOF_SRC" rev-parse --short HEAD)"
   git -C "$IOF_SRC" pull --ff-only --quiet || die "git pull не прошёл, проверь $IOF_SRC (git -C $IOF_SRC status)"
   new="$(git -C "$IOF_SRC" rev-parse --short HEAD)"
@@ -88,7 +101,7 @@ cmd_update() {
     echo "Изменения $old..$new:"
     git -C "$IOF_SRC" log --format='  %h %s' "$old..$new"
   fi
-  exec bash "$IOF_SRC/install.sh" "$@"
+  exec bash "$IOF_SRC/install.sh" "${installer_args[@]}"
 }
 
 # Локальное восстановление входа в панель. Пароль принимает только Python через терминал или stdin.

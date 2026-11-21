@@ -27,7 +27,7 @@ const demoState = {
   awgPorts: {},
   deleted: [],
   renamed: {},
-  version: "e741874 2026-11-01",
+  version: "v0.9 2026-11-01",
   updateLog: null,
   jobs: [
     {
@@ -304,13 +304,13 @@ function demoService(fetch) {
     migrate: null,
   };
   if (fetch) {
-    data.updates = demoState.version.startsWith("e741874") ? {
-      error: null, branch: "origin/master",
+    data.updates = demoState.version.startsWith("v0.9 ") ? {
+      error: null, release: "v0.10", available: true,
       commits: [
         { hash: "9c41d2e", date: "2026-11-02", subject: "iof: hy2 restart проверяет, что сервис поднялся" },
         { hash: "51ab0f7", date: "2026-11-02", subject: "iof-web: страница узла" },
       ],
-    } : { error: null, branch: "origin/master", commits: [] };
+    } : { error: null, release: "v0.10", available: false, commits: [] };
   }
   return demoDelay(data);
 }
@@ -418,12 +418,12 @@ function demoNodeJob(body) {
 
 // Обновление в демо: после задачи «панель перезапускается», и задача пропадает, как на сервере
 function demoUpdateJob() {
-  const out = ["Изменения e741874..9c41d2e:", "  9c41d2e iof: hy2 restart проверяет, что сервис поднялся", "  51ab0f7 iof-web: страница узла",
-    "iof: /usr/local/bin/iof (9c41d2e 2026-11-02)", "iof-nightly: /usr/local/sbin/iof-nightly"];
+  const out = ["Устанавливаю опубликованный релиз v0.10", "iof: /usr/local/bin/iof (v0.10 2026-11-02)",
+    "iof-nightly: /usr/local/sbin/iof-nightly"];
   // Как на сервере: задача успевает показать только начало, полный вывод остаётся в файле
-  return demoRunJob("service", "Обновление iof и панели", ["$ iof update", ...out.slice(0, 2)], "ok", (job) => {
+  return demoRunJob("service", "Обновление iof и панели", ["$ iof update --release", ...out.slice(0, 2)], "ok", (job) => {
     demoState.updateLog = { at: Date.now() / 1000, lines: [...out, "iof-web: работает, http://127.0.0.1:8088/ (с компьютера через SSH-туннель)"] };
-    demoState.version = "9c41d2e 2026-11-02";
+    demoState.version = "v0.10 2026-11-02";
     demoState.jobs = demoState.jobs.filter((j) => j !== job);
   });
 }

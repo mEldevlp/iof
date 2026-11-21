@@ -6,7 +6,7 @@
 Ссылки Hysteria2 и ключи vpn:// отдаёт на страницах соответствующих протоколов.
 Меняет что-то только через команды iof (добавление сервера: iof node add, iof hy2/awg install;
 клиенты: iof hy2/awg add | del | refresh; действия с узлом: iof hy2 restart, iof node del | rename;
-обновление: iof update; перенос управляющего сервера: iof migrate; проверка безопасности:
+обновление: iof update --release; перенос управляющего сервера: iof migrate; проверка безопасности:
 iof audit run, она узлы только читает; проверка с ПК: iof audit probe), по одной задаче за раз,
 с логом выполнения. Исключения — терминал на узел со страницы узла (ssh с ключом iof через
 WebSocket, включается отдельно, IOF_WEB_TERMINAL=1) и страница «Телеграм бот», у которой свой ход
@@ -1065,10 +1065,12 @@ def service_steps(iof, body):
     tee -p продолжает писать в файл, когда читать из трубы уже некому."""
     if body.get("action") != "update":
         raise ValueError("неизвестное действие")
-    script = f"set -o pipefail; {shlex.quote(iof)} update 2>&1 | tee -p {shlex.quote(str(UPDATE_LOG))}"
-    argv = ["systemd-run", "--unit=iof-update", "--collect", "--quiet", "--wait", "--pipe",
-            "--setenv=LC_ALL=C.UTF-8", "/bin/bash", "-c", script]
-    return "Обновление iof и панели", [("iof update", argv, None)]
+    script = f"set -o pipefail; {shlex.quote(iof)} update --release 2>&1 | tee -p {shlex.quote(str(UPDATE_LOG))}"
+    argv = ["systemd-run", "--unit=iof-update", "--collect", "--quiet", "--wait", "--pipe", "--setenv=LC_ALL=C.UTF-8"]
+    if release_api := os.environ.get("IOF_RELEASE_API"):
+        argv.append(f"--setenv=IOF_RELEASE_API={release_api}")
+    argv += ["/bin/bash", "-c", script]
+    return "Обновление iof и панели", [("iof update --release", argv, None)]
 
 
 # Блоки страницы «Безопасность», которые умеет проверять iof audit run
@@ -1459,8 +1461,7 @@ def bot_notify(base):
 
 
 def read_daily(base):
-    """check.daily (раз в сутки из iof check, key=value) -> {at, updates, ru} или None. updates — сколько
-    коммитов принесёт iof update, None — не проверено; ru — доступ к российским серверам с узлов или None."""
+    """Ежедневная проверка релиза и доступа к российским серверам с узлов."""
     try:
         lines = (base / "check.daily").read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
@@ -1472,8 +1473,9 @@ def read_daily(base):
     if kv.get("ru_time", "").isdigit() and not kv.get("ru_off"):
         ru = {"at": int(kv["ru_time"]), "nodes": to_int(kv.get("ru_nodes")), "cut": kv.get("ru_cut", "").split(),
               "noinet": kv.get("ru_noinet", "").split(), "down": kv.get("ru_down", "").split()}
-    return {"at": int(kv["time"]), "updates": to_int(kv["updates"]) if kv.get("updates", "").isdigit() else None,
-            "ru": ru, "ru_off": bool(kv.get("ru_off"))}
+    updates = kv.get("updates", "")
+    return {"at": int(kv["time"]), "updates": int(updates) if "updates_release" in kv and updates.isdigit() else None,
+            "updates_release": kv.get("updates_release", ""), "ru": ru, "ru_off": bool(kv.get("ru_off"))}
 
 
 def iof_bot_cmd(iof, args, stdin):
@@ -1847,7 +1849,7 @@ def node_view(srv, name, force):
 
 def service_view(srv, fetch):
     """Страница «Сервис»: версия, клон, Telegram и cron от iof, итог iof check и логи ночного
-    обслуживания из файлов. fetch: ещё и git fetch, чтобы узнать, есть ли обновления."""
+    обслуживания из файлов. fetch: ещё и проверка последнего опубликованного релиза."""
     base = srv.base
     info, error = iof_api(srv.iof, ["api", "service"], 20)
     data = {
@@ -1871,7 +1873,8 @@ def service_view(srv, fetch):
         upd, err = iof_api(srv.iof, ["api", "updates"], 60)
         data["updates"] = {
             "error": err,
-            "branch": upd.get("branch", ""),
+            "release": upd.get("release", ""),
+            "available": upd.get("available") == "yes",
             "commits": [dict(zip(("hash", "date", "subject"), c.split("\t", 2))) for c in upd.get("commit", [])],
         }
     return data

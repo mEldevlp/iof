@@ -94,8 +94,20 @@ sudo iof status
 
 ## Обновление
 
-На управляющем сервере:
+На странице «Сервис» нажмите «Проверить обновления», затем «Обновить». Панель ставит последний
+опубликованный стабильный релиз GitHub. Из терминала управляющего сервера:
 
 ```bash
-sudo iof update
+sudo iof update --release
 ```
+
+Если установленная версия появилась до `v0.9`, сначала установите `v0.9` из клона:
+
+```bash
+sudo git -C /opt/iof fetch origin tag v0.9
+sudo git -C /opt/iof checkout --detach v0.9
+sudo bash /opt/iof/install.sh
+```
+
+Первый [релиз iof](https://github.com/mEldevlp/iof/releases) имеет номер `v0.9`. После успешной проверки
+нового коммита `master` GitHub Actions выпускает следующую версию: `v0.10`, `v0.11` и далее.

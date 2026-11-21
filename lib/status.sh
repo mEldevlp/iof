@@ -290,38 +290,33 @@ check_daily() {
   check_ru
 }
 
-# Вышла ли новая версия iof: git fetch в клоне и коммиты, которые принесёт iof update. Сообщение уходит
-# один раз на каждую новую вершину вышестоящей ветки
+# Уведомление о каждом доступном опубликованном релизе уходит один раз.
 check_updates() {
-  local err branch head log count text
+  local info tag log count text
   daily_set updates ""
-  if [[ ! -d "$IOF_SRC/.git" ]] || ! have git; then
-    echo "  обновления iof: нет git-клона в $IOF_SRC, не проверяю"
+  daily_set updates_release ""
+  if ! info="$(api_updates 2>&1)"; then
+    echo "  обновления iof: $(tail -n 1 <<<"$info")"
     return 0
   fi
-  if ! err="$(GIT_TERMINAL_PROMPT=0 timeout 60 git -C "$IOF_SRC" fetch --quiet 2>&1)"; then
-    echo "  обновления iof: git fetch не прошёл: $(tail -n 1 <<<"$err")"
+  tag="$(kv_get "$info" release)"
+  if [[ "$(kv_get "$info" available)" != yes ]]; then
+    daily_set updates 0
+    echo "  обновления iof: новых релизов нет"
     return 0
   fi
-  if ! branch="$(git -C "$IOF_SRC" rev-parse --abbrev-ref '@{u}' 2>/dev/null)"; then
-    echo "  обновления iof: у ветки в $IOF_SRC нет вышестоящей (upstream), iof update не сможет сделать git pull"
-    return 0
-  fi
-  head="$(git -C "$IOF_SRC" rev-parse '@{u}')"
-  log="$(git -C "$IOF_SRC" log --format='• %h %s' 'HEAD..@{u}')"
-  count="$(grep -c . <<<"$log" || true)"
+  log="$(sed -n 's/^commit=/• /p' <<<"$info" | tr '\t' ' ')"
+  count="$(grep -c '^commit=' <<<"$info" || true)"
   daily_set updates "$count"
-  if (( count == 0 )); then
-    echo "  обновления iof: нет, в $branch ничего нового"
-    return 0
-  fi
-  echo "  обновления iof: в $branch новых коммитов: $count"
-  if [[ "$head" == "$(daily_get updates_head)" ]]; then return 0; fi
-  text="В $branch новых коммитов: $count."$'\n'"$(head -n 10 <<<"$log")"
+  daily_set updates_release "$tag"
+  echo "  обновления iof: доступен релиз $tag"
+  if [[ "$tag" == "$(daily_get updates_notified)" ]]; then return 0; fi
+  text="Вышел релиз iof $tag."
+  if [[ -n "$log" ]]; then text+=$'\n'"$(head -n 10 <<<"$log")"; fi
   if (( count > 10 )); then text+=$'\n'"… и ещё $((count - 10))"; fi
-  text+=$'\n'"Обновить: sudo iof update или кнопка «Обновить» на странице «Сервис» панели"
+  text+=$'\n'"Обновить: sudo iof update --release или кнопка «Обновить» на странице «Сервис» панели"
   tg_send updates "$text"
-  daily_set updates_head "$head"
+  daily_set updates_notified "$tag"
 }
 
 ru_job() { run_on "${N_SSH[$1]}" n_ru_reach "$RU_TARGETS" "$RU_CONTROL"; }

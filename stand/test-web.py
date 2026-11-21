@@ -236,11 +236,67 @@ for headers in ({"X-IOF-Request": None}, {"Origin": None}, {"Origin": address},
 print("ok: домен и IP по HTTPS, туннель, страницы и API, Host, Origin, CSRF, неверные данные входа")
 
 version = subprocess.check_output(["iof", "version"])
+cookie = cookies[domain]
+
+
+def updates():
+    _, data = request(domain, "/admin/api/service?fetch=1", cookie=cookie)
+    return json.loads(data)["updates"]
+
+
+assert updates() == {"error": None, "release": "", "available": False, "commits": []}
+release_file = Path("/run/iof-test-release.json")
+release = json.loads(release_file.read_text())
+release_file.write_text(json.dumps(dict(release, tag_name="v0.9", prerelease=False)))
+update = updates()
+assert update["available"] and update["release"] == "v0.9", update
+assert [c["subject"] for c in update["commits"]] == ["Стабильный выпуск для проверки обновления"]
+
+
+def repo(*args):
+    return subprocess.check_output(["git", "-C", "/opt/iof", *args]).strip()
+
+
+dirty = Path("/opt/iof/README-test")
+dirty.write_text("локальные данные")
+try:
+    blocked = subprocess.run(["iof", "update", "--release"], env=dict(os.environ, IOF_RELEASE_API=release_file.as_uri()),
+                             capture_output=True, text=True)
+    assert blocked.returncode and "локальные изменения" in blocked.stderr
+    assert dirty.read_text() == "локальные данные"
+finally:
+    dirty.unlink()
+assert subprocess.check_output(["iof", "version"]) == version
+
+def panel_pid():
+    return subprocess.check_output(["systemctl", "show", "--property=MainPID", "--value", "iof-web"]).strip()
+
+
+old_pid = panel_pid()
+request(domain, "/admin/api/service", 202, cookie=cookie, body={"action": "update"})
+for _ in range(100):
+    if panel_pid() not in (b"0", old_pid) and subprocess.check_output(["iof", "version"]).startswith(b"iof v0.9 "):
+        try:
+            current = updates()
+            if current == {"error": None, "release": "v0.9", "available": False, "commits": []}:
+                break
+        except (OSError, AssertionError):
+            pass
+    time.sleep(0.1)
+else:
+    raise AssertionError("панель не установила опубликованный релиз")
+assert repo("rev-parse", "HEAD") == repo("rev-parse", "v0.9") != repo("rev-parse", "master")
+assert auth.read_bytes() == before
+print("ok: панель установила опубликованный релиз, пропустив более свежий тег и коммит master")
+
+subprocess.run(["flock", "-w", "10", str(base / "update.lock"), "true"], check=True)
+subprocess.run(["git", "-C", "/opt/iof", "switch", "-q", "master"], check=True)
 subprocess.run(["iof", "update"], check=True, stdout=subprocess.DEVNULL)
-assert subprocess.check_output(["iof", "version"]) != version
+assert subprocess.check_output(["iof", "version"]).startswith(b"iof v0.10 ")
 assert auth.read_bytes() == before
 request(domain, "/admin/api/setup", cookie=cookies[domain])
-print("ok: миграция IOF_WEB_PASSWORD и сохранение учётных данных после iof update")
+assert updates() == {"error": None, "release": "v0.9", "available": False, "commits": []}
+print("ok: обновление из ветки в CLI, сохранение учётных данных, панель не понижает версию")
 
 cookie = cookies[domain]
 nodes_file = base / "nodes.conf"

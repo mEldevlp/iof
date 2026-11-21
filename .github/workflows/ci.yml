@@ -14,7 +14,7 @@ permissions:
 
 # Новый push в ту же ветку отменяет недоделанную проверку старого
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -63,3 +63,20 @@ jobs:
               tail -n 30 /var/log/iof-hy2-install.log 2>/dev/null' </dev/null || true
             echo "::endgroup::"
           done
+
+  release:
+    name: Опубликовать релиз
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    needs: [lint, stand]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Опубликовать следующую версию
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash ci/release.sh

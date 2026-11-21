@@ -1627,13 +1627,17 @@ def check_notify():
     git("push", "-q", f"{UPD}/origin.git", "master", cwd=f"{UPD}/work")
     git("clone", "-q", f"{UPD}/origin.git", f"{UPD}/src")
     git("commit", "-q", "--allow-empty", "-m", "ci: новая версия для проверки уведомления", cwd=f"{UPD}/work")
-    git("push", "-q", f"{UPD}/origin.git", "master", cwd=f"{UPD}/work")
-    env_with(env0, RU_TARGETS="", IOF_SRC=f"{UPD}/src")
+    git("tag", "v0.10", cwd=f"{UPD}/work")
+    git("push", "-q", "--tags", f"{UPD}/origin.git", "master", cwd=f"{UPD}/work")
+    release_file = f"{UPD}/release.json"
+    with open(release_file, "w", encoding="utf-8") as f:
+        json.dump(dict(tag_name="v0.10", draft=False, prerelease=False, published_at="2026-11-21T00:00:00Z"), f)
+    env_with(env0, RU_TARGETS="", IOF_SRC=f"{UPD}/src", IOF_RELEASE_API=f"file://{release_file}")
     before = mark()
     rc, out, err = run_iof("-n", node, "check", "--daily")
     got = notes(before, UPDATES)
-    report(rc == 0 and set(got) == {5001} and "ci: новая версия для проверки уведомления" in got[5001][0]["params"]["text"]
-           and "новых коммитов: 1" in out, "новая версия iof (git fetch в клоне): уведомление подписанному на обновления")
+    report(rc == 0 and set(got) == {5001} and "Вышел релиз iof v0.10" in got[5001][0]["params"]["text"]
+           and "доступен релиз v0.10" in out, "опубликованный релиз iof: уведомление подписанному на обновления")
     before = mark()
     run_iof("-n", node, "check", "--daily")
     report(not notes(before, UPDATES), "та же новая версия: второго уведомления нет")
