@@ -645,8 +645,8 @@ n_hy2_upgrade() {
 }
 
 
-# AmneziaWG на узле. Работает с контейнером, который ставит приложение Amnezia VPN
-# (amnezia-awg2 для AWG 2.0 или amnezia-awg), и ведёт clientsTable так же, как приложение,
+# AmneziaWG на узле. Работает с контейнерами iof и Amnezia VPN (amnezia-awg2 или amnezia-awg).
+# Ведёт clientsTable так же, как приложение,
 # чтобы созданные здесь клиенты были видны и удалялись в Amnezia VPN.
 
 # Находит контейнер AWG, имя в $AWG_C
@@ -676,6 +676,128 @@ n_awg_iface() {
     fi
   done
   return 1
+}
+
+# Готовит ключи и конфиг перед первым запуском контейнера.
+n_awg_seed_config() (
+  local dir="$1" port="$2" image="$3" private public psk i base
+  umask 077
+  install -d -m 700 "$dir"
+  private="$(docker run --rm "$image" awg genkey)" || return 1
+  public="$(printf '%s\n' "$private" | docker run --rm -i "$image" awg pubkey)" || return 1
+  psk="$(docker run --rm "$image" awg genpsk)" || return 1
+  [[ -n "$private" && -n "$public" && -n "$psk" ]] || return 1
+  printf '%s\n' "$private" > "$dir/wireguard_server_private_key.key" || return 1
+  printf '%s\n' "$public" > "$dir/wireguard_server_public_key.key" || return 1
+  printf '%s\n' "$psk" > "$dir/wireguard_psk.key" || return 1
+  printf '[]\n' > "$dir/clientsTable" || return 1
+  {
+    printf '[Interface]\nPrivateKey = %s\nAddress = 10.8.1.1/24\nListenPort = %s\n' "$private" "$port"
+    printf 'Jc = 4\nJmin = 40\nJmax = 70\nS1 = %s\nS2 = %s\nS3 = 0\nS4 = 0\n' "$((31 + RANDOM % 50))" "$((101 + RANDOM % 50))"
+    for i in 1 2 3 4; do
+      base=$((i * 100000000 + (RANDOM << 10) + RANDOM))
+      printf 'H%s = %s-%s\n' "$i" "$base" "$((base + 100))"
+    done
+  } > "$dir/awg0.conf.tmp" && mv -f "$dir/awg0.conf.tmp" "$dir/awg0.conf"
+)
+
+# Команда запуска контейнера, выполняется заново при каждом старте.
+n_awg_startup() {
+  cat <<'EOF'
+awg-quick up /opt/amnezia/awg/awg0.conf
+iptables -t nat -A POSTROUTING -s "$1" -o eth0 -j MASQUERADE
+exec sleep infinity
+EOF
+}
+
+# Установка AWG 2.0 в Docker. Файлы лежат на хосте и переживают пересоздание контейнера.
+n_awg_install() {
+  local requested="$1" port subnet=10.8.1.0/24 image=amneziavpn/amneziawg-go:0.2.19
+  local dir=/etc/iof/awg log=/var/log/iof-awg-install.log config i base range
+  local packages=()
+  n_defaults
+  umask 077
+  exec 9>/run/lock/iof-awg.lock
+  flock -w 60 9 || n_err "другая операция с AmneziaWG ещё выполняется"
+  [[ -c /dev/net/tun ]] || n_err "на сервере недоступно устройство /dev/net/tun"
+  : >> "$log"
+  command -v docker >/dev/null 2>&1 || packages+=(docker.io)
+  command -v python3 >/dev/null 2>&1 || packages+=(python3)
+  if (( ${#packages[@]} )); then
+    echo "[$(hostname)] устанавливаю пакеты: ${packages[*]}"
+    if ! (export DEBIAN_FRONTEND=noninteractive; apt-get update && apt-get install -y "${packages[@]}") >> "$log" 2>&1; then
+      n_err "не удалось установить пакеты, см. $log"
+    fi
+    if [[ "${packages[0]}" == docker.io ]]; then
+      systemctl enable --now docker >> "$log" 2>&1 || n_err "не удалось запустить Docker, см. $log"
+    fi
+  fi
+  if ! docker info >/dev/null 2>> "$log"; then
+    systemctl start docker >> "$log" 2>&1 && docker info >/dev/null 2>> "$log" \
+      || n_err "Docker недоступен, см. $log"
+  fi
+
+  if n_awg_find; then
+    if ! n_awg_running && [[ "$(docker inspect -f '{{index .Config.Labels "iof.awg"}}' "$AWG_C")" == "2" ]]; then
+      port="$(awk -F' = ' '$1 == "ListenPort" {print $2; exit}' "$dir/awg0.conf")"
+      [[ -z "$requested" || "$requested" == "$port" ]] || n_err "AWG уже настроен на UDP $port"
+      docker start "$AWG_C" >> "$log" 2>&1 || n_err "не удалось запустить $AWG_C, см. $log"
+      for (( i=0; i<20; i++ )); do
+        docker exec "$AWG_C" awg show awg0 listen-port >/dev/null 2>&1 && break
+        sleep 0.5
+      done
+    fi
+    n_awg_running && n_awg_iface || n_err "контейнер $AWG_C уже есть, но не запущен или без конфига"
+    port="$(docker exec "$AWG_C" awg show "$AWG_IF" listen-port 2>> "$log")" || n_err "интерфейс $AWG_IF не работает, см. $log"
+    [[ -z "$requested" || "$requested" == "$port" ]] || n_err "AWG уже работает на UDP $port"
+    echo "уже работает на UDP $port ($AWG_C)"
+    return 0
+  fi
+
+  config="$dir/awg0.conf"
+  port="${requested:-51820}"
+  if [[ -f "$config" ]]; then
+    port="$(awk -F' = ' '$1 == "ListenPort" {print $2; exit}' "$config")"
+    [[ -z "$requested" || "$requested" == "$port" ]] || n_err "AWG уже настроен на UDP $port"
+  fi
+  [[ "$port" =~ ^[0-9]{1,5}$ ]] && (( 10#$port >= 1 && 10#$port <= 65535 )) || n_err "некорректный порт AWG"
+  if [[ -n "$(ss -Huln "sport = :$port")" ]] \
+    || { [[ -f /etc/iof/relay.rules ]] && awk -v p="$port" '$1 !~ /^#/ && NF >= 4 && $2 == p {found=1} END {exit !found}' /etc/iof/relay.rules; }; then
+    n_err "порт UDP $port уже занят"
+  fi
+  while IFS=- read -r base range; do
+    [[ "$base" =~ ^[0-9]+$ && "${range:-$base}" =~ ^[0-9]+$ ]] || continue
+    if (( port >= 10#$base && port <= 10#${range:-$base} )); then n_err "порт UDP $port занят Hysteria2"; fi
+  done < <(if [[ -f "$CONFIG" ]]; then n_hy2_listen | awk -F'|' '{gsub(/,/, "\n", $3); print $2; print $3}'; fi)
+
+  if ! docker image inspect "$image" >/dev/null 2>&1; then
+    docker pull "$image" >> "$log" 2>&1 || n_err "не удалось скачать $image, см. $log"
+  fi
+  if [[ ! -f "$config" ]]; then
+    n_awg_seed_config "$dir" "$port" "$image" >> "$log" 2>&1 || n_err "не удалось создать конфиг AWG, см. $log"
+  fi
+
+  AWG_C=amnezia-awg2
+  if ! docker run -d --name "$AWG_C" --label iof.awg=2 --restart unless-stopped \
+    --cap-add NET_ADMIN --device /dev/net/tun --sysctl net.ipv4.ip_forward=1 \
+    --log-driver local -p "$port:$port/udp" -v "$dir:$AWG_DIR" "$image" \
+    bash -ec "$(n_awg_startup)" iof "$subnet" >> "$log" 2>&1; then
+    if [[ "$(docker inspect -f '{{index .Config.Labels "iof.awg"}}' "$AWG_C" 2>/dev/null || true)" == "2" ]]; then
+      docker rm -f "$AWG_C" >> "$log" 2>&1 || true
+    fi
+    n_err "не удалось создать контейнер AWG, см. $log"
+  fi
+  for (( i=0; i<20; i++ )); do
+    if [[ "$(docker exec "$AWG_C" awg show awg0 listen-port 2>/dev/null || true)" == "$port" ]] \
+      && docker exec "$AWG_C" iptables -t nat -C POSTROUTING -s "$subnet" -o eth0 -j MASQUERADE 2>/dev/null; then
+      echo "установлен на UDP $port ($AWG_C)"
+      return 0
+    fi
+    sleep 0.5
+  done
+  docker logs --tail 30 "$AWG_C" >> "$log" 2>&1 || true
+  docker rm -f "$AWG_C" >> "$log" 2>&1 || true
+  n_err "AmneziaWG не запустился, см. $log"
 }
 
 # Публичные ключи клиентов с именем $1 из clientsTable (JSON на stdin). Код 2, если JSON битый
@@ -821,9 +943,12 @@ n_awg_backup() {
 # работающего интерфейса, чтобы не выдать занятый.
 n_awg_add() {
   local label="$1" host="$2"
-  local conf table pubs priv pub psk srvpub port prefix n newtable created last lead live
+  local conf table pubs priv pub psk srvpub port prefix n newtable created live
   n_defaults
+  umask 077
   [[ $EUID -eq 0 ]] || n_err "нужны права root"
+  exec 9>/run/lock/iof-awg.lock
+  flock -w 60 9 || n_err "другая операция с AmneziaWG ещё выполняется"
   command -v python3 >/dev/null 2>&1 || n_err "нужен python3"
   n_awg_find || n_err "не найден контейнер AmneziaWG"
   n_awg_running || n_err "контейнер $AWG_C не запущен"
@@ -863,7 +988,7 @@ n_awg_add() {
       }
     }
     END {
-      n = max + 1
+      n = (max < 1 ? 2 : max + 1)
       if (n > 254) {
         n = 0
         for (i = 2; i <= 254; i++) if (!(i in used)) { n = i; break }
@@ -883,14 +1008,16 @@ n_awg_add() {
 
   n_awg_backup "$conf" "$table"
 
-  # Пир дописывается в файл и сразу применяется к работающему интерфейсу без перезапуска
-  last="$(docker exec "$AWG_C" tail -n 1 "$AWG_CONF")"
-  lead=""
-  if [[ -n "${last//[[:space:]]/}" ]]; then lead=$'\n'; fi
-  printf '%s[Peer]\nPublicKey = %s\nPresharedKey = %s\nAllowedIPs = %s/32\n\n' "$lead" "$pub" "$psk" "$prefix.$n" \
-    | docker exec -i "$AWG_C" sh -c "cat >> '$AWG_CONF'"
-  docker exec "$AWG_C" awg set "$AWG_IF" peer "$pub" preshared-key "$AWG_DIR/wireguard_psk.key" allowed-ips "$prefix.$n/32"
-  printf '%s\n' "$newtable" | docker exec -i "$AWG_C" sh -c "cat > '$AWG_DIR/clientsTable'"
+  # Пир применяется без перезапуска. Если запись не удалась, возвращаем конфиг и таблицу.
+  if ! docker exec "$AWG_C" awg set "$AWG_IF" peer "$pub" preshared-key "$AWG_DIR/wireguard_psk.key" allowed-ips "$prefix.$n/32" \
+    || ! printf '%s\n\n[Peer]\nPublicKey = %s\nPresharedKey = %s\nAllowedIPs = %s/32\n' "$conf" "$pub" "$psk" "$prefix.$n" \
+       | n_awg_write "$AWG_CONF" \
+    || ! printf '%s\n' "$newtable" | n_awg_write "$AWG_DIR/clientsTable"; then
+    docker exec "$AWG_C" awg set "$AWG_IF" peer "$pub" remove || true
+    printf '%s\n' "$conf" | n_awg_write "$AWG_CONF" || true
+    printf '%s\n' "$table" | n_awg_write "$AWG_DIR/clientsTable" || true
+    n_err "не удалось добавить клиента '$label', резервные копии в $AWG_BACKUP"
+  fi
   echo "[$(hostname)] добавлен клиент AWG '$label' ($prefix.$n)" >&2
 
   # Параметры обфускации берутся из [Interface] сервера, I1-I5 там закомментированы
@@ -909,11 +1036,16 @@ n_awg_add() {
       l = $0; sub(/^[[:space:]]*#?[[:space:]]*/, "", l)
       k = l; sub(/[[:space:]]*=.*/, "", k)
       v = l; sub(/^[^=]*=[[:space:]]*/, "", v); sub(/[[:space:]]+$/, "", v)
-      if (v == "") print k " ="; else print k " = " v
+      if (v != "") print k " = " v
     }
   ' <<<"$conf"
   printf '\n[Peer]\nPublicKey = %s\nPresharedKey = %s\nAllowedIPs = 0.0.0.0/0, ::/0\nEndpoint = %s:%s\nPersistentKeepalive = 25\n' \
     "$srvpub" "$psk" "$host" "$port"
+}
+
+# Атомарная запись конфига или clientsTable в каталоге контейнера.
+n_awg_write() {
+  docker exec -i "$AWG_C" sh -ec 'umask 077; cat > "$1.iof-tmp" && mv -f "$1.iof-tmp" "$1"' iof "$1"
 }
 
 # Удаляет клиента $1. Ключ $2 (с управляющего сервера) позволяет найти клиента,
@@ -921,6 +1053,9 @@ n_awg_add() {
 n_awg_del() {
   local label="$1" known="${2:-}" conf table pubs newtable newconf p
   n_defaults
+  umask 077
+  exec 9>/run/lock/iof-awg.lock
+  flock -w 60 9 || n_err "другая операция с AmneziaWG ещё выполняется"
   [[ $EUID -eq 0 ]] || n_err "нужны права root"
   n_awg_find || n_err "не найден контейнер AmneziaWG"
   n_awg_running || n_err "контейнер $AWG_C не запущен"
@@ -952,11 +1087,11 @@ n_awg_del() {
   ' <<<"$conf")"
 
   n_awg_backup "$conf" "$table"
-  printf '%s\n' "$newconf" | docker exec -i "$AWG_C" sh -c "cat > '$AWG_CONF'"
+  printf '%s\n' "$newconf" | n_awg_write "$AWG_CONF"
   for p in $pubs; do
-    docker exec "$AWG_C" awg set "$AWG_IF" peer "$p" remove || true
+    docker exec "$AWG_C" awg set "$AWG_IF" peer "$p" remove || n_err "не удалось удалить пир '$label', повтори команду"
   done
-  printf '%s\n' "$newtable" | docker exec -i "$AWG_C" sh -c "cat > '$AWG_DIR/clientsTable'"
+  printf '%s\n' "$newtable" | n_awg_write "$AWG_DIR/clientsTable"
   echo "[$(hostname)] удалён клиент AWG '$label'" >&2
 }
 
@@ -984,7 +1119,7 @@ n_status() {
   ver="$(hysteria version 2>/dev/null | awk -F':[[:space:]]*' '/^Version/{print $2; exit}' || true)"
 
   if n_awg_find; then
-    if n_awg_running && n_awg_iface; then
+    if n_awg_running && n_awg_iface && docker exec "$AWG_C" awg show "$AWG_IF" listen-port >/dev/null 2>&1; then
       awg_state="running"
       aconf="$(docker exec "$AWG_C" cat "$AWG_CONF" 2>/dev/null || true)"
       awg_port="$(awk -F'=' '/^[[:space:]]*ListenPort[[:space:]]*=/{gsub(/[[:space:]]/, "", $2); print $2; exit}' <<<"$aconf")"
@@ -2054,7 +2189,7 @@ NODE_FUNCS=(
   n_hy2_add n_hy2_del n_hy2_install n_hy2_hop_rules n_hy2_hop_files n_hy2_hop_ready n_hy2_last_error
   n_hy2_hop n_hy2_upgrade
   n_awg_find n_awg_running n_awg_iface n_awg_table_pubs n_awg_table_add n_awg_table_del n_awg_pubkey
-  n_awg_clients n_awg_backup n_awg_add n_awg_del
+  n_awg_clients n_awg_backup n_awg_add n_awg_del n_awg_seed_config n_awg_startup n_awg_install n_awg_write
   n_status
   n_free_ports n_relay_apply n_relay_status n_block_apply
   n_audit_listen n_audit_expect n_audit_server n_audit_hy2_blocks n_audit_awg_params n_audit_dpi

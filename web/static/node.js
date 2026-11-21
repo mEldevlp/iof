@@ -24,6 +24,10 @@ const ACTIONS = {
     body: { action: "install_hy2", force: true },
     ask: (n) => `Перезаписать конфиг Hysteria2 на ${n} по шаблону этого сервера? Старый сохранится рядом как бэкап, группы ссылок пересоберутся.`,
   },
+  install_awg: {
+    body: { action: "install_awg" },
+    ask: (n) => `Настроить AmneziaWG 2.0 на ${n}? iof установит Docker, если его ещё нет.`,
+  },
   delete: {
     body: { action: "delete" },
     ask: (n) => `Удалить узел ${n} из iof? Ссылки и ключи AmneziaWG пересоберутся без него. Сам сервер iof не тронет.`,
@@ -143,6 +147,11 @@ function renderAwg(d) {
   else rows = [["Состояние", badge("good", "работает")], ["Порт", `UDP ${esc(a.port)}`],
     ["Клиенты", `${a.peers}`], ["Онлайн", `${a.online} <span class="muted">за 3 мин</span>`]];
   $("#awg").innerHTML = kv(rows);
+  $("#awg-clients").href = `awg.html${DEMO ? "?demo" : ""}`;
+  $("#awg-port-label").hidden = a?.state !== "none";
+  $("#awg-actions").innerHTML = a && a.state !== "running"
+    ? actButton("install_awg", a.state === "none" ? "Установить AmneziaWG 2.0" : "Проверить и запустить", migrating(d), " primary")
+    : "";
 }
 
 function renderRes(d) {
@@ -257,10 +266,15 @@ async function renameNode(e) {
 
 async function act(key) {
   const a = ACTIONS[key], name = nd.data.name;
-  if (!confirm(a.ask(name))) return;
   formError("", "#action-error");
+  const body = { ...a.body, name };
+  if (key === "install_awg" && !$("#awg-port-label").hidden) {
+    const input = $("#awg-port");
+    if (!input.reportValidity()) return;
+    if (input.value) body.port = input.valueAsNumber;
+  }
+  if (!confirm(a.ask(name))) return;
   try {
-    const body = { ...a.body, name };
     const id = DEMO ? demoNodeJob(body) : (await postJson("api/node", body)).job;
     job.start(id);
     $("#job").scrollIntoView({ behavior: "smooth", block: "nearest" });
@@ -293,6 +307,10 @@ function renderJob(j) {
     ok: `${icon("good")}<div>Hysteria2 установлена, узел добавлен в группы ссылок.</div>`,
     warn: `${icon("warn")}<div>Установить не удалось${why}. Подробности в логе, повторить можно той же кнопкой.</div>`,
     error: `${icon("crit")}<div>Установка прервалась${why}</div>`,
+  } : first.startsWith("$ iof awg install") ? {
+    ok: `${icon("good")}<div>AmneziaWG работает. <a href="awg.html${demo}">Открыть клиентов и ключи</a></div>`,
+    warn: `${icon("warn")}<div>Часть операций завершилась с ошибками. Подробности в логе.</div>`,
+    error: `${icon("crit")}<div>Не удалось настроить AmneziaWG${why}</div>`,
   } : {
     ok: `${icon("good")}<div>Hysteria2 перезапущена и работает.</div>`,
     error: `${icon("crit")}<div>Не удалось перезапустить${why}</div>`,

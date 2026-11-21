@@ -19,6 +19,12 @@ const demoState = {
     { name: "Hysteria", label: "Hysteria", created: "2026-09-14 18:22:05", nodes: null, hop: false },
     { name: "Family", label: "Family", created: "2026-10-02 09:41:37", nodes: ["Main", "Node 1", "Node 2"], hop: true },
   ],
+  awgClients: [
+    { name: "Ivan_iPhone_5f56f27b", label: "Иван iPhone", created: "2026-10-12 21:05:11", configs: ["Main", "Main_via_Node_2", "Node_1", "Node_2"] },
+    { name: "Admin_Laptop", label: "Admin Laptop", created: "2026-09-14 18:30:44", configs: ["Main", "Main_via_Node_2", "Node_1", "Node_2"] },
+    { name: "Mama_Android_0c1a9e44", label: "Мама Android", created: "2026-10-28 11:17:52", configs: ["Main", "Node_1", "Node_2"] },
+  ],
+  awgPorts: {},
   deleted: [],
   renamed: {},
   version: "e741874 2026-11-01",
@@ -62,6 +68,11 @@ function demoNodes() {
   ];
   nodes[4].issues = ["контейнер AmneziaWG остановлен"];
   nodes[4].ok = false;
+  nodes.filter((n) => demoState.awgPorts[n.name]).forEach((n) => {
+    n.awg = { state: "running", port: demoState.awgPorts[n.name], peers: demoState.awgClients.length, online: 0 };
+    n.issues = [];
+    n.ok = true;
+  });
   return nodes.map((n) => ({ ...n, name: demoState.renamed[n.name] || n.name }))
     .filter((n) => !demoState.deleted.includes(n.name));
 }
@@ -87,12 +98,35 @@ function demoDashboard() {
     ...demoStatus(),
     relays: DEMO_RELAYS,
     hy2_groups: demoState.groups.map(({ name, label, created }) => ({ name, label, created })),
-    awg_clients: [
-      { name: "Ivan_iPhone_5f56f27b", label: "Иван iPhone", created: "2026-10-12 21:05:11", configs: ["Main", "Main_via_Node_2", "Node_1", "Node_2"] },
-      { name: "Admin_Laptop", label: "Admin Laptop", created: "2026-09-14 18:30:44", configs: ["Main", "Main_via_Node_2", "Node_1", "Node_2"] },
-      { name: "Mama_Android_0c1a9e44", label: "Мама Android", created: "2026-10-28 11:17:52", configs: ["Main", "Node_1", "Node_2"] },
-    ],
+    awg_clients: demoState.awgClients,
   });
+}
+
+function demoAwg() {
+  return demoDelay({ ...demoStatus(), clients: demoState.awgClients });
+}
+
+function demoAwgKeys(name) {
+  const client = demoState.awgClients.find((c) => c.name === name);
+  return { links: (client?.configs || []).map((title) => ({ title: title.replaceAll("_", " "), url: "vpn://DEMO" })) };
+}
+
+function demoAwgJob(body) {
+  const { action, label, name } = body;
+  if (action === "add") {
+    const client = demoState.awgClients.find((c) => c.label === label);
+    const login = client?.name || `demo_${demoState.jobs.length}_${Date.now()}`;
+    return demoRunJob("awg", `Клиент «${label}»`, [`$ iof awg add ${label}`, `Клиент: ${login}`], "ok", () => {
+      const configs = demoNodes().filter((n) => n.awg?.state === "running").map((n) => n.title.replaceAll(" ", "_"));
+      if (client) client.configs = [...new Set([...client.configs, ...configs])];
+      else demoState.awgClients.push({ name: login, label, configs, created: new Date().toISOString().slice(0, 19).replace("T", " ") });
+    });
+  }
+  if (action === "del") {
+    return demoRunJob("awg", "Удаление клиента", [`$ iof awg del ${name}`, "Клиент удалён"], "ok",
+      () => { demoState.awgClients = demoState.awgClients.filter((c) => c.name !== name); });
+  }
+  return demoRunJob("awg", "Пересборка ссылок AmneziaWG", ["$ iof awg refresh", "Ссылки пересобраны"]);
 }
 
 function demoHy2() {
@@ -250,6 +284,12 @@ function demoNodeJob(body) {
     });
   }
   const down = !demoNodes().find((n) => n.name === name)?.reachable;
+  if (body.action === "install_awg") {
+    const port = body.port || 51820;
+    return demoRunJob(kind, `Установка AmneziaWG 2.0 на ${name}`, [
+      `$ iof awg install ${name}`, `  ${name}: установлен на UDP ${port} (amnezia-awg2)`,
+    ], "ok", () => { demoState.awgPorts[name] = String(port); });
+  }
   if (body.action === "restart_hy2") {
     return down
       ? demoRunJob(kind, `Перезапуск Hysteria2 на ${name}`, [`$ iof hy2 restart ${name}`, "Перезапущено: 0", "Ошибки (1):",

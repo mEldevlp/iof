@@ -3,9 +3,9 @@
 
 Работает на управляющем сервере от root. Состояние узлов берёт из `iof api status`,
 списки ретрансляторов, групп Hysteria2 и клиентов AWG читает из /root/iof напрямую.
-Ссылки Hysteria2 (в них пароль) отдаёт на странице hy2, ключи и конфиги AWG не отдаёт.
-Меняет что-то только через команды iof (добавление сервера: iof node add, iof hy2 install;
-группы ссылок: iof hy2 add | del | refresh; действия с узлом: iof hy2 restart | install, iof node del | rename;
+Ссылки Hysteria2 и ключи vpn:// отдаёт на страницах соответствующих протоколов.
+Меняет что-то только через команды iof (добавление сервера: iof node add, iof hy2/awg install;
+клиенты: iof hy2/awg add | del | refresh; действия с узлом: iof hy2 restart, iof node del | rename;
 обновление: iof update; перенос управляющего сервера: iof migrate; проверка безопасности:
 iof audit run, она узлы только читает; проверка с ПК: iof audit probe), по одной задаче за раз,
 с логом выполнения. Исключения — терминал на узел со страницы узла (ssh с ключом iof через
@@ -65,10 +65,12 @@ STATIC_FILES = {
     "/": ("index.html", "text/html; charset=utf-8"),
     "/index.html": ("index.html", "text/html; charset=utf-8"),
     "/hy2.html": ("hy2.html", "text/html; charset=utf-8"),
+    "/awg.html": ("awg.html", "text/html; charset=utf-8"),
     "/common.js": ("common.js", "text/javascript; charset=utf-8"),
     "/demo.js": ("demo.js", "text/javascript; charset=utf-8"),
     "/dashboard.js": ("dashboard.js", "text/javascript; charset=utf-8"),
     "/hy2.js": ("hy2.js", "text/javascript; charset=utf-8"),
+    "/awg.js": ("awg.js", "text/javascript; charset=utf-8"),
     "/add.html": ("add.html", "text/html; charset=utf-8"),
     "/add.js": ("add.js", "text/javascript; charset=utf-8"),
     "/migrate.html": ("migrate.html", "text/html; charset=utf-8"),
@@ -372,7 +374,8 @@ def qr_png(text, level="M"):
 
 
 def read_awg_clients(base):
-    clients = read_index(base / "awg" / "index.tsv")
+    clients = [c for c in read_index(base / "awg" / "index.tsv")
+               if SAFE_NAME.fullmatch(c["name"]) and c["name"] not in (".", "..")]
     for c in clients:
         d = base / "awg" / c["name"]
         try:
@@ -380,6 +383,26 @@ def read_awg_clients(base):
         except OSError:
             c["configs"] = []
     return clients
+
+
+AWG_KEY = re.compile(r"vpn://[A-Za-z0-9_-]+={0,2}")
+
+
+def read_awg_keys(base, name):
+    if not any(c["name"] == name for c in read_awg_clients(base)):
+        raise ValueError("нет такого клиента AmneziaWG")
+    try:
+        lines = (base / "awg" / name / "keys.txt").read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return []
+    links, title = [], ""
+    for line in lines:
+        if line.startswith("== "):
+            title = line[3:]
+        elif AWG_KEY.fullmatch(line):
+            links.append({"title": title, "url": line})
+            title = ""
+    return links
 
 
 def read_migrate(base):
@@ -517,7 +540,7 @@ def iof_json(iof, args, timeout):
 # Задачи: команды iof, которые что-то меняют. Одна за раз, лог хранится в памяти
 
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
-# hy2 add печатает ссылки группы с паролем, в лог задачи они идут без него
+# iof печатает ссылки, а лог задачи доступен на всех страницах панели
 HY2_SECRET = re.compile(r"(hy2://)[^@\s]+@")
 # Строки, после которых задача считается выполненной с ошибками, хотя код 0: hy2 install и hy2 del,
 # если на части узлов не получилось, migrate start, если новый сервер видит не все узлы,
@@ -586,6 +609,7 @@ class Jobs:
                     for raw in p.stdout:
                         line = ANSI.sub("", raw.decode("utf-8", "replace")).rstrip("\n").split("\r")[-1]
                         line = HY2_SECRET.sub(r"\1••••••••@", line)
+                        line = AWG_KEY.sub("vpn://••••••••", line)
                         if line.strip():
                             self.say(job, line)
                         if line.startswith(WARN_LINES):
@@ -594,6 +618,7 @@ class Jobs:
                     rc = p.wait()
                 finally:
                     timer.cancel()
+                    p.stdout.close()
                 if rc != 0 and rc in warn_rc and not failed:
                     state = "warn"
                 elif rc != 0:
@@ -725,6 +750,8 @@ def node_add_steps(iof, body, existing):
         raise ValueError("имя узла: латиница, цифры, точка, дефис, подчёркивание")
     if name in existing:
         raise ValueError(f"узел {name} уже есть в nodes.conf")
+    if name == "all" and (body.get("install_hy2") or body.get("install_awg")):
+        raise ValueError("имя all зарезервировано при установке VPN")
     host, port, user, auth_args, stdin = login_fields(body)
     if addr and not NODE_HOST.match(addr):
         raise ValueError("адрес для клиентов: IPv4 или имя хоста")
@@ -736,6 +763,8 @@ def node_add_steps(iof, body, existing):
     steps = [(shlex.join(["iof", *argv[1:]]), argv, stdin)]
     if body.get("install_hy2"):
         steps.append((f"iof hy2 install {name}", [iof, "hy2", "install", name], None))
+    if body.get("install_awg"):
+        steps.append(step(iof, "awg", "install", "--", name))
     return f"Добавление сервера {name} ({host})", steps
 
 
@@ -811,6 +840,26 @@ def hy2_steps(iof, body, groups, migrate):
     raise ValueError("неизвестное действие")
 
 
+def awg_steps(iof, body, clients, migrate):
+    not_migrating(migrate)
+    action = body.get("action")
+    if action == "add":
+        label = text_field(body, "label", 64)
+        if not label or any(c == "|" or ord(c) < 32 or ord(c) == 127 for c in label):
+            raise ValueError("введи имя клиента без | и управляющих символов")
+        title = "Дополнение профилей клиента" if any(c["label"] == label for c in clients) else "Создание клиента"
+        return f"{title} «{label}»", [step(iof, "awg", "add", label)]
+    if action == "del":
+        name = text_field(body, "name", 100)
+        client = next((c for c in clients if c["name"] == name), None)
+        if client is None:
+            raise ValueError("нет такого клиента AmneziaWG")
+        return f"Удаление клиента «{client['label']}»", [step(iof, "awg", "del", name)]
+    if action == "refresh":
+        return "Пересборка ссылок AmneziaWG", [step(iof, "awg", "refresh")]
+    raise ValueError("неизвестное действие")
+
+
 def node_steps(iof, body, conf, relays, hy2_template, migrate):
     """Кнопки на странице узла -> (имя узла, заголовок задачи, шаги). conf — строки nodes.conf."""
     name = text_field(body, "name", 40)
@@ -836,6 +885,12 @@ def node_steps(iof, body, conf, relays, hy2_template, migrate):
         force = bool(body.get("force"))
         verb = "Переустановка" if force else "Установка"
         return name, f"{verb} Hysteria2 на {name}", [step(iof, "hy2", "install", name, *(["--force"] if force else []))]
+    if action == "install_awg":
+        port = body.get("port")
+        if port is not None and (type(port) is not int or not 1 <= port <= 65535):
+            raise ValueError("порт UDP должен быть числом от 1 до 65535")
+        extra = ["--port", str(port)] if port is not None else []
+        return name, f"Установка AmneziaWG 2.0 на {name}", [step(iof, "awg", "install", *extra, "--", name)]
     if action == "delete":
         used = next((r for r in relays if name in (r["node"], r["via"])), None)
         if used:
@@ -1750,6 +1805,15 @@ class Handler(BaseHTTPRequestHandler):
             return self.hy2(force)
         if url.path == "/api/hy2/qr":
             return self.hy2_qr(query.get("g", ""), query.get("i", ""))
+        if url.path == "/api/awg":
+            data = self.server.cache.get(force)
+            data.update(clients=read_awg_clients(self.server.base), migrate=read_migrate(self.server.base))
+            return self.send_json(data)
+        if url.path == "/api/awg/keys":
+            try:
+                return self.send_json({"links": read_awg_keys(self.server.base, query.get("name", ""))})
+            except ValueError as e:
+                return self.send_json({"error": str(e)}, HTTPStatus.NOT_FOUND)
         if url.path == "/api/nodes/add-info":
             return self.add_info()
         if url.path == "/api/migrate":
@@ -1782,7 +1846,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         if not self.authorized() or not self.same_origin():
             return
-        if path not in ("/api/nodes", "/api/migrate", "/api/hy2", "/api/node", "/api/service", "/api/security",
+        if path not in ("/api/nodes", "/api/migrate", "/api/hy2", "/api/awg", "/api/node", "/api/service", "/api/security",
                         "/api/term", "/api/probe", "/api/bot", "/api/setup"):
             return self.send_json({"error": "не найдено"}, HTTPStatus.NOT_FOUND)
         body = self.read_json()
@@ -1818,6 +1882,8 @@ class Handler(BaseHTTPRequestHandler):
             return "node", title, steps
         if path == "/api/migrate":
             return ("migrate", *migrate_steps(srv.iof, body, migrate))
+        if path == "/api/awg":
+            return ("awg", *awg_steps(srv.iof, body, read_awg_clients(srv.base), migrate))
         kind = {"/api/hy2": "hy2", "/api/node": "node", "/api/security": "audit"}.get(path)
         if kind:
             return action_steps(srv, kind, body)

@@ -86,6 +86,8 @@ Hysteria2
   iof hy2 upgrade узлы        обновить Hysteria2 официальным установщиком, при неудаче вернуть прежнюю
 
 AmneziaWG 2.0
+  iof awg install <узлы|all> [--port 51820]
+                              установить AWG на узлы и добавить их к существующим клиентам
   iof awg add "Имя"           создать клиента на всех узлах и выдать ключи vpn://
   iof awg keys "Имя"          снова показать ключи
   iof awg del "Имя"           удалить клиента со всех узлов
@@ -171,7 +173,7 @@ if [[ $# -gt 0 ]]; then shift; fi
 # Пока идёт перенос отсюда, команды, которые что-то меняют, запрещены
 case "$cmd:${1:-}" in
   setup:*|init:*|refresh:*|node:add|node:import|node:del|node:rename|relay:add|relay:del|relay:apply) migrate_guard ;;
-  hy2:add|hy2:del|hy2:refresh|hy2:install|hy2:hop|hy2:upgrade|awg:add|awg:del|awg:refresh) migrate_guard ;;
+  hy2:add|hy2:del|hy2:refresh|hy2:install|hy2:hop|hy2:upgrade|awg:install|awg:add|awg:del|awg:refresh) migrate_guard ;;
   block:on|block:update|block:off) migrate_guard ;;
   bot:token|bot:on|bot:off|bot:set|bot:invite|bot:redeem|bot:admin) migrate_guard ;;
 esac

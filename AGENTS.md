@@ -42,7 +42,8 @@ Docker Desktop там не запускается: Kaspersky Standard не да�
 | `stand/` | тестовый стенд на Docker: `Dockerfile` (Ubuntu 24.04 с systemd и SSH), `compose.yml` (old, node1, node2, new), `stand.sh`, `test.sh` (проверка iof на стенде), `hy2-template.yaml`, `fake-tg.py` (поддельный Bot API для бота) | не ставится; попадает в `/opt/iof` как часть клона |
 | `ci/lint.sh` | статические проверки: `bash -n`, shellcheck, разбор и pyflakes для `iof-web.py`, `iof_bot.py` и `stand/fake-tg.py`, `node --check`, правила проекта (NODE_FUNCS, STATIC_FILES, CSP, одинаковое меню во всех html, `probe.ps1`: только ASCII, одна метка, разбор парсером PowerShell, если он есть, LF) | не ставится |
 | `ci/test-build.sh` | проверка автономности сборки и совпадения функций и встроенных программ; отказ при отсутствующем, лишнем, повторном или сломанном модуле | не ставится |
-| `ci/test-panel.py` | регрессионные тесты ссылок Hysteria2 ботом, переименования и первого запуска на временных данных, без SSH и Telegram | не ставится |
+| `ci/test-panel.py` | регрессионные тесты ссылок Hysteria2 ботом, профилей AWG, переименования и первого запуска на временных данных, без SSH и Telegram | не ставится |
+| `stand/test-awg.sh` | настоящий туннель из `vpn://` в одноразовой сети Docker, без вложенного Docker | не ставится |
 | `.github/workflows/ci.yml` | CI в GitHub Actions, см. «Проверка изменений» | не ставится |
 | `.shellcheckrc` | настройки shellcheck: отключены SC2178 и SC2128, ложные срабатывания на local-переменные разных функций | не ставится |
 
@@ -79,9 +80,10 @@ Docker Desktop там не запускается: Kaspersky Standard не да�
 | `hy2/<логин>.txt` | ссылки группы по строке: узлы, затем ретрансляторы; внутри пароли. У группы со списком портов порт узла со сменой портов — `443,10000-19999` |
 | `hy2/<логин>.hop` | пустая метка `iof hy2 add --hop`: в ссылках группы список портов. Без неё ссылки как раньше, с одним портом |
 | `awg/index.tsv` | как у hy2 |
-| `awg/<логин>/<Подпись>.conf` | конфиг клиента для узла, с **приватным ключом клиента** (больше нигде его нет) |
+| `awg/<логин>/<Подпись>.conf` | конфиг клиента для узла с **приватным ключом клиента**, который также входит в `vpn://` |
 | `awg/<логин>/<Подпись>.pub` | `публичный_ключ контейнер` |
-| `awg/<логин>/*_via_*.conf`, `keys.txt` | пересобираются при каждом `awg keys`/`refresh` |
+| `awg/<логин>/*_via_*.conf`, `keys.txt` | пересобираются при `awg add/keys/refresh`. `keys.txt` (600) — блоки `== <подпись>` и `vpn://`, файл заменяется атомарно |
+| `awg/.lock` | `flock` для установки, изменения клиентов и пересборки ссылок |
 | `check.last` | итог последнего `iof check` для панели: `time`, `total`, `bad`, `problems` (имена через пробел), `changes` |
 | `check.daily` | итог ежедневной части: `time` (unix), `updates` (число коммитов или пусто), `updates_head` (последняя сообщённая вершина upstream), `ru_time`, `ru_off`, `ru_nodes` (число опрошенных узлов), `ru_cut`, `ru_noinet`, `ru_down` (списки имён через пробел) |
 | `ru/<узел>` | последнее изменившееся состояние доступа к российским серверам: `ok`, `cut`, `noinet`; отсутствие файла означает `ok` |
@@ -163,9 +165,20 @@ sha1-хэш. Повторный запуск с той же подписью д�
   когда список скачал управляющий сервер), `/etc/iof/block.allow`, `/usr/local/sbin/iof-block`,
   `iof-block.service`, наборы `iof-block` и `iof-allow`, цепочка `IOF-BLOCK` в таблице raw с переходом
   из PREROUTING. `block off` убирает всё, кроме пакета `ipset`.
-- AmneziaWG: docker-контейнер `amnezia-awg2` или `amnezia-awg` (ставит приложение Amnezia VPN),
-  конфиг `/opt/amnezia/awg/{awg0|wg0}.conf` внутри контейнера, `clientsTable` ведётся как
-  в приложении. Бэкапы перед изменением: `/var/backups/iof-awg` на хосте.
+- AmneziaWG: контейнер `amnezia-awg2`, либо существующий `amnezia-awg2`/`amnezia-awg` от приложения.
+  Конфиг `/opt/amnezia/awg/{awg0|wg0}.conf` внутри контейнера, `clientsTable` ведётся как в приложении.
+  Бэкапы перед изменением: `/var/backups/iof-awg` на хосте; `flock` изменений в `/run/lock/iof-awg.lock`.
+  `iof awg install <узлы|all> [--port N]` ставит недостающие `docker.io` и `python3` на Ubuntu,
+  запускает официальный образ `amneziavpn/amneziawg-go:0.2.19` (amd64, AWG 2.0) с `/dev/net/tun`,
+  `NET_ADMIN`, IPv4-форвардингом и NAT внутри контейнера. Публикует UDP 51820 по умолчанию через Docker.
+  Установщик проверяет порт и живой интерфейс. Конфиг подсети `10.8.1.0/24`, серверные ключи и таблица
+  клиентов на хосте в `/etc/iof/awg` (700), лог `/var/log/iof-awg-install.log`. Повтор сохраняет конфиг,
+  ключи и пиры, существующий рабочий контейнер приложения использует как есть. После установки iof
+  добавляет удачные узлы к существующим клиентам. Если удаление клиента с узлов не завершено, файлы
+  на управляющем сервере сохраняются для повтора.
+- AWG `vpn://` — гостевой профиль Amnezia VPN без данных SSH: JSON с `containers` и вложенным
+  JSON-текстом `awg.last_config`, префикс длины JSON в 4 байта big-endian, затем zlib и base64url
+  без `=`. Поля конфигурации и обфускации берутся из `.conf`, для ретранслятора меняется его Endpoint.
 - Ретранслятор: `/etc/iof/relay.rules`, `/usr/local/sbin/iof-relay`, `iof-relay.service`,
   `/etc/sysctl.d/99-iof-relay.conf`. Работает на iptables DNAT+MASQUERADE в цепочках `IOF-*`.
 - Проверка с ПК, только на время проверки: юнит `iof-probe-<номер>` (systemd-run, `RuntimeMaxSec` =
@@ -426,7 +439,7 @@ sha1-хэш. Повторный запуск с той же подписью д�
 `node add|import|del|rename|list`, `hy2 install|add [--hop|--no-hop]|del|list|show|refresh|status|restart|hop on|off|upgrade`,
 `block on|update|off`,
 `bot show|token|on|off|set|invite|redeem|admin`,
-`awg add|keys|del|show|export|list|clients|refresh|status`, `relay add|del|list|apply`,
+`awg install [--port N]|add|keys|del|show|export|list|clients|refresh|status`, `relay add|del|list|apply`,
 `migrate start|finish|cancel|status`, `vless` (заглушка, WIP). Полный список в `usage()`.
 
 ## Веб-панель `iof-web`
@@ -442,9 +455,9 @@ sha1-хэш. Повторный запуск с той же подписью д�
   Telegram-бот: он вызывает `iof bot redeem` сам, а не задачей `Jobs` (команда быстрая, узлы не трогает,
   и код приглашения не должен ждать, пока идёт `hy2 install`); так же и страница «Телеграм бот»
   (`POST /api/bot` вызывает `iof bot` сразу, см. ниже).
-  У задачи есть вид `kind` (`node` — добавление, `migrate`, `hy2`, `service`, `audit`, `probe`, `node:<имя>` —
+  У задачи есть вид `kind` (`node` — добавление, `migrate`, `hy2`, `awg`, `service`, `audit`, `probe`, `node:<имя>` —
   действия с узлом, `bot` — действия Telegram-бота): по нему страница находит свои задачи. Ссылки `hy2://`
-  в логе задачи без пароля (`HY2_SECRET`).
+  в логе задачи без пароля (`HY2_SECRET`), содержимое `vpn://` вырезается (`AWG_KEY`).
   По завершении задачи кэш статуса сбрасывается. Если в выводе есть строка, начинающаяся
   с `Ошибки (`, задача получает состояние `warn`: так поступают `hy2 install`, `migrate start`
   и `migrate cancel`. То же для строк из `WARN_LINES` (`hy2 add/del/refresh` не на всех узлах).
@@ -460,14 +473,22 @@ sha1-хэш. Повторный запуск с той же подписью д�
   через stdin). Шаги кнопок «Hysteria2», узла и «Безопасности» собирает `action_steps(srv, kind, body)`
   (`hy2_steps`, `node_steps`, `audit_steps`, `check_steps`): им пользуются `job_for` панели и бот через
   `BotActions.plan` (у узла только `restart_hy2`, без действий из `AUDIT_ACTIONS`).
+- Раздел «AmneziaWG» (`awg.html`, `awg.js`) показывает состояние узлов и клиентов iof. Ключ каждой
+  точки подключения копируется отдельно. Создание и дополнение клиента повтором `awg add`, удаление
+  и пересборка ключей идут через Jobs. Установка есть на странице узла и в форме добавления сервера.
+  `GET /api/awg` даёт статус и метаданные, `GET /api/awg/keys?name=<логин>` — ключи одного клиента после
+  авторизации, с `Cache-Control: no-store`. `POST /api/awg` принимает `add` (label), `del` (name) и
+  `refresh`. Во время переноса со старого сервера изменения запрещены.
 - API: `GET /api/dashboard`, `/api/hy2`, `/api/hy2/qr?g=<логин>&i=<n|all>`, `/api/nodes/add-info`,
   `/api/migrate`, `/api/node?n=<имя>`, `/api/service[?fetch=1]` (через `iof api service|updates` и логи
   `/var/log/iof-nightly*.log`), `/api/jobs`, `/api/term/ws?t=<билет>` (WebSocket терминала);
   `POST /api/nodes` (добавление сервера, при необходимости
-  `iof hy2 install`), `POST /api/migrate` (`action`: start, finish или cancel), `POST /api/hy2`
+  `iof hy2 install` или `iof awg install`, поля `install_hy2` и `install_awg`),
+  `POST /api/migrate` (`action`: start, finish или cancel), `POST /api/hy2`
   (`add|del|refresh`; у `add` необязательный `hop: true|false` → `hy2 add --hop|--no-hop`, кнопка
   «Список портов» группы с диалогом `#hop-dialog`; в группах `hop`, у ссылок `hop` и `port` строкой),
-  `POST /api/node` (`restart_hy2|install_hy2|delete|rename`, удаление = `node del` + `refresh`;
+  `POST /api/node` (`restart_hy2|install_hy2|install_awg|delete|rename`, у `install_awg` необязательный порт `port`;
+  удаление = `node del` + `refresh`;
   переименование = `{action: "rename", name, new_name}` → `node rename`, задача вида `node:<старое имя>`),
   `POST /api/term` (`{name, cols, rows}` → одноразовый билет терминала),
   `GET /api/security` (вывод `iof api audit` плюс `error`, `busy`, `migrate`, `probe_state`; узлы не опрашивает;
@@ -624,8 +645,8 @@ sha1-хэш. Повторный запуск с той же подписью д�
   на «Сервисе»; опрос `api/bot` раз в 15 с, раз в 2 с, пока бот включается или выключается — `stateView`;
   настройки и таблица админов перерисовываются, только когда поменялись; код приглашения живёт только в
   диалоге `#invite-dialog` и стирается при закрытии), Сервис (`service.*`). Опрос задачи страницы — `watchJob`
-  в `common.js`, оценка узла и `meter` — тоже там. Ключи и конфиги AWG
-  панель не показывает.
+  в `common.js`, оценка узла и `meter` — тоже там. Ключи `vpn://` доступны для копирования
+  на странице «AmneziaWG»; исходные файлы `.conf` панель не отдаёт.
 - Каркас страницы: `.shell` = боковое меню `aside#sidebar` (логотип, разделы «Мониторинг» и
   «Управление», внизу переключатель темы и плашка демо) + `.content` (шапка `.page-head` с `h1`,
   описанием и кнопками, `main`, подвал). Меню повторено в каждом html, у текущей страницы
@@ -664,7 +685,10 @@ sha1-хэш. Повторный запуск с той же подписью д�
 
 `python3 ci/test-panel.py` проверяет единый блок ссылок и QR, выдачу без QR, длинную группу файлом,
 отказ Telegram принять фото, переименование со связанными записями и ключами AWG, отказы без частичной
-записи, активную проверку с ПК и валидацию API. В CI запускается после lint.
+записи, активную проверку с ПК, валидацию API и формат `vpn://` с проверкой, что секрет не попал в лог.
+В CI запускается после lint. `bash stand/test-awg.sh` проверяет обмен пакетами по туннелю из того же
+`vpn://` и восстановление после перезапуска контейнера. Нужны Docker, Python 3, `/dev/net/tun` и
+локальный образ `amneziavpn/amneziawg-go:0.2.19` (загрузить `docker pull`).
 
 Минимум после правок — статические проверки (работают и в Git Bash):
 
@@ -809,8 +833,8 @@ bash stand/stand.sh down
   браузер открывает их через записи `stand-old-panel` и `stand-new-panel` в `.Codex/launch.json`.
 - `machine-id` во всех контейнерах одинаковый, как у VPS из одного образа. iof на него не опирается.
 - Hysteria2 ставится официальным установщиком, поэтому `setup` нужен интернет. `test` тоже:
-  через туннели открывается `PROBE_URL` (по умолчанию `generate_204` от Google). AmneziaWG на стенде
-  нет: ему нужен Docker внутри сервера.
+  через туннели открывается `PROBE_URL` (по умолчанию `generate_204` от Google). Туннель AmneziaWG
+  проверяется отдельно в сети `stand/test-awg.sh`.
 - Клиент Hysteria2 понимает ссылку `hy2://` прямо в поле `server` конфига, а формат файла
   конфига определяет по расширению: файл без `.yaml` не прочитается.
 - Ретранслятор `test` проверяет клиентом на самом узле: пакеты уходят на ретранслятор и через DNAT

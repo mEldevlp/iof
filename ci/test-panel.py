@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Проверки выдачи группы ботом и переименования узла без SSH и настоящего Telegram."""
+"""Проверки ссылок, панели и локальных команд без SSH и настоящего Telegram."""
+import base64
 import html
 import importlib.util
 import json
@@ -10,6 +11,7 @@ import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock
+import zlib
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.dont_write_bytecode = True
@@ -61,6 +63,122 @@ class GroupLinks(unittest.TestCase):
     def test_photo_rejected_does_not_repeat_links(self):
         _, calls = self.deliver(["hy2://one"], error=bot.ApiError(400, "Bad Request"))
         self.assertEqual([c.args[0] for c in calls], ["sendMessage", "sendPhoto"])
+
+
+class AwgLinks(unittest.TestCase):
+    def test_export_and_panel(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            client = base / "awg" / "family"
+            client.mkdir(parents=True)
+            (client.parent / "index.tsv").write_text("family\tСемья\t2026-11-21 12:00:00\n../other\tДругой клиент\n",
+                                                     encoding="utf-8")
+            conf = client / "Test.conf"
+            conf.write_text("[Interface]\nAddress = 10.8.1.2/32\nDNS = 9.9.9.9, 149.112.112.112\n"
+                            "PrivateKey = test-private=\nH1 = 100001000-100001100\nS3 = 20\nI1 = <b 0x12345678>\nI2 =\n"
+                            "[Peer]\nEndpoint = relay.example:51821\nPublicKey = server-key=\nPresharedKey = test-psk=\n",
+                            encoding="utf-8")
+            key = subprocess.check_output(["bash", "-c", 'source lib/awg.sh; awg_make_key "$@"',
+                                           "awg-test", str(conf), "client-public=", "amnezia-awg2", "Узел через реле"],
+                                          cwd=ROOT, text=True).strip()
+            self.assertRegex(key, r"^vpn://[A-Za-z0-9_-]+$")
+            encoded = key[6:]
+            blob = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
+            data = zlib.decompress(blob[4:])
+            self.assertEqual(int.from_bytes(blob[:4], "big"), len(data))
+            profile = json.loads(data)
+            container, = profile["containers"]
+            self.assertEqual(profile["defaultContainer"], "amnezia-awg2")
+            self.assertEqual(container["container"], "amnezia-awg2")
+            self.assertEqual(profile["description"], "Узел через реле")
+            self.assertEqual(profile["hostName"], "relay.example")
+            self.assertEqual(profile["dns2"], "149.112.112.112")
+            self.assertFalse({"userName", "password", "port"} & profile.keys())
+            awg = container["awg"]
+            self.assertEqual(awg["protocol_version"], "2")
+            self.assertEqual(awg["port"], "51821")
+            last = json.loads(awg["last_config"])
+            self.assertEqual(last["port"], 51821)
+            self.assertEqual(last["client_ip"], "10.8.1.2")
+            self.assertEqual(last["client_pub_key"], "client-public=")
+            self.assertIn("DNS = $PRIMARY_DNS, $SECONDARY_DNS", last["config"])
+            self.assertIn("Endpoint = relay.example:51821", last["config"])
+            for param in ("H1", "S3", "I1"):
+                self.assertEqual(last[param], awg[param])
+                self.assertIn(f"{param} = {awg[param]}", last["config"])
+            self.assertNotIn("I2 =", last["config"])
+
+            (client / "keys.txt").write_text(f"== Узел через реле\n{key}\n\nслужебный текст\n", encoding="utf-8")
+            self.assertEqual(web.read_awg_keys(base, "family"), [{"title": "Узел через реле", "url": key}])
+            self.assertEqual(web.read_awg_clients(base)[0]["configs"], ["Test"])
+            self.assertNotIn(key, str(web.read_awg_clients(base)))
+            with self.assertRaises(ValueError):
+                web.read_awg_keys(base, "../other")
+
+            handler = web.Handler.__new__(web.Handler)
+            handler.server = SimpleNamespace(base=base, hosts={"localhost"}, password="test")
+            handler.path = "/api/awg/keys?name=family"
+            handler.headers = {"Host": "localhost"}
+            handler.send_response, handler.send_header, handler.end_headers = Mock(), Mock(), Mock()
+            handler.send_body = Mock()
+            handler.do_GET()
+            handler.send_response.assert_called_once_with(401)
+            handler.send_body.assert_not_called()
+            handler.headers["Authorization"] = "Basic " + base64.b64encode(b"iof:test").decode()
+            handler.do_GET()
+            payload, _, cache, status = handler.send_body.call_args.args
+            self.assertEqual(status, 200)
+            self.assertEqual(cache, "no-store")
+            self.assertEqual(json.loads(payload)["links"][0]["url"], key)
+
+            jobs = web.Jobs(lambda: None)
+            job = {"log": []}
+            jobs.run(job, [("iof awg add", [sys.executable, "-c", "import sys; print(sys.argv[1])", key], None)])
+            self.assertEqual(job["state"], "ok")
+            self.assertNotIn(key, str(job))
+            self.assertIn("vpn://••••••••", job["log"])
+
+    def test_job_validation(self):
+        client = {"name": "family", "label": "Семья"}
+        _, steps = web.awg_steps("iof", {"action": "del", "name": "family"}, [client], None)
+        self.assertEqual(steps[0][1], ["iof", "awg", "del", "family"])
+        with self.assertRaises(ValueError):
+            web.awg_steps("iof", {"action": "add", "label": "Семья"}, [client], {"role": "source"})
+        conf = [("test", "192.0.2.1", "local", "Тест")]
+        body = {"action": "install_awg", "name": "test", "port": 51821}
+        _, _, steps = web.node_steps("iof", body, conf, [], Path("missing"), None)
+        self.assertEqual(steps[0][1], ["iof", "awg", "install", "--port", "51821", "--", "test"])
+        for invalid in (0, 65536, True, "51821"):
+            with self.assertRaises(ValueError):
+                web.node_steps("iof", dict(body, port=invalid), conf, [], Path("missing"), None)
+
+    def test_install_reuses_clients_only_on_ready_nodes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script = r'''
+set -euo pipefail
+source lib/common.sh
+source lib/awg.sh
+NODES_FILE="$1/nodes.conf"
+AWG_INDEX="$1/index.tsv"
+printf 'a | a.example | root@a\nb | b.example | root@b\nc | c.example | root@c\n' > "$NODES_FILE"
+printf 'family\tFamily\t2026-11-21 12:00:00\n' > "$AWG_INDEX"
+run_on() {
+  printf '%s %s %s\n' "$@" >> "$1.trace"
+  [[ "$1" != root@b ]] || return 255
+  echo 'установлен'
+}
+awg_add() { printf 'клиент: %s, индексы: %s\n' "$1" "${*:2}"; }
+cd "$1"
+awg_install --port 05182 -- a b
+cat root@*.trace
+'''
+            result = subprocess.run(["bash", "-c", script, "awg-test", tmp], cwd=ROOT,
+                                    capture_output=True, text=True, check=True)
+            self.assertIn("Ошибки (1)", result.stdout)
+            self.assertIn("клиент: Family, индексы: 0", result.stdout)
+            self.assertIn("root@a n_awg_install 5182", result.stdout)
+            self.assertIn("root@b n_awg_install 5182", result.stdout)
+            self.assertNotIn("root@c", result.stdout)
 
 
 class RenameNode(unittest.TestCase):

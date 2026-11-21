@@ -125,7 +125,7 @@ cmd_exec() {
 cmd_refresh() {
   hy2_refresh
   echo
-  awg_refresh
+  cmd_awg refresh
 }
 
 # VLESS: iof vless ... (WIP, команд пока нет)

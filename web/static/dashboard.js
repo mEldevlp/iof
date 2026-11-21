@@ -151,10 +151,10 @@ function renderHy2(d) {
 
 function renderAwg(d) {
   $("#awg-count").textContent = d.awg_clients.length || "";
-  $("#awg").innerHTML = d.awg_clients.length ? d.awg_clients.map((c) => `<div class="item">
+  $("#awg").innerHTML = d.awg_clients.length ? d.awg_clients.map((c) => `<a class="item item-link" href="awg.html${DEMO ? "?demo" : ""}#c=${encodeURIComponent(c.name)}">
       <div class="item-head"><span class="item-title">${esc(c.label)}</span><span class="item-meta">${fmtCreated(c.created)}</span></div>
       ${c.configs.length ? `<div class="chips">${c.configs.map((f) => `<span class="chip">${esc(f.replace(/_/g, " "))}</span>`).join("")}</div>` : ""}
-    </div>`).join("") : emptyList("Клиентов, созданных через iof, пока нет", 'sudo iof awg add "Имя"');
+    </a>`).join("") : emptyList("Клиентов, созданных через iof, пока нет");
 }
 
 const overview = startPage({

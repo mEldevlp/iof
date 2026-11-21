@@ -1,7 +1,7 @@
 "use strict";
 
 // Страница «Добавить сервер». Справка для формы: GET api/nodes/add-info,
-// добавление: POST api/nodes (задача iof node add [+ iof hy2 install]), ход: GET api/jobs.
+// Добавление и установка VPN: POST api/nodes, ход: GET api/jobs.
 // Поля входа на сервер и карточка задачи общие со страницей «Перенос», они в common.js
 
 const NAME_RE = /^[A-Za-z0-9._-]{1,40}$/;
@@ -21,7 +21,8 @@ function collect() {
   const v = (id) => $(id).value.trim();
   const errors = {};
   const data = collectLogin(errors);
-  Object.assign(data, { name: v("#f-name"), title: v("#f-title"), addr: v("#f-addr"), install_hy2: $("#f-hy2").checked });
+  Object.assign(data, { name: v("#f-name"), title: v("#f-title"), addr: v("#f-addr"),
+    install_hy2: $("#f-hy2").checked, install_awg: $("#f-awg").checked });
   if (!NAME_RE.test(data.name)) errors["#f-name"] = "латиница, цифры, точка, дефис, подчёркивание";
   else if (add.info && add.info.nodes.includes(data.name)) errors["#f-name"] = "такой узел уже есть";
   if (data.title.includes("|")) errors["#f-title"] = "без символа |";
@@ -36,15 +37,14 @@ function renderJob(job) {
   const lvl = renderJobCard(job);
   if (!job) return;
   const demo = DEMO ? "?demo" : "";
-  const name = esc(nameFromTitle(job.title));
-  const added = job.log.some((l) => l.startsWith("$ iof hy2 install"));
+  const node = nodeHref(nameFromTitle(job.title));
+  const added = job.log.some((l) => /^\$ iof (hy2|awg) install /.test(l));
   const reason = failReason(job.log);
   jobResult(lvl, {
-    ok: `${icon("good")}<div>Сервер добавлен. <a href="./${demo}">Открыть обзор</a> · <a href="hy2.html${demo}">Ссылки Hysteria2</a></div>`,
-    warn: `${icon("warn")}<div>Сервер добавлен, но Hysteria2 установить не удалось, подробности в логе.
-      Повторить: <code>sudo iof hy2 install ${name}</code></div>`,
+    ok: `${icon("good")}<div>Сервер добавлен. <a href="${node}">Открыть узел</a> · <a href="./${demo}">Обзор</a></div>`,
+    warn: `${icon("warn")}<div>Сервер добавлен. Подробности об ошибках в логе. <a href="${node}">Открыть узел</a></div>`,
     error: added
-      ? `${icon("crit")}<div>Сервер добавлен, но установка Hysteria2 прервалась. Повторить: <code>sudo iof hy2 install ${name}</code></div>`
+      ? `${icon("crit")}<div>Сервер добавлен. Установка VPN прервалась. <a href="${node}">Открыть узел</a></div>`
       : `${icon("crit")}<div>Сервер не добавлен${reason ? `: <b>${esc(reason)}</b>` : ", причина в логе"}</div>`,
   }[job.state]);
   $("#submit").disabled = job.state === "running";
@@ -163,6 +163,7 @@ function demoStart(d) {
       "Сертификат: свой на каждом узле, CN=bing.com", "Устанавливаю Hysteria2 на узлах: 1, одновременно до 20", "",
       "Установлено: 1", `  ${d.name} (v2.13.0)`, "Добавляю новые узлы в группы ссылок...", "Готово. Ссылки: sudo iof hy2 list");
   }
+  if (d.install_awg) lines.push(`$ iof awg install ${d.name}`, `  ${d.name}: установлен на UDP 51820 (amnezia-awg2)`);
   demoJob = { id: "demo", kind: "node", title: `Добавление сервера ${d.name} (${d.host})`, state: "running", log: [] };
   let i = 0;
   const tick = () => {

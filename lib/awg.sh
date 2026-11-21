@@ -6,7 +6,11 @@
 
 awg_dir_for() {
   local label="$1"
-  if [[ -d "$AWG_LINKS/$label" ]]; then printf '%s' "$AWG_LINKS/$label"; else printf '%s' "$AWG_LINKS/$(name_for "$label")"; fi
+  if node_name_ok "$label" && [[ "$label" != . && "$label" != .. && -d "$AWG_LINKS/$label" ]]; then
+    printf '%s' "$AWG_LINKS/$label"
+  else
+    printf '%s' "$AWG_LINKS/$(name_for "$label")"
+  fi
 }
 
 awg_label_for() {
@@ -19,6 +23,7 @@ awg_label_for() {
 # Создаёт клиента на узле, если для этого узла ещё нет конфига. Печатает skip или created
 awg_add_job() {
   local i="$1" f cfg
+  umask 077
   f="$AWG_ADD_DIR/$(node_file_name "$i")"
   if [[ -s "$f" ]]; then
     echo "skip"
@@ -26,27 +31,32 @@ awg_add_job() {
   fi
   cfg="$(run_on "${N_SSH[$i]}" n_awg_add "$AWG_ADD_LABEL" "${N_ADDR[$i]}")" || return $?
   [[ "$cfg" == IOF\ * && "$cfg" == *"[Interface]"* ]] || { echo "сервер вернул неожиданный ответ" >&2; return 1; }
-  printf '%s\n' "${cfg%%$'\n'*}" | cut -d' ' -f2- > "${f%.conf}.pub"
-  printf '%s\n' "${cfg#*$'\n'}" > "$f"
-  chmod 600 "$f" "${f%.conf}.pub"
+  printf '%s\n' "${cfg%%$'\n'*}" | cut -d' ' -f2- > "${f%.conf}.pub" || return 1
+  printf '%s\n' "${cfg#*$'\n'}" > "$f.tmp" && chmod 600 "$f.tmp" "${f%.conf}.pub" && mv -f "$f.tmp" "$f" || return 1
   echo "created"
 }
 
 awg_add() {
   local label="${1:-}"
   [[ -n "$label" ]] || die "укажи имя клиента: iof awg add \"Мама iPhone\""
+  shift
+  if [[ "$label" == *[[:cntrl:]]* || "$label" == *'|'* ]]; then die "имя содержит недопустимые символы"; fi
   read_nodes
-  local name dir i ok=0 skipped=0 failed=() noawg=()
+  local name dir i existing ok=0 skipped=0 failed=() noawg=() targets=("$@")
+  if (( ${#targets[@]} == 0 )); then targets=("${!N_NAME[@]}"); fi
   name="$(name_for "$label")"
   dir="$AWG_LINKS/$name"
-  mkdir -p "$dir"
-  chmod 700 "$AWG_LINKS" "$dir"
+  existing="$(awk -F'\t' -v n="$name" '$1==n{print $2; exit}' "$AWG_INDEX" 2>/dev/null || true)"
+  if [[ -n "$existing" && "$existing" != "$label" ]]; then
+    die "имя уже используется другим клиентом, выбери другое"
+  fi
+  mkdir -p "$dir" && chmod 700 "$AWG_LINKS" "$dir" || die "не удалось подготовить каталог клиента"
   AWG_ADD_DIR="$dir"
   AWG_ADD_LABEL="$label"
 
-  echo "Создаю клиента на узлах: ${#N_NAME[@]}" >&2
-  pmap awg_add_job "${!N_NAME[@]}"
-  for i in "${!N_NAME[@]}"; do
+  echo "Создаю клиента на узлах: ${#targets[@]}" >&2
+  pmap awg_add_job "${targets[@]}"
+  for i in "${targets[@]}"; do
     if pm_ok "$i"; then
       ok=$((ok + 1))
       if [[ "$(pm_out "$i")" == "skip" ]]; then skipped=$((skipped + 1)); fi
@@ -60,12 +70,14 @@ awg_add() {
   if (( ok == 0 )); then
     rmdir "$dir" 2>/dev/null || true
     if (( ${#failed[@]} > 0 )); then report_failures "${failed[@]}"; fi
+    if (( ${#noawg[@]} == ${#targets[@]} )); then die "сначала установи AmneziaWG хотя бы на одном узле"; fi
     die "ни один сервер не создал клиента"
   fi
-  index_set "$AWG_INDEX" "$name" "$label"
+  index_set "$AWG_INDEX" "$name" "$label" || die "не удалось записать список клиентов"
 
   echo
   awg_build_keys "$dir"
+  echo "Клиент: $name"
   echo
   echo "Клиент AWG: $label (готов на $ok узлах, из них раньше созданных: $skipped)"
   echo "Каждый ключ выше вставь в Amnezia VPN: + , затем Вставить ключ."
@@ -76,10 +88,56 @@ awg_add() {
   fi
   if (( ${#failed[@]} > 0 )); then
     echo
-    echo "Не получилось (${#failed[@]}):"
+    echo "Ошибки (${#failed[@]}):"
     report_failures "${failed[@]}"
     echo "Когда починишь, повтори команду, готовые конфиги не пересоздадутся."
   fi
+}
+
+awg_install_job() { run_on "${N_SSH[$1]}" n_awg_install "$AWG_INSTALL_PORT"; }
+
+awg_install() {
+  local i port="" name label created
+  local args=() ready=() failed=()
+  while (( $# )); do
+    case "$1" in
+      --) shift; args+=("$@"); break ;;
+      --port)
+        port_ok "${2:-}" || die "порт должен быть от 1 до 65535"
+        port="$((10#$2))"
+        shift
+        ;;
+      -*) die "неизвестный параметр установки: $1" ;;
+      *) args+=("$1") ;;
+    esac
+    shift
+  done
+  (( ${#args[@]} > 0 )) || die "укажи узлы: iof awg install <узлы|all> [--port 51820]"
+  read_nodes
+  select_nodes "${args[@]}"
+  AWG_INSTALL_PORT="$port"
+  echo "Устанавливаю AmneziaWG 2.0 на узлах: ${#SEL[@]}, одновременно до $PARALLEL"
+  pmap awg_install_job "${SEL[@]}"
+  for i in "${SEL[@]}"; do
+    if pm_ok "$i"; then
+      ready+=("$i")
+      printf '  %s: %s\n' "${N_NAME[$i]}" "$(pm_out "$i" | tail -n 1)"
+    else
+      failed+=("$i")
+    fi
+  done
+  if (( ${#failed[@]} )); then
+    echo "Ошибки (${#failed[@]}):"
+    report_failures "${failed[@]}"
+  fi
+  (( ${#ready[@]} )) || die "ни на одном узле AmneziaWG не заработал"
+  [[ -s "$AWG_INDEX" ]] || return 0
+  echo "Добавляю готовые узлы к существующим клиентам AmneziaWG"
+  while IFS=$'\t' read -r name label created; do
+    if ! (AWG_QUIET_KEYS=1 awg_add "$label" "${ready[@]}"); then
+      echo "Не удалось обновить: $label"
+    fi
+  done < "$AWG_INDEX"
 }
 
 # Ключ vpn:// в формате приложения Amnezia VPN из готового .conf: <файл> <публичный ключ> <контейнер> <название>.
@@ -104,7 +162,7 @@ ip = iface["Address"].split("/")[0]
 dns = [d.strip() for d in iface.get("DNS", "1.1.1.1, 1.0.0.1").split(",") if d.strip()]
 host, port = peer["Endpoint"].rsplit(":", 1)
 names = ["Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4", "H1", "H2", "H3", "H4", "I1", "I2", "I3", "I4", "I5"]
-params = {k: iface[k] for k in names if k in iface}
+params = {k: iface[k] for k in names if iface.get(k)}
 
 priv = iface["PrivateKey"]
 srv = peer["PublicKey"]
@@ -134,6 +192,7 @@ awg.update({
     "last_config": json.dumps(last, indent=4, ensure_ascii=False, sort_keys=True),
     "port": port,
     "subnet_address": ip.rsplit(".", 1)[0] + ".0",
+    "subnet_cidr": "24",
     "transport_proto": "udp",
 })
 if container == "amnezia-awg2":
@@ -148,7 +207,7 @@ root = {
     "nameOverriddenByUser": True,
 }
 data = json.dumps(root, indent=4, ensure_ascii=False, sort_keys=True).encode()
-blob = struct.pack(">I", len(data)) + zlib.compress(data)
+blob = struct.pack(">I", len(data)) + zlib.compress(data, 8)
 print("vpn://" + base64.urlsafe_b64encode(blob).decode().rstrip("="))
 ' "$1" "$2" "$3" "$4"
 }
@@ -156,11 +215,12 @@ print("vpn://" + base64.urlsafe_b64encode(blob).decode().rstrip("="))
 # Печатает ключи vpn:// для всех конфигов клиента (узлы и ретрансляторы) и сохраняет в keys.txt
 awg_build_keys() {
   local dir="$1" i f meta pub container title priv out key
+  local failed=0
+  umask 077
   have python3 || die "нужен python3"
   read_nodes
   out="$dir/keys.txt"
-  : > "$out"
-  chmod 600 "$out"
+  : > "$out.tmp" && chmod 600 "$out.tmp" || die "не удалось подготовить файл ссылок"
   for i in "${!N_NAME[@]}"; do
     f="$dir/$(node_file_name "$i")"
     [[ -s "$f" ]] || continue
@@ -173,14 +233,16 @@ awg_build_keys() {
         chmod 600 "${f%.conf}.pub"
       else
         echo "== $title: не удалось получить публичный ключ, сервер недоступен" >&2
+        failed=$((failed + 1))
         continue
       fi
     fi
     read -r pub container < "${f%.conf}.pub"
     if key="$(awg_make_key "$f" "$pub" "${container:-amnezia-awg2}" "$title")"; then
-      printf '%s\n%s\n\n' "== $title" "$key" | tee -a "$out"
+      printf '%s\n%s\n\n' "== $title" "$key" >> "$out.tmp" || die "не удалось записать ссылку"
     else
       echo "== $title: не удалось собрать ключ" >&2
+      failed=$((failed + 1))
     fi
   done
 
@@ -201,11 +263,15 @@ awg_build_keys() {
     title="$(node_title "$ni") via $(node_title "$vi")"
     read -r pub container < "${f%.conf}.pub"
     if key="$(awg_make_key "$rf" "$pub" "${container:-amnezia-awg2}" "$title")"; then
-      printf '%s\n%s\n\n' "== $title" "$key" | tee -a "$out"
+      printf '%s\n%s\n\n' "== $title" "$key" >> "$out.tmp" || die "не удалось записать ссылку"
     else
       echo "== $title: не удалось собрать ключ" >&2
+      failed=$((failed + 1))
     fi
   done
+  mv -f "$out.tmp" "$out" || die "не удалось сохранить ссылки"
+  if [[ "${AWG_QUIET_KEYS:-}" != 1 ]]; then cat "$out"; fi
+  if (( failed )); then echo "Ошибки ($failed): часть ссылок AmneziaWG не собрана" >&2; fi
 }
 
 awg_keys() {
@@ -250,12 +316,19 @@ awg_del() {
   if [[ -d "$dir" ]]; then AWG_DEL_LABEL="$(awg_label_for "$dir")"; fi
   pmap awg_del_job "${!N_NAME[@]}"
   for i in "${!N_NAME[@]}"; do
-    if ! pm_ok "$i" && ! pm_err "$i" | grep -q 'не найден контейнер AmneziaWG'; then failed+=("$i"); fi
+    if pm_ok "$i"; then continue; fi
+    if [[ -s "$dir/$(node_file_name "$i")" ]] || ! pm_err "$i" | grep -q 'не найден контейнер AmneziaWG'; then
+      failed+=("$i")
+    fi
   done
+  if (( ${#failed[@]} )); then
+    echo "Ошибки (${#failed[@]}):"
+    report_failures "${failed[@]}"
+    die "удаление не завершено, повтори команду, когда узлы будут доступны"
+  fi
   rm -rf "$dir"
   index_set "$AWG_INDEX" "$(basename "$dir")"
-  echo "Клиент '$AWG_DEL_LABEL' удалён. Ошибок: ${#failed[@]}"
-  if (( ${#failed[@]} > 0 )); then report_failures "${failed[@]}"; fi
+  echo "Клиент '$AWG_DEL_LABEL' удалён"
 }
 
 # Конфиги клиента и QR-коды, второй аргумент оставляет один узел: iof awg show "Имя" France
@@ -352,7 +425,15 @@ cmd_awg() {
   local action="${1:-}"
   if [[ $# -gt 0 ]]; then shift; fi
   case "$action" in
-    add)     awg_add "$@" ;;
+    install|add|del|keys|refresh)
+      (umask 077; mkdir -p "$AWG_LINKS")
+      exec 8>"$AWG_LINKS/.lock"
+      flock -w 60 8 || die "другая операция с клиентами AmneziaWG ещё выполняется"
+      ;;
+  esac
+  case "$action" in
+    install) awg_install "$@" ;;
+    add)     awg_add "${1:-}" ;;
     del)     awg_del "$@" ;;
     keys)    awg_keys "$@" ;;
     show)    awg_show "$@" ;;
@@ -361,6 +442,6 @@ cmd_awg() {
     clients) awg_clients ;;
     refresh) awg_refresh ;;
     status)  awg_status ;;
-    *)       die "используй: iof awg add | del | keys | show | export | list | clients | refresh | status" ;;
+    *)       die "используй: iof awg install | add | del | keys | show | export | list | clients | refresh | status" ;;
   esac
 }

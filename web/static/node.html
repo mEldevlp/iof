@@ -34,6 +34,10 @@
           <svg class="nav-ico" viewBox="0 0 20 20" aria-hidden="true"><path d="M8.5 11.5l3-3M9.3 6.2l1.1-1.1a3 3 0 0 1 4.3 4.3l-1.1 1.1M10.7 13.8l-1.1 1.1a3 3 0 0 1-4.3-4.3l1.1-1.1"/></svg>
           <span>Hysteria2</span>
         </a>
+        <a href="awg.html">
+          <svg class="nav-ico" viewBox="0 0 20 20" aria-hidden="true"><path d="M2 10h3l2-5 3 10 3-10 2 5h3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <span>AmneziaWG</span>
+        </a>
         <a href="security.html">
           <svg class="nav-ico" viewBox="0 0 20 20" aria-hidden="true"><path d="M10 2.5l6 2.2v4.5c0 3.7-2.4 6.6-6 8.3-3.6-1.7-6-4.6-6-8.3V4.7zM7.4 10l1.9 1.9 3.4-3.7"/></svg>
           <span>Безопасность</span>
@@ -158,7 +162,13 @@
           <section class="card">
             <div class="card-head"><h2>AmneziaWG</h2></div>
             <dl id="awg" class="kv"></dl>
-            <p class="hint pad">Клиентов AmneziaWG iof создаёт сразу на всех узлах: <code>sudo iof awg add "Имя"</code></p>
+            <div class="btn-row">
+              <label id="awg-port-label" class="field" hidden><span>Порт UDP</span>
+                <input id="awg-port" type="number" min="1" max="65535" placeholder="51820">
+              </label>
+              <span id="awg-actions"></span>
+            </div>
+            <p class="hint pad"><a id="awg-clients" href="awg.html">Клиенты и ключи AmneziaWG</a></p>
           </section>
           <section class="card">
             <div class="card-head"><h2>Сервер</h2></div>
