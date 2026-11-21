@@ -47,46 +47,6 @@ function renderCountry(el) {
   el.innerHTML = flag || (waiting ? '<span class="node-flag skeleton-fill skeleton-flag" aria-hidden="true"></span>' : "");
 }
 
-function renderHealth(d) {
-  const el = $("#health");
-  const nodes = d.nodes;
-  const bad = nodes.filter((n) => nodeLevel(n) === "crit");
-  const warn = nodes.filter((n) => nodeLevel(n) === "warn");
-
-  if (d.status_error) {
-    el.className = "health crit";
-    el.innerHTML = `${icon("crit", "ico big-ico")}<div><h2>Не удалось опросить узлы</h2>
-      <p class="sub">${esc(d.status_error)}</p></div>`;
-    return;
-  }
-  if (!nodes.length) {
-    el.className = "health";
-    el.innerHTML = `${icon("none", "ico big-ico")}<div><h2>Узлов нет</h2>
-      <p class="sub">Добавь серверы: <code>sudo iof node add имя ip "Подпись"</code> или <code>sudo iof node import файл</code></p></div>`;
-    return;
-  }
-
-  const level = bad.length ? "crit" : warn.length ? "warn" : "good";
-  const healthy = nodes.length === 1 && nodes[0].controller ? "Управляющий сервер работает"
-    : `Работает ${nodes.length} ${plural(nodes.length, ["узел", "узла", "узлов"])}`;
-  const title = bad.length
-    ? `Проблемы на ${bad.length} из ${nodes.length} ${plural(nodes.length, ["узла", "узлов", "узлов"])}`
-    : warn.length
-      ? `Узлы работают, на ${warn.length} нужна внимательность`
-      : healthy;
-  const items = [
-    ...bad.map((n) => ({ lvl: "crit", n, text: [...n.issues, ...warnings(n)].join("; ") })),
-    ...warn.map((n) => ({ lvl: "warn", n, text: warnings(n).join("; ") })),
-  ];
-  el.className = `health ${level}`;
-  el.innerHTML = `${icon(level, "ico big-ico")}<div>
-    <h2>${esc(title)}</h2>
-    <p class="sub">Проблемой считается: Hysteria2 не работает или не слушает порт, остановлен контейнер AWG, диск от 90%, нет связи по SSH.</p>
-    ${items.length ? `<ul class="issues">${items.map((i) =>
-      `<li>${icon(i.lvl)}<span><a class="node-link" href="${nodeHref(i.n.name)}"><b>${esc(i.n.dedicated ? i.n.title : i.n.name)}</b></a> <span class="muted">${esc(i.n.addr)}</span> — ${esc(i.text)}</span></li>`).join("")}</ul>` : ""}
-  </div>`;
-}
-
 function kpi(label, value, small, subs, href) {
   const tag = href ? "a" : "div";
   return `<${tag} class="kpi${href ? " kpi-link" : ""}"${href ? ` href="${href}${DEMO ? "?demo" : ""}"` : ""}>
@@ -138,10 +98,10 @@ function nodeRow(n) {
   const level = nodeLevel(n);
   const tip = [...n.issues, ...warnings(n)].join("; ") || "в порядке";
   const name = n.dedicated ? n.title : n.name;
-  const rowClass = `${n.controller ? "is-controller" : ""} ${level === "good" ? "" : "is-" + level}`.trim();
+  const rowClass = `${n.controller ? "is-controller" : ""} ${nodeRowClass(n)}`.trim();
   const flag = DEMO ? countryFlag(n.country) : n.addr && !n.dedicated ? `<span data-country="${esc(n.addr)}"></span>` : "";
   const head = `<td class="cell-node"><div class="node-cell"><span title="${esc(tip)}">${icon(level)}</span><div>
-      <div class="node-name"><a class="node-link" href="${nodeHref(n.name)}">${esc(name)}</a>${flag}</div>
+      <div class="node-name">${flag}<a class="node-link" href="${nodeHref(n.name)}">${esc(name)}</a></div>
       ${n.title && n.title !== name ? `<span class="sub-line">${esc(n.title)}</span>` : ""}
       ${n.controller ? '<span class="sub-line">Управляющий сервер</span>' : ""}
     </div></div></td>
@@ -231,7 +191,6 @@ const overview = startPage({
     });
   },
   render(d) {
-    renderHealth(d);
     renderKpis(d);
     renderNodes(d);
     renderRelays(d);

@@ -291,11 +291,11 @@ function renderNodes(d) {
     const head = `<td class="cell-node"><div class="node-cell"><div>
         <div class="node-name"><a class="node-link" href="${nodeHref(n.name)}">${esc(n.name)}</a></div>
         ${n.title && n.title !== n.name ? `<span class="sub-line">${esc(n.title)}</span>` : ""}
+        ${n.reachable ? nodeNotice(n) : ""}
       </div></div></td>
       <td data-label="Адрес"><span class="mono">${esc(n.addr)}</span></td>`;
     if (!n.reachable) return `<tr class="is-crit">${head}<td class="cell-wide" colspan="3">${badge("crit", "нет связи по SSH")}</td></tr>`;
-    const bad = n.hy2.installed && !(n.hy2.state === "active" && n.hy2.udp);
-    return `<tr class="${bad ? "is-crit" : ""}">${head}
+    return `<tr class="${nodeRowClass(n)}">${head}
       <td data-label="Состояние">${hy2Cell(n, false)}</td>
       <td data-label="Доступ">${esc(hy2Access(n.hy2)) || '<span class="muted">—</span>'}</td>
       <td data-label="Версия">${esc(n.hy2.version) || '<span class="muted">—</span>'}</td>

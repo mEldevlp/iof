@@ -95,6 +95,13 @@ STATIC_FILES = {
     "/xterm.css": ("xterm.css", "text/css; charset=utf-8"),
     "/app.css": ("app.css", "text/css; charset=utf-8"),
     "/favicon.svg": ("favicon.svg", "image/svg+xml"),
+    "/logo-panel.svg": ("logo-panel.svg", "image/svg+xml"),
+    "/hy2-light-logo.svg": ("hy2-light-logo.svg", "image/svg+xml"),
+    "/hy2-dark-logo.svg": ("hy2-dark-logo.svg", "image/svg+xml"),
+    "/amnezia-light-logo.svg": ("amnezia-light-logo.svg", "image/svg+xml"),
+    "/amnezia-dark-logo.svg": ("amnezia-dark-logo.svg", "image/svg+xml"),
+    "/tg-light-logo.svg": ("tg-light-logo.svg", "image/svg+xml"),
+    "/tg-dark-logo.svg": ("tg-dark-logo.svg", "image/svg+xml"),
     "/TwemojiCountryFlags.woff2": ("TwemojiCountryFlags.woff2", "font/woff2"),
 }
 
@@ -1947,7 +1954,7 @@ def log(text):
 
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
 HOST_HEADER = re.compile(r"(\[[0-9a-f:.]+\]|[a-z0-9][a-z0-9.-]{0,252})(?::([0-9]{1,5}))?")
-PUBLIC_FILES = {"/login.html", "/login.js", "/common.js", "/app.css", "/favicon.svg"}
+PUBLIC_FILES = {"/login.html", "/login.js", "/common.js", "/app.css", "/favicon.svg", "/logo-panel.svg"}
 SESSION_COOKIE = "iof_session"
 
 

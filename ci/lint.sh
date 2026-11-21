@@ -165,7 +165,10 @@ check_csp() {
     grep -nE '<script\b' "${html[@]}" | grep -v 'src='
     grep -nE '<style\b|[[:space:]]style=|setAttribute\(["'"'"']style|[[:space:]]on[a-z]+=["'"'"']|javascript:' \
       "${code[@]}" | code_only
-    grep -nE '(src|href)=["'"'"']?(https?:)?//|url\(["'"'"']?(https?:)?//|@import' "${all[@]}" | code_only
+    # CSP разрешает переход по ссылке: не считаем <a href> внешним ресурсом.
+    grep -nE '(src|href)=["'"'"']?(https?:)?//|url\(["'"'"']?(https?:)?//|@import' "${all[@]}" | code_only |
+       sed -E 's/<a[[:space:]][^>]*>//g' |
+       grep -E '(src|href)=["'"'"']?(https?:)?//|url\(["'"'"']?(https?:)?//|@import'
   )"
   if [[ -z "$found" ]]; then
     ok "CSP: нет встроенных скриптов, style=, обработчиков on...= и внешних адресов"

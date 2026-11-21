@@ -14,12 +14,7 @@
   <div class="shell">
     <aside id="sidebar" class="sidebar">
       <a class="brand" href="./">
-        <svg class="logo" viewBox="0 0 64 64" aria-hidden="true">
-          <defs><clipPath id="logo-sky"><rect width="64" height="44"/></clipPath></defs>
-          <circle class="logo-sun" cx="42" cy="44" r="13" clip-path="url(#logo-sky)"/>
-          <path class="logo-palm" d="M14.4 48C15.8 37.5 18.6 28.5 24.2 21.4L27 22.8C22.2 30 20.2 39 19.6 48ZM25.5 21Q12 8 6 27Q15 18 25.5 21ZM25.5 21Q39 8 46 26Q37 17 25.5 21ZM25.5 21Q16 4 9 10Q19 11 25.5 21ZM25.5 21Q33 3 42 8Q31 12 25.5 21ZM25.5 21Q21 9 27.5 2.5Q28.5 13 25.5 21ZM4 50C16 43 28 44 38 47C46 49.5 54 48 60 43C55 50.5 46 53 37 51.5C27 50 16 48 4 50Z"/>
-          <path class="logo-wave" d="M12 56C22 52 32 52.5 41 54.5C48 56 55 55 60 51C56 57 48 59.5 40 58.5C31 57.5 22 55 12 56Z"/>
-        </svg>
+        <img class="logo" src="logo-panel.svg" alt="" width="32" height="32">
         <span><b>Island of Freedom</b><small>VPN-узлы: Hysteria2 и AWG</small></span>
       </a>
       <nav class="nav" aria-label="Разделы">
@@ -29,11 +24,11 @@
           <span>Обзор</span>
         </a>
         <a href="hy2.html">
-          <svg class="nav-ico" viewBox="0 0 20 20" aria-hidden="true"><path d="M8.5 11.5l3-3M9.3 6.2l1.1-1.1a3 3 0 0 1 4.3 4.3l-1.1 1.1M10.7 13.8l-1.1 1.1a3 3 0 0 1-4.3-4.3l1.1-1.1"/></svg>
+          <span class="nav-logo nav-logo-hy2" aria-hidden="true"></span>
           <span>Hysteria2</span>
         </a>
         <a href="awg.html">
-          <svg class="nav-ico" viewBox="0 0 20 20" aria-hidden="true"><path d="M2 10h3l2-5 3 10 3-10 2 5h3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <span class="nav-logo nav-logo-amnezia" aria-hidden="true"></span>
           <span>AmneziaWG</span>
         </a>
         <a href="security.html" aria-current="page">
@@ -51,7 +46,7 @@
           <span id="nav-migrate" class="nav-badge" hidden></span>
         </a>
         <a href="bot.html">
-          <svg class="nav-ico" viewBox="0 0 20 20" aria-hidden="true"><path d="M17 3L3 9.2l5.6 2.2L10.8 17zM8.6 11.4L17 3"/></svg>
+          <span class="nav-logo nav-logo-tg" aria-hidden="true"></span>
           <span>Телеграм бот</span>
         </a>
         <a href="service.html">
@@ -108,59 +103,65 @@
         </section>
 
         <section id="server" class="card">
-          <div class="card-head">
-            <h2>Аудит сервера</h2>
-            <div class="actions">
-              <span id="server-stamp" class="card-note"></span>
-              <label class="sr-only" for="server-node">Узел</label>
-              <div data-skeleton="select"><select id="server-node"></select></div>
-              <button id="server-run" class="btn primary" type="button" data-run="server">Проверить</button>
+          <details class="security-fold">
+            <summary><h2>Аудит сервера</h2></summary>
+            <div class="card-head">
+              <div class="actions">
+                <span id="server-stamp" class="card-note"></span>
+                <label class="sr-only" for="server-node">Узел</label>
+                <div data-skeleton="select"><select id="server-node"></select></div>
+                <button id="server-run" class="btn primary" type="button" data-run="server">Проверить</button>
+              </div>
             </div>
-          </div>
-          <p class="hint pad">SSH, файрвол, защита от подбора паролей, обновления, открытые порты, sudo и SUID-файлы.
-            Проверка только читает настройки узлов и ничего на них не меняет. Нагрузка на узлы — на «Обзоре».</p>
-          <div id="server-health" data-skeleton="health" class="health"></div>
-          <div id="server-checks" data-skeleton="checks 4"></div>
+            <p class="hint pad">SSH, файрвол, защита от подбора паролей, обновления, открытые порты, sudo и SUID-файлы.
+              Проверка только читает настройки узлов и ничего на них не меняет. Нагрузка на узлы — на «Обзоре».</p>
+            <div id="server-health" data-skeleton="health" class="health"></div>
+            <div id="server-checks" data-skeleton="checks 4"></div>
+          </details>
         </section>
 
         <section id="dpi" class="card">
-          <div class="card-head">
-            <h2>Защита от РКН (ТСПУ)</h2>
-            <div class="actions">
-              <span id="dpi-stamp" class="card-note"></span>
-              <label class="sr-only" for="dpi-node">Узел</label>
-              <div data-skeleton="select"><select id="dpi-node"></select></div>
-              <button id="dpi-run" class="btn primary" type="button" data-run="dpi">Проверить</button>
+          <details class="security-fold">
+            <summary><h2>Защита от РКН (ТСПУ)</h2></summary>
+            <div class="card-head">
+              <div class="actions">
+                <span id="dpi-stamp" class="card-note"></span>
+                <label class="sr-only" for="dpi-node">Узел</label>
+                <div data-skeleton="select"><select id="dpi-node"></select></div>
+                <button id="dpi-run" class="btn primary" type="button" data-run="dpi">Проверить</button>
+              </div>
             </div>
-          </div>
-          <p class="hint pad">Чем узел заметен для фильтров и зондов: маскировка Hysteria2 и AmneziaWG, что отвечает
-            снаружи, блок-лист сканеров, репутация адреса, журналы. Проверка показывает признаки, а не обещает,
-            что узел не найдут. Пароли и параметры обфускации в панель не попадают. Узлы она только читает,
-            снаружи на них смотрит управляющий сервер.</p>
-          <div id="dpi-health" data-skeleton="health" class="health"></div>
-          <div id="dpi-checks" data-skeleton="checks 4"></div>
+            <p class="hint pad">Чем узел заметен для фильтров и зондов: маскировка Hysteria2 и AmneziaWG, что отвечает
+              снаружи, блок-лист сканеров, репутация адреса, журналы. Проверка показывает признаки, а не обещает,
+              что узел не найдут. Пароли и параметры обфускации в панель не попадают. Узлы она только читает,
+              снаружи на них смотрит управляющий сервер.</p>
+            <div id="dpi-health" data-skeleton="health" class="health"></div>
+            <div id="dpi-checks" data-skeleton="checks 4"></div>
+          </details>
         </section>
 
         <section id="probe" class="card">
-          <div class="card-head">
-            <h2>Доступность из РФ: проверка с ПК</h2>
-            <div class="actions">
-              <span id="probe-stamp" class="card-note"></span>
-              <label class="sr-only" for="probe-node">Узел</label>
-              <div data-skeleton="select"><select id="probe-node"></select></div>
-              <button id="probe-start" class="btn primary" type="button">Начать проверку</button>
-              <button id="probe-cancel" class="btn" type="button" hidden>Остановить</button>
+          <details class="security-fold">
+            <summary><h2>Доступность из РФ: проверка с ПК</h2></summary>
+            <div class="card-head">
+              <div class="actions">
+                <span id="probe-stamp" class="card-note"></span>
+                <label class="sr-only" for="probe-node">Узел</label>
+                <div data-skeleton="select"><select id="probe-node"></select></div>
+                <button id="probe-start" class="btn primary" type="button">Начать проверку</button>
+                <button id="probe-cancel" class="btn" type="button" hidden>Остановить</button>
+              </div>
             </div>
-          </div>
-          <p class="hint pad">Доходит ли трафик до узлов через твоего провайдера. На узлах на время проверки
-            (PROBE_TTL, по умолчанию 15 минут) поднимаются мишени, и управляющий сервер сразу проходит до них
-            все слои: это контроль. Затем скрипт PowerShell на ПК проходит те же слои и сдаёт отчёт сюда.
-            Где ПК не дошёл, а контроль дошёл, там и режут. Проверка показывает, что прошло из этой сети
-            в этот раз, и не обещает, что так будет всегда.</p>
-          <div id="probe-wait" class="probe-wait" hidden></div>
-          <div id="probe-health" data-skeleton="health" class="health"></div>
-          <div id="probe-nodes" data-skeleton="checks 2"></div>
-          <div id="probe-history" data-skeleton="list" class="list"></div>
+            <p class="hint pad">Доходит ли трафик до узлов через твоего провайдера. На узлах на время проверки
+              (PROBE_TTL, по умолчанию 15 минут) поднимаются мишени, и управляющий сервер сразу проходит до них
+              все слои: это контроль. Затем скрипт PowerShell на ПК проходит те же слои и сдаёт отчёт сюда.
+              Где ПК не дошёл, а контроль дошёл, там и режут. Проверка показывает, что прошло из этой сети
+              в этот раз, и не обещает, что так будет всегда.</p>
+            <div id="probe-wait" class="probe-wait" hidden></div>
+            <div id="probe-health" data-skeleton="health" class="health"></div>
+            <div id="probe-nodes" data-skeleton="checks 2"></div>
+            <div id="probe-history" data-skeleton="list" class="list"></div>
+          </details>
         </section>
 
         <section class="card">
@@ -174,7 +175,7 @@
         </section>
       </main>
 
-      <footer class="foot">iof-web · проверку выполняют <code>iof audit run</code> и <code>iof audit probe</code>, результат хранится в <code>/root/iof/audit</code>. Набор проверок по мотивам vps-audit и rkn-block-checker</footer>
+      <footer class="foot">Island of Freedom · by mEldevlp - <a href="https://github.com/mEldevlp">https://github.com/mEldevlp</a></footer>
     </div>
   </div>
 

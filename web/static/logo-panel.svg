@@ -1,0 +1,93 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="1254" height="1254" viewBox="0 0 1254 1254" role="img" aria-label="Остров свободы — пальма, золотой щит и морские волны">
+<title>Остров свободы</title>
+<desc>Премиальный векторный логотип VPN-сервиса: голубая пальма, золотистый щит без символов, три морские волны и градиентное кольцо на тёмном фоне.</desc>
+<defs>
+  <radialGradient id="night" cx="51%" cy="49%" r="74%"><stop offset="0" stop-color="#06091b"/><stop offset="0.70" stop-color="#030510"/><stop offset="1" stop-color="#01020b"/></radialGradient>
+  <!-- continuous palette for segmented arc -->
+  <linearGradient id="ringTL" x1="0" y1="0.85" x2="0.95" y2="0.1"><stop offset="0" stop-color="#096aff"/><stop offset="0.36" stop-color="#00bdf5"/><stop offset="0.70" stop-color="#00e7ee"/><stop offset="1" stop-color="#6772db"/></linearGradient>
+  <linearGradient id="ringTR" x1="0" y1="0" x2="1" y2="0.88"><stop offset="0" stop-color="#6772db"/><stop offset="0.13" stop-color="#ca628d"/><stop offset="0.34" stop-color="#ff9a27"/><stop offset="0.63" stop-color="#ffd208"/><stop offset="0.82" stop-color="#ff9d02"/><stop offset="1" stop-color="#f65b04"/></linearGradient>
+  <linearGradient id="ringBR" x1="0.08" y1="1" x2="0.93" y2="0"><stop offset="0" stop-color="#aa53b8"/><stop offset="0.17" stop-color="#ed6e4e"/><stop offset="0.45" stop-color="#ffa500"/><stop offset="0.74" stop-color="#ffbd03"/><stop offset="1" stop-color="#f65b04"/></linearGradient>
+  <linearGradient id="ringBL" x1="0.92" y1="1" x2="0" y2="0"><stop offset="0" stop-color="#aa53b8"/><stop offset="0.30" stop-color="#0867fa"/><stop offset="0.60" stop-color="#05a7ff"/><stop offset="1" stop-color="#0874f8"/></linearGradient>
+  <linearGradient id="trunk" x1="0.08" y1="0.12" x2="1" y2="0.82"><stop offset="0" stop-color="#02eff1"/><stop offset="0.25" stop-color="#04bbfb"/><stop offset="0.54" stop-color="#006be9"/><stop offset="0.78" stop-color="#004bda"/><stop offset="1" stop-color="#003499"/></linearGradient>
+  <linearGradient id="trunkSheen" x1="0" y1="0" x2="0.82" y2="1"><stop offset="0" stop-color="#2ffbff"/><stop offset="0.47" stop-color="#00dcf7"/><stop offset="1" stop-color="#0796f4"/></linearGradient>
+  <linearGradient id="leafCyan" x1="0.12" y1="0.12" x2="0.84" y2="0.9"><stop offset="0" stop-color="#69ffff"/><stop offset="0.19" stop-color="#09e7f6"/><stop offset="0.57" stop-color="#078df4"/><stop offset="1" stop-color="#0752d4"/></linearGradient>
+  <linearGradient id="leafBlue" x1="0.18" y1="0.05" x2="0.9" y2="1"><stop offset="0" stop-color="#11ddf5"/><stop offset="0.48" stop-color="#096ef0"/><stop offset="0.82" stop-color="#0756df"/><stop offset="1" stop-color="#092da1"/></linearGradient>
+  <linearGradient id="leafRight" x1="0.3" y1="0" x2="0.8" y2="1"><stop offset="0" stop-color="#0065eb"/><stop offset="0.52" stop-color="#0899f4"/><stop offset="1" stop-color="#09e8ef"/></linearGradient>
+  <linearGradient id="leafTeal" x1="0.13" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#43f9fc"/><stop offset="0.48" stop-color="#09cafa"/><stop offset="1" stop-color="#0266de"/></linearGradient>
+  <linearGradient id="shieldOuter" x1="0.02" y1="0.03" x2="0.84" y2="0.94"><stop offset="0" stop-color="#fff94b"/><stop offset="0.25" stop-color="#ffc00c"/><stop offset="0.53" stop-color="#ff8700"/><stop offset="0.78" stop-color="#f86b00"/><stop offset="1" stop-color="#c83b06"/></linearGradient>
+  <linearGradient id="shieldFace" x1="0" y1="0" x2="0.9" y2="1"><stop offset="0" stop-color="#ffde06"/><stop offset="0.43" stop-color="#ffb300"/><stop offset="0.75" stop-color="#ff8702"/><stop offset="1" stop-color="#fa6501"/></linearGradient>
+  <linearGradient id="shieldTop" x1="0" y1="0" x2="0.95" y2="0.7"><stop offset="0" stop-color="#fff961"/><stop offset="0.55" stop-color="#ffe330"/><stop offset="1" stop-color="#ffc513"/></linearGradient>
+  <linearGradient id="shieldRight" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#ffbc10"/><stop offset="0.55" stop-color="#ff8e08"/><stop offset="1" stop-color="#ee5505"/></linearGradient>
+  <linearGradient id="waveFront" x1="0.06" y1="0.12" x2="0.87" y2="0.92"><stop offset="0" stop-color="#0670f6"/><stop offset="0.27" stop-color="#01d9f4"/><stop offset="0.53" stop-color="#0076e8"/><stop offset="0.72" stop-color="#0063c9"/><stop offset="1" stop-color="#00ebf7"/></linearGradient>
+  <linearGradient id="waveSheen" x1="0.22" y1="0.15" x2="0.67" y2="0.95"><stop offset="0" stop-color="#80ffff"/><stop offset="0.18" stop-color="#01ddf7"/><stop offset="0.53" stop-color="#0584ff"/><stop offset="1" stop-color="#00e6ef"/></linearGradient>
+  <linearGradient id="wave2" x1="0.12" y1="0.19" x2="0.92" y2="0.85"><stop offset="0" stop-color="#079af3"/><stop offset="0.36" stop-color="#02d7f5"/><stop offset="0.55" stop-color="#0063d1"/><stop offset="0.78" stop-color="#007ce6"/><stop offset="1" stop-color="#02d6fd"/></linearGradient>
+  <linearGradient id="wave3" x1="0.1" y1="0.24" x2="0.9" y2="0.65"><stop offset="0" stop-color="#0631a7"/><stop offset="0.29" stop-color="#006df4"/><stop offset="0.65" stop-color="#00b6fb"/><stop offset="0.9" stop-color="#00eaf5"/><stop offset="1" stop-color="#0096f9"/></linearGradient>
+  <clipPath id="logoBoundary"><circle cx="615.5" cy="609.5" r="515"/></clipPath>
+  <clipPath id="shieldBoundary"><path d="M440 456 H974 V808 C928 862 837 906 742 878 C634 854 559 801 440 790 Z"/></clipPath>
+</defs>
+<rect width="1254" height="1254" fill="url(#night)"/>
+<g clip-path="url(#logoBoundary)">
+  <!-- Palm trunk: curving down toward the water -->
+  <path d="M530 428 C480 451 431 500 384 562 C321 645 264 733 239 817 C227 848 229 855 232 872 C279 838 338 792 417 792 C390 703 391 638 419 574 C443 517 486 466 530 428Z" fill="url(#trunk)"/>
+  <path d="M530 428 C478 459 412 518 353 603 C280 708 240 799 235 856 C257 795 289 720 343 644 C402 552 458 473 530 428Z" fill="url(#trunkSheen)"/>
+
+
+  <!-- Upper-left crown: main long blade -->
+  <path d="M530 428 C504 335 450 263 383 242 C366 237 347 236 326 235 C386 197 448 204 494 234 C550 270 566 336 530 428Z" fill="url(#leafBlue)"/>
+  <path d="M326 235 C392 199 449 208 491 239 C464 226 423 219 394 225 C434 235 492 287 530 428 C474 315 400 241 326 235Z" fill="url(#leafCyan)"/>
+  <!-- Small overlapping left blade -->
+  <path d="M394 265 C445 251 495 300 529 428 C492 355 447 294 394 265Z" fill="url(#leafBlue)"/>
+
+  <!-- Broad left blade, curved and forked -->
+  <path d="M530 428 C446 360 414 329 348 330 C250 320 175 412 135 568 C206 493 263 438 360 398 C326 430 310 447 300 470 C367 429 433 404 530 428Z" fill="url(#leafBlue)"/>
+  <path d="M530 428 C460 362 411 334 355 331 C250 334 174 422 135 568 C188 480 263 392 340 355 C416 316 468 375 530 428Z" fill="url(#leafCyan)"/>
+  <path d="M300 470 C322 439 348 404 385 383 C436 376 481 404 530 428 C431 404 368 428 300 470Z" fill="url(#leafTeal)"/>
+
+  <!-- Upper-right overlapping palm fronds -->
+  <path d="M530 428 C568 341 603 267 659 246 C734 217 827 256 902 325 C806 298 744 298 678 316 C721 308 748 322 764 338 C664 334 604 369 530 428Z" fill="url(#leafRight)"/>
+  <path d="M530 428 C567 329 611 264 671 243 C624 273 583 320 556 395 C659 282 774 263 902 325 C808 286 737 295 677 316 C609 340 568 394 530 428Z" fill="url(#leafTeal)"/>
+  <path d="M530 428 C583 367 659 309 727 315 C746 318 759 333 764 338 C660 337 593 377 530 428Z" fill="url(#leafBlue)" opacity=".9"/>
+
+  <!-- Right-lower palm frond -->
+  <path d="M530 428 C617 375 693 368 749 399 C800 424 821 473 834 538 C778 487 732 468 670 438 C689 452 702 472 709 487 C640 454 587 437 530 428Z" fill="url(#leafBlue)"/>
+  <path d="M530 428 C607 376 677 382 733 397 C782 412 815 471 834 538 C797 484 744 429 687 413 C641 399 580 417 530 428Z" fill="url(#leafRight)"/>
+  <path d="M530 428 C593 423 658 442 708 487 C651 459 585 438 530 428Z" fill="url(#leafTeal)"/>
+  <!-- Short downward central leaflet -->
+  <path d="M530 428 C557 441 558 462 548 490 C538 522 503 541 478 569 C480 514 495 465 530 428Z" fill="url(#leafBlue)"/>
+  <path d="M530 428 C511 469 491 512 478 569 C478 506 494 462 530 428Z" fill="url(#leafCyan)"/>
+
+  <!-- Warm golden shield; plain shield with no key -->
+  <g clip-path="url(#shieldBoundary)">
+  <path d="M718 500 C774 544 845 581 926 599 L926 684 C920 772 886 850 839 897 C757 949 642 936 590 886 C532 813 501 707 501 599 C592 584 667 548 718 500Z" fill="url(#shieldOuter)"/>
+  <!-- orange right bevel -->
+  <path d="M718 501 C786 551 844 579 927 599 L927 677 C919 786 870 867 811 913 L782 900 C858 821 893 726 893 622 C825 604 771 575 718 541Z" fill="url(#shieldRight)"/>
+  <!-- protected front surface -->
+  <path d="M718 539 C770 574 828 603 892 622 L892 672 C885 779 849 851 783 900 C707 927 640 914 594 884 C551 817 536 743 535 622 C603 608 667 574 718 539Z" fill="url(#shieldFace)"/>
+  <!-- clean top bevel: bright yellow upper ridge -->
+  <path d="M501 599 C580 586 662 550 718 500 C771 544 845 582 927 599 L893 622 C827 605 766 574 718 539 C659 582 599 608 535 621Z" fill="url(#shieldTop)"/>
+  <!-- small highlights and shield edge retain fine depth but no decorative mark -->
+  <path d="M501 599 L535 622 C531 753 559 833 594 884 C549 817 504 726 501 599Z" fill="#ffc216" opacity=".33"/>
+
+  </g>
+  <!-- Three clean blue ocean bands overlapping shield and trunk -->
+  <path d="M202 887 C263 836 340 796 413 793 C518 780 618 826 698 858 C829 921 966 871 1088 741 C1021 852 932 909 837 921 C710 936 602 854 478 836 C388 818 293 871 224 917Z" fill="url(#waveFront)"/>
+  <path d="M203 886 C281 824 350 789 438 792 C550 789 637 852 726 876 C859 914 992 836 1088 741 C1003 858 893 909 782 895 C655 878 557 795 438 801 C354 798 280 831 203 886Z" fill="url(#waveSheen)" opacity=".90"/>
+  <path d="M220 910 C330 837 390 817 470 834 C607 856 703 934 834 921 C892 917 948 897 992 862 C916 933 848 936 778 925 C650 908 566 860 471 850 C369 838 283 890 226 930Z" fill="#063bba" opacity=".62"/>
+
+  <path d="M268 960 C346 904 423 890 509 892 C644 888 702 951 810 953 C905 960 956 925 1010 869 C938 967 855 990 744 983 C637 978 564 928 472 935 C417 935 380 981 344 1020Z" fill="url(#wave2)"/>
+  <path d="M268 959 C374 878 445 885 528 895 C653 903 716 958 822 955 C895 959 958 923 1010 869 C932 958 856 980 754 974 C655 966 570 908 474 908 C379 900 329 935 268 959Z" fill="#08c9f6" opacity=".37"/>
+  <path d="M343 1020 C430 959 474 935 555 946 C654 958 702 983 793 984 C902 991 967 929 1010 869 C944 972 847 1004 759 1002 C647 988 570 963 515 974 C446 980 399 1002 343 1020Z" fill="#0044c7" opacity=".53"/>
+
+  <path d="M416 1065 C481 999 555 985 648 986 C732 987 774 1000 846 976 C910 956 967 912 1010 869 C952 986 862 1014 789 1018 C663 1025 570 1042 511 1104Z" fill="url(#wave3)"/>
+  <path d="M416 1065 C497 985 572 981 670 988 C809 1007 920 960 1010 869 C952 955 864 991 764 999 C635 1003 523 1005 416 1065Z" fill="#098ff9" opacity=".34"/>
+</g>
+<!-- Four gradient sweeps produce a true editable vector circular border -->
+<g fill="none" stroke-width="26" stroke-linejoin="round" stroke-linecap="butt">
+  <path d="M102 609.5 A513.5 513.5 0 0 1 615.5 96" stroke="url(#ringTL)"/>
+  <path d="M615.5 96 A513.5 513.5 0 0 1 1129 609.5" stroke="url(#ringTR)"/>
+  <path d="M1129 609.5 A513.5 513.5 0 0 1 615.5 1123" stroke="url(#ringBR)"/>
+  <path d="M615.5 1123 A513.5 513.5 0 0 1 102 609.5" stroke="url(#ringBL)"/>
+</g>
+<!-- Hide microscopic seams at the four color transitions without adding glow -->
+<g><circle cx="615.5" cy="96" r="2.5" fill="#6772db"/><circle cx="1129" cy="609.5" r="2.5" fill="#f65b04"/><circle cx="615.5" cy="1123" r="2.5" fill="#aa53b8"/><circle cx="102" cy="609.5" r="2.5" fill="#0874f8"/></g>
+</svg>

@@ -7,6 +7,9 @@
   --surface-2: #f3f2ee;
   --side: #f1f0ec;
   --side-on: #fcfcfb;
+  --nav-logo-hy2: url("hy2-light-logo.svg");
+  --nav-logo-amnezia: url("amnezia-light-logo.svg");
+  --nav-logo-tg: url("tg-light-logo.svg");
   --ink: #0b0b0b;
   --ink-2: #52514e;
   --muted: #7a7873;
@@ -31,9 +34,6 @@
   --term-fg: #f0efec;
   --term-cursor: #f0efec;
   --term-sel: rgba(57, 135, 229, 0.4);
-  /* Логотип: пальма и верхняя волна — --accent, солнце и нижняя волна одинаковы в обеих темах */
-  --logo-sun: #f5a623;
-  --logo-wave: #5ab4f0;
   /* Каркас: ширина бокового меню, поля и ширина содержимого */
   --side-w: 236px;
   --gutter: 28px;
@@ -47,6 +47,9 @@
     --surface-2: #222220;
     --side: #131312;
     --side-on: #262624;
+    --nav-logo-hy2: url("hy2-dark-logo.svg");
+    --nav-logo-amnezia: url("amnezia-dark-logo.svg");
+    --nav-logo-tg: url("tg-dark-logo.svg");
     --ink: #f0efec;
     --ink-2: #c3c2b7;
     --muted: #8f8d87;
@@ -72,6 +75,9 @@
   --surface-2: #222220;
   --side: #131312;
   --side-on: #262624;
+  --nav-logo-hy2: url("hy2-dark-logo.svg");
+  --nav-logo-amnezia: url("amnezia-dark-logo.svg");
+  --nav-logo-tg: url("tg-dark-logo.svg");
   --ink: #f0efec;
   --ink-2: #c3c2b7;
   --muted: #8f8d87;
@@ -123,10 +129,7 @@ code, .mono { font-family: var(--mono); font-size: 12px; }
   padding: 20px 20px 12px;
   color: inherit; text-decoration: none;
 }
-.logo { width: 32px; height: 32px; flex: none; }
-.logo-palm { fill: var(--accent); }
-.logo-sun { fill: var(--logo-sun); }
-.logo-wave { fill: var(--logo-wave); }
+.logo { width: 32px; height: 32px; flex: none; object-fit: contain; border-radius: 8px; }
 .brand b { display: block; font-size: 16px; font-weight: 600; line-height: 20px; }
 .brand small { display: block; font-size: 12px; line-height: 16px; color: var(--ink-2); }
 
@@ -141,11 +144,15 @@ code, .mono { font-family: var(--mono); font-size: 12px; }
 }
 .nav a:hover { background: color-mix(in srgb, var(--ink) 5%, transparent); color: var(--ink); }
 .nav a[aria-current] { background: var(--side-on); color: var(--ink); box-shadow: 0 0 0 1px var(--ring), var(--shadow); }
+.nav-ico, .nav-logo { width: 18px; height: 18px; flex: none; }
 .nav-ico {
-  width: 18px; height: 18px; flex: none;
   fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round;
 }
 .nav a[aria-current] .nav-ico { color: var(--accent); }
+.nav-logo { background: center / contain no-repeat; }
+.nav-logo-hy2 { background-image: var(--nav-logo-hy2); }
+.nav-logo-amnezia { background-image: var(--nav-logo-amnezia); }
+.nav-logo-tg { background-image: var(--nav-logo-tg); }
 /* Отметка у пункта меню, например «идёт» у переноса */
 .nav-badge {
   margin-left: auto; padding: 0 6px; border-radius: 4px;
@@ -280,6 +287,9 @@ main {
 .health.good { background: var(--good-bg); border-color: color-mix(in srgb, var(--good) 30%, transparent); }
 .health.crit { background: var(--crit-bg); border-color: color-mix(in srgb, var(--crit) 35%, transparent); }
 .health.warn { background: var(--warn-bg); border-color: color-mix(in srgb, var(--warn) 45%, transparent); }
+/* Только сводка отдельного узла: аудит и состояние бота сохраняют сплошную подложку. */
+.node-health.crit { background: linear-gradient(to right, var(--crit-bg), transparent 25%) var(--surface); }
+.node-health.warn { background: linear-gradient(to right, var(--warn-bg), transparent 25%) var(--surface); }
 .health .big-ico { width: 24px; height: 24px; flex: none; }
 .health h2 { font-size: 16px; font-weight: 600; line-height: 24px; }
 .health .sub { color: var(--ink-2); font-size: 13px; }
@@ -328,10 +338,12 @@ table.nodes { width: 100%; border-collapse: collapse; font-variant-numeric: tabu
 .nodes th:first-child, .nodes td:first-child { padding-left: 16px; }
 .nodes th:last-child, .nodes td:last-child { padding-right: 16px; }
 .nodes tbody tr:last-child td { border-bottom: 0; }
-.nodes tbody tr:hover td { background: color-mix(in srgb, var(--surface-2) 60%, transparent); }
-.nodes tr.is-controller { background: color-mix(in srgb, var(--accent) 6%, var(--surface)); }
-.nodes tr.is-controller:is(:hover, :focus-within) { background: color-mix(in srgb, var(--accent) 12%, var(--surface)); }
-.nodes tbody tr.is-controller:hover td { background: none; }
+.nodes tbody tr:is(:hover, :focus-within) { background-color: color-mix(in srgb, var(--surface-2) 60%, transparent); }
+.nodes tr.is-controller { background-color: color-mix(in srgb, var(--accent) 6%, var(--surface)); }
+.nodes tr.is-controller:is(:hover, :focus-within) { background-color: color-mix(in srgb, var(--accent) 12%, var(--surface)); }
+/* Подложка одна на всю строку: постепенно исчезает на первой четверти ширины. */
+.nodes tr.is-crit { background-image: linear-gradient(to right, var(--crit-bg), transparent 25%); }
+.nodes tr.is-warn { background-image: linear-gradient(to right, var(--warn-bg), transparent 25%); }
 .nodes tr.is-crit td:first-child { box-shadow: inset 3px 0 0 var(--crit); }
 .nodes tr.is-warn td:first-child { box-shadow: inset 3px 0 0 var(--warn); }
 .nodes .num { text-align: right; }
@@ -343,6 +355,9 @@ table.nodes { width: 100%; border-collapse: collapse; font-variant-numeric: tabu
   font-display: block;
 }
 .node-flag { font: 16px/1 "Twemoji Country Flags", sans-serif; }
+.node-status { white-space: normal; }
+.node-status .st { align-items: baseline; white-space: normal; }
+.node-status .ico { align-self: flex-start; margin-top: 2px; }
 .node-cell { display: flex; gap: 8px; align-items: flex-start; }
 .node-cell .ico { margin-top: 3px; }
 .offline { color: var(--ink-2); }
@@ -485,7 +500,8 @@ img.qr { display: block; width: 100%; max-width: 240px; height: auto; margin: 0 
 .field .hint { margin-top: 4px; font-size: 12px; line-height: 16px; }
 .field [aria-invalid="true"] { border-color: var(--crit); }
 .field-error { margin: 4px 0 0; font-size: 12px; color: var(--crit); font-weight: 500; }
-.login-page { min-height: 100vh; display: grid; place-items: center; padding: 20px; }
+.login-page { min-height: 100vh; display: grid; grid-template-rows: 1fr auto; place-items: center; padding: 20px; }
+.login-page > .foot { text-align: center; padding: 16px 0 0; }
 .login-card { width: min(100%, 390px); padding: 24px; }
 .login-card .brand { padding: 0; }
 .login-card h1 { margin: 24px 0 16px; font-size: 22px; }
@@ -495,7 +511,10 @@ img.qr { display: block; width: 100%; max-width: 240px; height: auto; margin: 0 
 .password-form .form-error { margin: 0; }
 .input-row { display: flex; gap: 8px; align-items: center; margin-top: 0; }
 .input-row input { flex: 1; }
-#bot-server { flex: 1; min-width: 0; }
+.bot-server-form { padding: 0 16px 16px; }
+.bot-server-form .input-row { flex-wrap: wrap; align-items: stretch; }
+.bot-server-form .btn { flex: none; }
+#bot-server { flex: 1 1 180px; min-width: 0; }
 .field textarea + .input-row { margin-top: 8px; align-items: flex-start; }
 .file-btn { cursor: pointer; flex: none; }
 .seg {
@@ -603,7 +622,13 @@ pre.log {
 /* Страница «Безопасность». Сводка блока — .health внутри карточки. Строка проверки: оценка,
    название, значение; раскрывается в «почему это важно», значения по узлам и «как исправить».
    Колонка оценки 112px, содержимое раскрытой строки начинается под названием */
-.card > .health { margin: 0 16px 16px; padding: 12px 16px; border-radius: 8px; }
+.card > .health, .security-fold > .health { margin: 0 16px 16px; padding: 12px 16px; border-radius: 8px; }
+/* Секции закрыты при входе; их оболочка не заменяется при обновлении результатов. */
+.security-fold > summary { display: flex; align-items: center; gap: 12px; padding: 16px; cursor: pointer; list-style: none; border-radius: 12px; }
+.security-fold > summary::-webkit-details-marker { display: none; }
+.security-fold > summary::before { content: ""; width: 6px; height: 6px; flex: none; border: solid var(--ink-2); border-width: 0 2px 2px 0; transform: rotate(-45deg); }
+.security-fold[open] > summary::before { transform: rotate(45deg); }
+.security-fold > .card-head { padding-top: 0; justify-content: flex-end; }
 .check-group { margin: 0; padding: 8px 16px 8px; font-size: 13px; font-weight: 600; color: var(--ink-2); }
 .checks summary { align-items: baseline; }
 .checks summary .st { flex: 0 0 112px; }
@@ -720,6 +745,9 @@ table.admins { width: 100%; border-collapse: collapse; font-size: 13px; font-var
   width: 100%; max-width: calc(var(--wrap) + 2 * var(--gutter));
   margin: 0 auto; padding: 12px var(--gutter) 28px; font-size: 12px; color: var(--muted);
 }
+
+.foot a { color: inherit; text-underline-offset: 2px; overflow-wrap: anywhere; }
+.foot a:hover { color: var(--accent); }
 
 /* Скелетоны используют существующую раскладку и нейтральные оттенки обеих тем. */
 .skeleton-active > :not(.skeleton-part) { display: none !important; }

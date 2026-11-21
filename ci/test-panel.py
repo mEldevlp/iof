@@ -32,6 +32,30 @@ bot = module("iof_bot", "web/iof_bot.py")
 web = module("iof_web", "web/iof-web.py")
 
 
+class PanelAppearance(unittest.TestCase):
+    def test_logo_is_available_before_login(self):
+        handler = web.Handler.__new__(web.Handler)
+        handler.route = Mock(return_value=("/logo-panel.svg", {}))
+        handler.static = Mock()
+        handler.authorized = Mock(return_value=False)
+        handler.do_GET()
+        handler.static.assert_called_once_with("logo-panel.svg", "image/svg+xml")
+        handler.authorized.assert_not_called()
+        self.assertTrue((web.STATIC_DIR / "logo-panel.svg").is_file())
+
+    def test_branding_on_all_pages(self):
+        footer = ('<footer class="foot">Island of Freedom · by mEldevlp - '
+                  '<a href="https://github.com/mEldevlp">https://github.com/mEldevlp</a></footer>')
+        for path in web.STATIC_DIR.glob("*.html"):
+            with self.subTest(page=path.name):
+                text = path.read_text(encoding="utf-8")
+                self.assertIn('<img class="logo" src="logo-panel.svg"', text)
+                self.assertIn(footer, text)
+                self.assertNotIn('<svg class="logo"', text)
+        for name in ("hy2.html", "bot.html"):
+            self.assertNotIn("Команды на сервере", (web.STATIC_DIR / name).read_text(encoding="utf-8"))
+
+
 class Dashboard(unittest.TestCase):
     def test_controller_before_and_after_migrate_finish(self):
         with tempfile.TemporaryDirectory() as tmp:

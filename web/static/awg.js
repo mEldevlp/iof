@@ -153,8 +153,8 @@ function renderClients(clients, replace) {
 
 function renderNodes(d) {
   $("#nodes-count").textContent = d.nodes.length || "";
-  $("#nodes").innerHTML = d.nodes.map((n) => `<tr>
-    <td class="cell-node"><a class="node-link" href="${nodeHref(n.name)}">${esc(n.title || n.name)}</a></td>
+  $("#nodes").innerHTML = d.nodes.map((n) => `<tr class="${nodeRowClass(n)}">
+    <td class="cell-node"><a class="node-link" href="${nodeHref(n.name)}">${esc(n.title || n.name)}</a>${n.reachable ? nodeNotice(n) : ""}</td>
     <td data-label="Адрес" class="mono">${esc(n.addr)}</td>
     <td data-label="Состояние">${n.reachable ? awgCell(n) : badge("crit", "нет связи по SSH")}</td>
     <td data-label="Установка">${n.reachable && n.awg.state !== "running"

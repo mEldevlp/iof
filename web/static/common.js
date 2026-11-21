@@ -163,6 +163,17 @@ function nodeLevel(n) {
   return warnings(n).length ? "warn" : "good";
 }
 
+// Одна оценка для строк узлов на всех страницах; причины остаются видимыми и без цвета.
+function nodeRowClass(n) {
+  const level = nodeLevel(n);
+  return level === "good" ? "" : `is-${level}`;
+}
+
+function nodeNotice(n) {
+  const notes = n.reachable ? [...n.issues, ...warnings(n)] : ["нет связи по SSH"];
+  return notes.length ? `<span class="sub-line node-status">${badge(nodeLevel(n), notes.join("; "))}</span>` : "";
+}
+
 function awgCell(n) {
   const a = n.awg;
   if (a.state === "running") {
@@ -631,6 +642,11 @@ function startPage(page) {
 
   function renderAlert() {
     const el = $("#alert");
+    if (!state.error && state.data?.status_error) {
+      el.hidden = false;
+      el.innerHTML = `${icon("crit")} Не удалось опросить узлы: ${esc(state.data.status_error)}`;
+      return;
+    }
     if (!state.error) { el.hidden = true; return; }
     el.hidden = false;
     el.innerHTML = state.data

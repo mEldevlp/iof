@@ -91,14 +91,14 @@ function renderHealth(d) {
     return;
   }
   if (d.status_error || !n || (local && !n.reachable)) {
-    el.className = "health crit";
+    el.className = "health node-health crit";
     el.innerHTML = `${icon("crit", "ico big-ico")}<div><h2>Нет данных ${local ? "о сервере" : "об узле"}</h2>
       <p class="sub">${esc(d.status_error || n?.issues[0] || "узел не попал в опрос, обнови страницу")}</p></div>`;
     return;
   }
   if (!n.reachable) {
     const t = parseSsh(d.conf.ssh);
-    el.className = "health crit";
+    el.className = "health node-health crit";
     el.innerHTML = `${icon("crit", "ico big-ico")}<div><h2>Нет связи по SSH</h2>
       <p class="sub">iof не смог зайти на <span class="mono">${esc(d.conf.ssh)}</span> своим ключом. Проверить с этого сервера:
       <code>ssh -i /root/.ssh/iof_ed25519${t.port !== "22" ? ` -p ${esc(t.port)}` : ""} ${esc(t.target)}</code></p></div>`;
@@ -107,7 +107,7 @@ function renderHealth(d) {
   const lvl = nodeLevel(n);
   const items = [...n.issues.map((t) => ["crit", t]), ...warnings(n).map((t) => ["warn", t])];
   const title = lvl === "crit" ? "Есть проблемы" : lvl === "warn" ? "Работает, но нужна внимательность" : "Всё в порядке";
-  el.className = `health ${lvl}`;
+  el.className = `health node-health ${lvl}`;
   el.innerHTML = `${icon(lvl, "ico big-ico")}<div><h2>${title}</h2>
     <p class="sub">Работает ${fmtUptime(n.uptime_s)}${local ? "" : `, вход и сбор данных по SSH за ${fmtMs(n.ms)}`}</p>
     ${items.length ? `<ul class="issues">${items.map(([l, t]) => `<li>${icon(l)}<span>${esc(t)}</span></li>`).join("")}</ul>` : ""}
