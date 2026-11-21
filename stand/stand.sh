@@ -30,6 +30,8 @@ set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$DIR/.." && pwd)"
+# shellcheck source=stand/wait-ready.sh
+source "$DIR/wait-ready.sh"
 # Ключ для туннелей к панелям. В домашней папке, а не в репозитории: на /mnt/c из WSL у файлов
 # права 777, и ssh такой ключ не берёт
 KEY="$HOME/.iof-stand/id_ed25519"
@@ -56,16 +58,6 @@ running() {
   for s in "${SERVERS[@]}"; do
     if grep -qx "$s" <<<"$up"; then echo "$s"; fi
   done
-}
-
-# Ждёт, пока на сервере поднимутся systemd и sshd
-wait_ready() {
-  local s="$1"
-  for _ in $(seq 1 60); do
-    if [[ "$(on "$s" systemctl is-active ssh 2>/dev/null || true)" == "active" ]]; then return 0; fi
-    sleep 1
-  done
-  die "$s не поднялся: bash stand/stand.sh sh $s, затем systemctl --failed"
 }
 
 # Рабочая копия репозитория в /opt/iof на сервере, вместе с .git: iof migrate ставит iof на новый сервер из клона
@@ -97,7 +89,7 @@ cmd_up() {
   done
   dc build
   dc up -d "${list[@]}"
-  for s in "${list[@]}"; do wait_ready "$s"; done
+  for s in "${list[@]}"; do wait_ready "$s" on; done
   ensure_key
   echo "Стенд поднят: ${list[*]}. Дальше: bash stand/stand.sh setup"
 }

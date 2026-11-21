@@ -4,6 +4,8 @@
 # Нужен заранее собранный образ iof-stand: bash stand/stand.sh up old node1.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=stand/wait-ready.sh
+source "$ROOT/stand/wait-ready.sh"
 PREFIX="iof-setup-$$"
 NET="$PREFIX-net"
 LOCAL="$PREFIX-local"
@@ -21,6 +23,7 @@ for c in "$LOCAL" "$CONTROL" "$PEER"; do
     --tmpfs /run --tmpfs /run/lock -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
     -v "$ROOT:/opt/iof:ro" iof-stand >/dev/null
 done
+for c in "$LOCAL" "$CONTROL" "$PEER"; do wait_ready "$c" docker exec; done
 for c in "$LOCAL" "$CONTROL"; do
   docker exec "$c" bash -c 'apt-get update -qq && apt-get install -y -qq python3 git qrencode >/dev/null &&
     bash /opt/iof/install.sh && printf "%s\n" iof-stand-panel | iof web reset-password --password-stdin' >/dev/null

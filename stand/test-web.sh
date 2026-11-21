@@ -3,12 +3,15 @@
 # HTTPS и SSH-туннель на отдельном сервере стенда, с собственной парой ключей и локальным DNS.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=stand/wait-ready.sh
+source "$ROOT/stand/wait-ready.sh"
 NAME="iof-test-web-$$"
 export MSYS_NO_PATHCONV=1
 trap 'docker rm -f "$NAME" >/dev/null 2>&1 || true' EXIT
 docker run -d --name "$NAME" --hostname panel --privileged --cgroupns=host \
   --tmpfs /run --tmpfs /run/lock -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
   -v "$ROOT:/src:ro" iof-stand >/dev/null
+wait_ready "$NAME" docker exec
 
 docker exec -i "$NAME" bash -s <<'SH'
 set -euo pipefail

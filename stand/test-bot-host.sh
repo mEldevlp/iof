@@ -3,6 +3,8 @@
 # Перенос Telegram-бота на отдельных Ubuntu-контейнерах из образа iof-stand.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=stand/wait-ready.sh
+source "$ROOT/stand/wait-ready.sh"
 NET="iof-bot-$$"
 CONTROL="$NET-control"
 FIRST="$NET-first"
@@ -26,6 +28,7 @@ for c in "$CONTROL" "$FIRST" "$SECOND"; do
 done
 containers=()
 for c in "$CONTROL" "$FIRST" "$SECOND"; do
+  wait_ready "$c" docker exec
   docker exec "$c" bash -c 'apt-get update -qq && apt-get install -y -qq --no-install-recommends python3 >/dev/null' &
   containers+=("$!")
 done
