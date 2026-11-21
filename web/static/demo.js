@@ -93,12 +93,30 @@ function demoGroupNodes(g) {
     (g.nodes ? g.nodes.includes(node) : true) && (relay || titles.includes(node)));
 }
 
+const DEMO_CONTROLLER_NAME = "@controller";
+
+function demoController() {
+  return {
+    name: DEMO_CONTROLLER_NAME, title: "iof-main", addr: "", local: true, controller: true, dedicated: true,
+    reachable: true, issues: [], ok: true, uptime_s: 11400,
+    hy2: { installed: false }, awg: { state: "none" },
+    cpu: { pct: 12, load1: 0.24, cpus: 2 },
+    mem: { pct: 38, used_mb: 742, total_mb: 1967 },
+    disk: { pct: 38, used_kb: 9542042, total_kb: 25165824 },
+  };
+}
+
 function demoDashboard() {
   const status = demoStatus();
   const countries = { "192.0.2.10": "FI", "198.51.100.20": "NL", "203.0.113.30": "DE", "203.0.113.43": "SE" };
+  const nodes = status.nodes.map((n) => {
+    const local = n.addr === "192.0.2.10";
+    return { ...n, local, controller: local, country: countries[n.addr] };
+  });
+  if (!nodes.some((n) => n.controller)) nodes.unshift(demoController());
   return demoDelay({
     ...status,
-    nodes: status.nodes.map((n) => ({ ...n, controller: n.addr === "192.0.2.10", country: countries[n.addr] })),
+    nodes,
     relays: DEMO_RELAYS,
     hy2_groups: demoState.groups.map(({ name, label, created }) => ({ name, label, created })),
     awg_clients: demoState.awgClients,
@@ -156,11 +174,15 @@ function demoHy2() {
 
 function demoNode(name) {
   const { nodes, ...status } = demoStatus();
+  if (name === DEMO_CONTROLLER_NAME) {
+    return demoDelay({ ...status, name, conf: null, node: demoController(), controller: true, terminal: true, migrate: null });
+  }
   const node = nodes.find((n) => n.name === name) || null;
   return demoDelay({
     ...status,
     name,
     conf: node && { name, addr: node.addr, ssh: node.addr === "192.0.2.10" ? "local" : `root@${node.addr}`, title: node.title },
+    controller: node?.addr === "192.0.2.10",
     node,
     relays: DEMO_RELAYS.filter((r) => r.node === name || r.via === name),
     hy2_groups: demoState.groups.map((g) => ({

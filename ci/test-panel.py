@@ -42,9 +42,12 @@ class Dashboard(unittest.TestCase):
                             encoding="utf-8")
             nodes = [{"name": n} for n in ("node-a", "old", "node-b", "berlin")]
             handler = web.Handler.__new__(web.Handler)
-            handler.server = SimpleNamespace(base=base, cache=Mock())
+            handler.server = SimpleNamespace(base=base, cache=Mock(), controller_cache=Mock())
             handler.send_json = Mock()
             handler.server.cache.get.side_effect = lambda _: {"nodes": nodes}
+            handler.server.controller_cache.get.side_effect = lambda _: {
+                "nodes": [web.shape_node({"name": "iof-main", "reachable": "yes"})], "status_error": None,
+            }
 
             def names():
                 handler.dashboard(False)
@@ -74,7 +77,12 @@ migrate_finish
             self.assertTrue(all("controller" not in node for node in nodes))
 
             conf.write_text(conf.read_text(encoding="utf-8").replace("| local |", "| root@new |"), encoding="utf-8")
-            self.assertEqual(names(), [(node["name"], False) for node in nodes])
+            self.assertEqual(names(), [(web.CONTROLLER_NAME, True)] + [(node["name"], False) for node in nodes])
+            row = handler.send_json.call_args.args[0]["nodes"][0]
+            self.assertTrue(row["dedicated"] and row["local"] and row["ok"])
+            self.assertEqual(row["title"], "iof-main")
+            self.assertFalse(row["hy2"]["installed"])
+            self.assertEqual(row["awg"]["state"], "none")
 
     def test_countries_ip_and_domain_change_and_retry_after_outage(self):
         now = Mock(return_value=1000)

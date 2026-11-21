@@ -5,10 +5,11 @@
 cmd_api() {
   case "${1:-}" in
     status)  api_status ;;
+    controller) api_controller ;;
     service) api_service ;;
     updates) api_updates ;;
     audit)   api_audit ;;
-    *)       die "используй: iof api status | service | updates | audit" ;;
+    *)       die "используй: iof api status | controller | service | updates | audit" ;;
   esac
 }
 
@@ -35,20 +36,34 @@ api_updates() {
 }
 
 api_status() {
+  nodes_present || return 0
   read_nodes
   select_nodes
-  local i k
+  local i
   probe_all "${SEL[@]}"
   for i in "${SEL[@]}"; do
     echo "== ${N_NAME[$i]}"
     printf 'addr=%s\ntitle=%s\n' "${N_ADDR[$i]}" "$(node_title "$i")"
     if probe_load "$i"; then
-      printf 'reachable=yes\nms=%s\nissues=%s\n' "$P_MS" "$(node_issues)"
-      for k in "${!P[@]}"; do printf '%s=%s\n' "$k" "${P[$k]}"; done
+      api_probe_fields
     else
       printf 'reachable=no\nissues=нет связи по SSH\n'
     fi
   done
+}
+
+# Локальный опрос для панели, в том числе до регистрации VPN-узлов.
+api_controller() {
+  local out
+  out="$(probe_target local)" && probe_parse "$out" || die "не удалось собрать данные управляющего сервера"
+  printf '== %s\n' "$(hostname)"
+  api_probe_fields
+}
+
+api_probe_fields() {
+  local k
+  printf 'reachable=yes\nms=%s\nissues=%s\n' "$P_MS" "$(node_issues)"
+  for k in "${!P[@]}"; do printf '%s=%s\n' "$k" "${P[$k]}"; done
 }
 
 # Для страницы «Безопасность» панели: JSON с последними проверками, справочником, историей

@@ -54,11 +54,13 @@ function renderHealth(d) {
   }
 
   const level = bad.length ? "crit" : warn.length ? "warn" : "good";
+  const healthy = nodes.length === 1 && nodes[0].controller ? "Управляющий сервер работает"
+    : `Работает ${nodes.length} ${plural(nodes.length, ["узел", "узла", "узлов"])}`;
   const title = bad.length
     ? `Проблемы на ${bad.length} из ${nodes.length} ${plural(nodes.length, ["узла", "узлов", "узлов"])}`
     : warn.length
       ? `Узлы работают, на ${warn.length} нужна внимательность`
-      : `Все ${nodes.length} ${plural(nodes.length, ["узел работает", "узла работают", "узлов работают"])}`;
+      : healthy;
   const items = [
     ...bad.map((n) => ({ lvl: "crit", n, text: [...n.issues, ...warnings(n)].join("; ") })),
     ...warn.map((n) => ({ lvl: "warn", n, text: warnings(n).join("; ") })),
@@ -68,7 +70,7 @@ function renderHealth(d) {
     <h2>${esc(title)}</h2>
     <p class="sub">Проблемой считается: Hysteria2 не работает или не слушает порт, остановлен контейнер AWG, диск от 90%, нет связи по SSH.</p>
     ${items.length ? `<ul class="issues">${items.map((i) =>
-      `<li>${icon(i.lvl)}<span><a class="node-link" href="${nodeHref(i.n.name)}"><b>${esc(i.n.name)}</b></a> <span class="muted">${esc(i.n.addr)}</span> — ${esc(i.text)}</span></li>`).join("")}</ul>` : ""}
+      `<li>${icon(i.lvl)}<span><a class="node-link" href="${nodeHref(i.n.name)}"><b>${esc(i.n.dedicated ? i.n.title : i.n.name)}</b></a> <span class="muted">${esc(i.n.addr)}</span> — ${esc(i.text)}</span></li>`).join("")}</ul>` : ""}
   </div>`;
 }
 
@@ -94,9 +96,10 @@ function renderKpis(d) {
   const online = awgOk.reduce((s, n) => s + n.awg.online, 0);
   const peers = awgOk.reduce((s, n) => s + n.awg.peers, 0);
 
-  const ms = up.map((n) => n.ms).sort((a, b) => a - b);
+  const ssh = up.filter((n) => !n.local);
+  const ms = ssh.map((n) => n.ms).sort((a, b) => a - b);
   const median = ms.length ? ms[Math.floor((ms.length - 1) / 2)] : 0;
-  const slowest = up.reduce((m, n) => (!m || n.ms > m.ms ? n : m), null);
+  const slowest = ssh.reduce((m, n) => (!m || n.ms > m.ms ? n : m), null);
 
   const parts = [
     `${icon("good")} в порядке ${okCount}`,
@@ -121,17 +124,18 @@ function renderKpis(d) {
 function nodeRow(n) {
   const level = nodeLevel(n);
   const tip = [...n.issues, ...warnings(n)].join("; ") || "в порядке";
+  const name = n.dedicated ? n.title : n.name;
   const rowClass = `${n.controller ? "is-controller" : ""} ${level === "good" ? "" : "is-" + level}`.trim();
   const flag = countryFlag(DEMO ? n.country : nodeCountries[n.addr]);
   const head = `<td class="cell-node"><div class="node-cell"><span title="${esc(tip)}">${icon(level)}</span><div>
-      <div class="node-name"><a class="node-link" href="${nodeHref(n.name)}">${esc(n.name)}</a>${flag}</div>
-      ${n.title && n.title !== n.name ? `<span class="sub-line">${esc(n.title)}</span>` : ""}
+      <div class="node-name"><a class="node-link" href="${nodeHref(n.name)}">${esc(name)}</a>${flag}</div>
+      ${n.title && n.title !== name ? `<span class="sub-line">${esc(n.title)}</span>` : ""}
       ${n.controller ? '<span class="sub-line">Управляющий сервер</span>' : ""}
     </div></div></td>
-    <td data-label="Адрес"><span class="mono">${esc(n.addr)}</span></td>`;
+    <td data-label="Адрес"><span class="mono">${esc(n.addr || "—")}</span></td>`;
   const row = `<tr class="${rowClass}" data-href="${nodeHref(n.name)}">${head}`;
   if (!n.reachable) {
-    return `${row}<td class="cell-wide offline" colspan="7">${badge("crit", "нет связи по SSH")}</td></tr>`;
+    return `${row}<td class="cell-wide offline" colspan="7">${badge("crit", n.issues[0] || "нет данных")}</td></tr>`;
   }
   return `${row}
     <td data-label="Hysteria2" class="cell-proto">${hy2Cell(n)}</td>
@@ -140,7 +144,7 @@ function nodeRow(n) {
     <td data-label="Память">${meter("Память", n.mem.pct, 90, 0, `из ${gb(n.mem.total_mb, 1024)} ГБ`)}</td>
     <td data-label="Диск">${meter("Диск", n.disk.pct, 80, 90, `из ${gb(n.disk.total_kb, 1048576)} ГБ`)}</td>
     <td data-label="Работает">${fmtUptime(n.uptime_s)}</td>
-    <td data-label="Отклик" class="num">${fmtMs(n.ms)}</td>
+    <td data-label="Отклик" class="num">${n.local ? "—" : fmtMs(n.ms)}</td>
   </tr>`;
 }
 
@@ -149,7 +153,8 @@ function renderNodes(d) {
   const onlyBad = $("#onlybad").checked;
   const list = d.nodes.filter((n) =>
     (!onlyBad || nodeLevel(n) !== "good") &&
-    (!q || [n.name, n.title, n.addr].some((s) => (s || "").toLowerCase().includes(q))));
+    (!q || [n.dedicated ? "" : n.name, n.title, n.addr, n.controller ? "управляющий сервер" : ""]
+      .some((s) => (s || "").toLowerCase().includes(q))));
 
   $("#nodes-count").textContent = list.length === d.nodes.length ? d.nodes.length : `${list.length} из ${d.nodes.length}`;
   $("#nodes").innerHTML = list.map(nodeRow).join("");
@@ -196,8 +201,8 @@ const overview = startPage({
   demo: async () => {
     const d = await demoDashboard();
     if (["setup", "template-only", "setup-error"].includes(setupDemo)) {
-      d.nodes = setup.info && setup.info.nodes ? d.nodes.slice(0, 1) : [];
-      if (d.nodes.length && setup.info.local) Object.assign(d.nodes[0], setup.info.local, { country: null });
+      const local = setup.info?.local;
+      d.nodes = local ? [{ ...d.nodes[0], ...local, country: null }] : [demoController()];
     }
     return d;
   },
@@ -242,7 +247,6 @@ async function loadSetup() {
   try {
     const i = setup.info = DEMO ? (setup.info || demoSetupInfo()) : await getJson("api/setup");
     renderMigrate(i.migrate);
-    $("#overview-content").hidden = !i.nodes;
     $("#setup").hidden = i.template && i.nodes > 0 && i.state.phase !== "installing";
     $("#setup-template").hidden = i.template;
     $("#setup-template").disabled = i.template || setup.running;

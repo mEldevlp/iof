@@ -89,9 +89,36 @@ def websocket(origin, ticket, cookie, status, *, ws_origin=None):
     return sock
 
 
-def ticket_for(cookie):
-    _, data = request(domain, "/admin/api/term", cookie=cookie, body={"name": "panel", "cols": 80, "rows": 24})
-    return json.loads(data)["ticket"]
+def ticket_for(cookie, name="panel", status=200):
+    _, data = request(domain, "/admin/api/term", status, cookie=cookie, body={"name": name, "cols": 80, "rows": 24})
+    return json.loads(data).get("ticket")
+
+
+def terminal_output(ws, command, expected):
+    mask = os.urandom(4)
+    ws.sendall(bytes([0x82, 0x80 | len(command)]) + mask
+               + bytes(c ^ mask[i % 4] for i, c in enumerate(command)))
+    with ws.makefile("rb") as frames:
+        output = b""
+        while expected not in output:
+            opcode, size = frames.read(2)
+            if size >= 126:
+                size = int.from_bytes(frames.read(2 if size == 126 else 8), "big")
+            payload = frames.read(size)
+            assert opcode != 0x88, (payload, output)
+            if opcode == 0x82:
+                output += payload
+
+
+def restart_panel():
+    subprocess.run(["systemctl", "restart", "iof-web"], check=True)
+    for _ in range(50):
+        try:
+            request(tunnel, "/api/setup", 401)
+            return
+        except OSError:
+            time.sleep(0.1)
+    raise AssertionError("панель не отвечает после перезапуска")
 
 
 def wait_job(cookie, match):
@@ -193,6 +220,44 @@ request(domain, "/admin/api/setup", cookie=cookies[domain])
 print("ok: миграция IOF_WEB_PASSWORD и сохранение учётных данных после iof update")
 
 cookie = cookies[domain]
+nodes_file = base / "nodes.conf"
+registered = nodes_file.read_bytes()
+web_env = base / "web.env"
+enabled_env = web_env.read_bytes()
+try:
+    for name in ("panel", "@controller"):
+        if name == "@controller":
+            nodes_file.write_bytes(b"")
+            restart_panel()
+        else:
+            assert ticket_for(cookie, "@controller", 400) is None
+        _, data = request(domain, "/admin/api/dashboard?force=1", cookie=cookie)
+        nodes = json.loads(data)["nodes"]
+        assert len(nodes) == 1 and nodes[0]["controller"] and nodes[0]["name"] == name
+        _, data = request(domain, f"/admin/api/node?n={name}", cookie=cookie)
+        view = json.loads(data)
+        assert view["controller"] and view["terminal"] and view["node"]["reachable"]
+        assert bool(view["conf"]) == (name == "panel")
+        ticket = ticket_for(cookie, name)
+        with websocket(domain, ticket, cookie, 101) as ws:
+            terminal_output(ws, b"hostname\r", b"panel\r\n")
+        with websocket(domain, ticket, cookie, 403):
+            pass
+    assert not view["node"]["hy2"]["installed"] and view["node"]["awg"]["state"] == "none"
+    for path in ("hy2", "awg"):
+        _, data = request(domain, "/admin/api/" + path, cookie=cookie)
+        assert json.loads(data)["nodes"] == []
+    web_env.write_bytes(enabled_env.replace(b"IOF_WEB_TERMINAL=1", b"IOF_WEB_TERMINAL=0"))
+    restart_panel()
+    _, data = request(domain, "/admin/api/node?n=@controller", cookie=cookie)
+    assert not json.loads(data)["terminal"]
+    assert ticket_for(cookie, "@controller", 403) is None
+finally:
+    nodes_file.write_bytes(registered)
+    web_env.write_bytes(enabled_env)
+    restart_panel()
+print("ok: одна строка управляющего сервера, локальный hostname, терминал выключен, списки VPN без служебной строки")
+
 ticket = ticket_for(cookie)
 with websocket(domain, ticket, cookie, 403, ws_origin=address):
     pass
@@ -202,15 +267,7 @@ with websocket(domain, ticket, cookie, 101) as ws:
     with websocket(domain, ticket, cookie, 403):
         pass
     # Двоичный кадр со вводом и ответ настоящей оболочки.
-    command = b"printf 'IOF%sTERMINAL\\n' -TEST-\r"
-    mask = os.urandom(4)
-    ws.sendall(bytes([0x82, 0x80 | len(command)]) + mask
-               + bytes(c ^ mask[i % 4] for i, c in enumerate(command)))
-    output = b""
-    while b"IOF-TEST-TERMINAL" not in output:
-        part = ws.recv(4096)
-        assert part
-        output += part
+    terminal_output(ws, b"printf 'IOF%sTERMINAL\\n' -TEST-\r", b"IOF-TEST-TERMINAL")
 
     pending = ticket_for(cookie)
     change = {"current": old, "password": new, "confirmation": new}

@@ -72,25 +72,28 @@ function migrating(d) {
 
 function renderHead(d) {
   const demo = DEMO ? "?demo" : "";
-  document.title = `${d.name || "Узел"} · Island of Freedom`;
-  $("#node-title").textContent = d.name || "Узел";
+  const title = (d.node?.dedicated ? d.node.title : d.name) || "Узел";
+  document.title = `${title} · Island of Freedom`;
+  $("#node-title").textContent = title;
   $("#rename-open").hidden = !d.conf || migrating(d);
   $("#node-sub").innerHTML = `<a href="./${demo}">Обзор</a>` +
-    (d.conf ? ` / ${esc(d.conf.title)} · <span class="mono">${esc(d.conf.addr)}</span>` : "");
+    (d.conf ? ` / ${esc(d.conf.title)} · <span class="mono">${esc(d.conf.addr)}</span>` : "") +
+    (d.controller ? (d.conf ? " · " : " / ") + "Управляющий сервер" : "");
 }
 
 function renderHealth(d) {
   const el = $("#health"), n = d.node;
-  if (!d.conf) {
+  const local = n?.dedicated || d.conf?.ssh === "local";
+  if (!d.conf && !n?.dedicated) {
     el.className = "health";
     el.innerHTML = `${icon("none", "ico big-ico")}<div><h2>Узла ${esc(d.name || "")} нет в nodes.conf</h2>
       <p class="sub">Его удалили или ссылка неверная. Список узлов на <a href="./${DEMO ? "?demo" : ""}">Обзоре</a>.</p></div>`;
     return;
   }
-  if (d.status_error || !n) {
+  if (d.status_error || !n || (local && !n.reachable)) {
     el.className = "health crit";
-    el.innerHTML = `${icon("crit", "ico big-ico")}<div><h2>Нет данных об узле</h2>
-      <p class="sub">${esc(d.status_error || "узел не попал в опрос, обнови страницу")}</p></div>`;
+    el.innerHTML = `${icon("crit", "ico big-ico")}<div><h2>Нет данных ${local ? "о сервере" : "об узле"}</h2>
+      <p class="sub">${esc(d.status_error || n?.issues[0] || "узел не попал в опрос, обнови страницу")}</p></div>`;
     return;
   }
   if (!n.reachable) {
@@ -106,7 +109,7 @@ function renderHealth(d) {
   const title = lvl === "crit" ? "Есть проблемы" : lvl === "warn" ? "Работает, но нужна внимательность" : "Всё в порядке";
   el.className = `health ${lvl}`;
   el.innerHTML = `${icon(lvl, "ico big-ico")}<div><h2>${title}</h2>
-    <p class="sub">Работает ${fmtUptime(n.uptime_s)}, вход и сбор данных по SSH за ${fmtMs(n.ms)}</p>
+    <p class="sub">Работает ${fmtUptime(n.uptime_s)}${local ? "" : `, вход и сбор данных по SSH за ${fmtMs(n.ms)}`}</p>
     ${items.length ? `<ul class="issues">${items.map(([l, t]) => `<li>${icon(l)}<span>${esc(t)}</span></li>`).join("")}</ul>` : ""}
   </div>`;
 }
@@ -128,6 +131,10 @@ function renderHy2(d) {
     ["Доступ", esc(hy2Access(h)) || "—"], ["Версия", esc(h.version) || "—"]];
   $("#hy2").innerHTML = kv(rows);
 
+  if (!d.conf || (d.controller && !h?.installed)) {
+    $("#hy2-actions").replaceChildren();
+    return;
+  }
   const noTpl = !d.hy2_template, mig = migrating(d);
   const btns = h && h.installed
     ? [actButton("restart_hy2", "Перезапустить", !up), actButton("reinstall_hy2", "Переустановить по шаблону", !up || noTpl || mig)]
@@ -147,27 +154,30 @@ function renderAwg(d) {
   else rows = [["Состояние", badge("good", "работает")], ["Порт", `UDP ${esc(a.port)}`],
     ["Клиенты", `${a.peers}`], ["Онлайн", `${a.online} <span class="muted">за 3 мин</span>`]];
   $("#awg").innerHTML = kv(rows);
+  const installed = !!a && a.state !== "none";
   $("#awg-clients").href = `awg.html${DEMO ? "?demo" : ""}`;
-  $("#awg-port-label").hidden = a?.state !== "none";
-  $("#awg-actions").innerHTML = a && a.state !== "running"
+  $("#awg-clients").parentElement.hidden = !d.conf || (d.controller && !installed);
+  $("#awg-port-label").hidden = d.controller || a?.state !== "none";
+  $("#awg-actions").innerHTML = d.conf && a && a.state !== "running" && (!d.controller || installed)
     ? actButton("install_awg", a.state === "none" ? "Установить AmneziaWG 2.0" : "Проверить и запустить", migrating(d), " primary")
     : "";
 }
 
 function renderRes(d) {
   const n = d.node, c = d.conf, up = !!n && n.reachable;
-  const rows = [
+  const local = n?.dedicated || c?.ssh === "local";
+  const rows = c ? [
     ["Адрес", `<span class="mono">${esc(c.addr)}</span> <span class="muted">для клиентов</span>`],
-    ["SSH", c.ssh === "local" ? "этот сервер (local)" : `<span class="mono">${esc(c.ssh)}</span>`],
-  ];
+  ] : [["Имя в системе", `<span class="mono">${esc(n.title)}</span>`]];
+  rows.push(local ? ["Подключение", "Локально"] : ["SSH", `<span class="mono">${esc(c.ssh)}</span>`]);
   if (up) {
     rows.push(
       ["ЦП", meter("ЦП", n.cpu.pct, 90, 0, `LA ${n.cpu.load1} · ${n.cpu.cpus} ${plural(n.cpu.cpus, ["ядро", "ядра", "ядер"])}`)],
       ["Память", meter("Память", n.mem.pct, 90, 0, `из ${gb(n.mem.total_mb, 1024)} ГБ`)],
       ["Диск", meter("Диск", n.disk.pct, 80, 90, `из ${gb(n.disk.total_kb, 1048576)} ГБ`)],
       ["Работает", fmtUptime(n.uptime_s)],
-      ["Отклик", `${fmtMs(n.ms)} <span class="muted">вход по SSH и сбор данных</span>`],
     );
+    if (!local) rows.push(["Отклик", `${fmtMs(n.ms)} <span class="muted">вход по SSH и сбор данных</span>`]);
   }
   $("#res").innerHTML = kv(rows);
   applyWidths($("#res"));
@@ -216,12 +226,17 @@ function render(d) {
   nd.data = d;
   renderHead(d);
   renderHealth(d);
-  const known = !!d.conf;
-  ["#node-body", "#node-more", "#danger", "#term-open"].forEach((sel) => { $(sel).hidden = !known; });
+  const known = !!d.conf || !!d.node?.dedicated;
+  $("#node-body").hidden = !known;
+  $("#term-open").hidden = !known;
+  $("#node-more").hidden = !d.conf;
+  $("#danger").hidden = !d.conf;
   if (known) {
     renderHy2(d);
     renderAwg(d);
     renderRes(d);
+  }
+  if (d.conf) {
     renderGroups(d);
     renderRelays(d);
     renderDanger(d);
@@ -338,7 +353,7 @@ const pageApi = startPage({
     $("#rename-cancel").addEventListener("click", () => closeRename(true));
     $("#term-open").addEventListener("click", () => {
       const d = nd.data;
-      if (d && d.conf) Term.open({ name: d.name, ssh: d.conf.ssh, enabled: !!d.terminal });
+      if (d?.conf || d?.node?.dedicated) Term.open({ name: d.name, ssh: d.conf?.ssh || "local", enabled: !!d.terminal });
     });
     document.querySelector("main").addEventListener("click", (e) => {
       const b = e.target.closest("[data-act]");

@@ -7,9 +7,13 @@ declare -A P=()
 P_MS=0
 
 probe_job() {
-  local i="$1" t0 t1 out
+  probe_target "${N_SSH[$1]}"
+}
+
+probe_target() {
+  local target="$1" t0 t1 out
   t0="$(date +%s%N)"
-  out="$(run_on "${N_SSH[$i]}" n_status 2>/dev/null)" || return 1
+  out="$(run_on "$target" n_status 2>/dev/null)" || return 1
   t1="$(date +%s%N)"
   printf '%s\n%s\n' "$(( (t1 - t0) / 1000000 ))" "$out"
 }

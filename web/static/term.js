@@ -245,7 +245,7 @@ const Term = (() => {
 
   // Выдуманная оболочка для демо-режима: строка ввода с Backspace и Ctrl+C, пара команд
   function demoShell() {
-    const node = t.node;
+    const node = t.node === DEMO_CONTROLLER_NAME ? demoController().title : t.node;
     const prompt = `\x1b[1;32mroot@${node}\x1b[0m:\x1b[1;34m~\x1b[0m# `;
     const w = (s) => t.xterm.write(s);
     const answers = {

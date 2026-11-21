@@ -54,7 +54,7 @@ Island of Freedom управление VPN-серверами // by meldevlp
   iof exec "команда"          выполнить команду на узлах
   iof refresh                 пересобрать все ссылки hy2 и ключи awg
   iof init                    первичная настройка управляющего сервера
-  iof api status|service|updates   данные для веб-панели в виде key=value (api audit — JSON)
+  iof api status|controller|service|updates   данные для веб-панели в виде key=value (api audit — JSON)
   iof update [--no-web]       обновить iof и веб-панель с GitHub (клон в /opt/iof)
   iof version                 установленная версия (коммит и дата)
 

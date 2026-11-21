@@ -193,9 +193,10 @@ class StatusCache:
     """Опрос узлов идёт по SSH и занимает секунды, поэтому результат кэшируется,
     а одновременные запросы ждут один общий опрос, а не запускают свои."""
 
-    def __init__(self, iof, ttl):
+    def __init__(self, iof, ttl, command="status"):
         self.iof = iof
         self.ttl = ttl
+        self.command = command
         self.lock = threading.Lock()
         self.data = None
 
@@ -229,7 +230,7 @@ class StatusCache:
         t0 = time.time()
         env = dict(os.environ, LC_ALL="C.UTF-8", LANG="C.UTF-8")
         try:
-            p = subprocess.run([self.iof, "api", "status"], capture_output=True,
+            p = subprocess.run([self.iof, "api", self.command], capture_output=True,
                                timeout=180, env=env, stdin=subprocess.DEVNULL)
         except FileNotFoundError:
             return self.failed(t0, f"не найден {self.iof}")
@@ -241,7 +242,7 @@ class StatusCache:
             return self.failed(t0, err[-1] if err else f"iof завершился с кодом {p.returncode}")
         # Старый iof не знает api и печатает справку
         if out.strip() and not out.startswith("== "):
-            return self.failed(t0, "iof не поддерживает «iof api status», обнови скрипт на сервере")
+            return self.failed(t0, f"iof не поддерживает «iof api {self.command}», обнови скрипт на сервере")
         return {"status_at": time.time(), "probe_s": round(time.time() - t0, 2),
                 "status_error": None, "nodes": parse_status(out)}
 
@@ -520,17 +521,43 @@ def read_migrate(base):
             "started": kv.get("started", "")}
 
 
-def dashboard_nodes(base, nodes, migrate):
-    """Порядок меняется только на Обзоре, без изменения общего кэша статусов."""
-    rows = read_conf(base / "nodes.conf", 4)
+CONTROLLER_NAME = "@controller"  # Служебное имя панели, недопустимое для VPN-узла.
+
+
+def controller_name(rows, migrate):
     if migrate and migrate["role"] == "target":
         # В копии nodes.conf запись local уже новая, но до finish управляет ещё старый сервер.
         peer = migrate["peer"].removesuffix(":22")
-        name = next((n for n, _, ssh, _ in rows if peer and ssh.removesuffix(":22") == peer), None)
+        return next((n for n, _, ssh, _ in rows if peer and ssh.removesuffix(":22") == peer), None)
+    return next((n for n, _, ssh, _ in rows if ssh in ("", "local")), CONTROLLER_NAME)
+
+
+def dedicated_controller(srv, force):
+    data = srv.controller_cache.get(force)
+    nodes = data.pop("nodes")
+    if nodes:
+        node = dict(nodes[0], name=CONTROLLER_NAME)
     else:
-        name = next((n for n, _, ssh, _ in rows if ssh in ("", "local")), None)
-    return sorted((dict(node, controller=node["name"] == name) for node in nodes),
-                  key=lambda node: not node["controller"])
+        issue = data["status_error"] or "не удалось собрать данные управляющего сервера"
+        node = shape_node({"name": CONTROLLER_NAME, "title": socket.gethostname(), "issues": issue})
+    return data, dict(node, controller=True, dedicated=True, local=True)
+
+
+def dashboard_nodes(srv, nodes, migrate, force):
+    """Строка управляющего сервера и порядок нужны только Обзору."""
+    rows = read_conf(srv.base / "nodes.conf", 4)
+    name = controller_name(rows, migrate)
+    targets = {n: ssh for n, _, ssh, _ in rows}
+    result = [dict(n, controller=n["name"] == name, local=targets[n["name"]] in ("", "local"))
+              for n in nodes if n["name"] in targets]
+    if name == CONTROLLER_NAME:
+        _, node = dedicated_controller(srv, force)
+        result.insert(0, node)
+    elif name is not None and not any(n["controller"] for n in result):
+        _, addr, ssh, title = next(row for row in rows if row[0] == name)
+        node = shape_node({"name": name, "addr": addr, "title": title, "issues": "нет данных опроса"})
+        result.insert(0, dict(node, controller=True, local=ssh in ("", "local")))
+    return sorted(result, key=lambda node: not node["controller"])
 
 
 def read_check(base):
@@ -1770,10 +1797,17 @@ def node_view(srv, name, force):
     """Страница узла: его состояние из общего опроса, строка nodes.conf, ретрансляторы с ним
     и есть ли в группах Hysteria2 ссылка на него. Ссылки (в них пароль) не отдаются."""
     base = srv.base
+    rows = read_conf(base / "nodes.conf", 4)
+    migrate = read_migrate(base)
+    controller = name == controller_name(rows, migrate)
+    if name == CONTROLLER_NAME and controller:
+        data, node = dedicated_controller(srv, force)
+        return dict(data, generated_at=time.time(), name=name, conf=None, node=node,
+                    controller=True, terminal=srv.terms.enabled, migrate=migrate)
     data = srv.cache.get(force)
     nodes = data.pop("nodes")
     conf = next(({"name": n, "addr": a, "ssh": s or "local", "title": t or n}
-                 for n, a, s, t in read_conf(base / "nodes.conf", 4) if n == name), None)
+                 for n, a, s, t in rows if n == name), None)
     title = conf["title"] if conf else name
     groups = [{"name": g["name"], "label": g["label"], "created": g["created"],
                "has_link": any(not link["relay"] and link["node"] == title for link in g["links"])}
@@ -1782,13 +1816,14 @@ def node_view(srv, name, force):
         "generated_at": time.time(),
         "name": name,
         "conf": conf,
+        "controller": controller,
         "node": next((n for n in nodes if n["name"] == name), None),
         "relays": [r for r in read_relays(base) if name in (r["node"], r["via"])],
         "hy2_groups": groups,
         "hy2_template": template_path(srv).is_file(),
         "busy": srv.jobs.busy(),
         "terminal": srv.terms.enabled,
-        "migrate": read_migrate(base),
+        "migrate": migrate,
     })
     return data
 
@@ -2221,7 +2256,7 @@ class Handler(BaseHTTPRequestHandler):
         migrate = read_migrate(base)
         data.update({
             "generated_at": time.time(),
-            "nodes": dashboard_nodes(base, data["nodes"], migrate),
+            "nodes": dashboard_nodes(self.server, data["nodes"], migrate, force),
             "relays": read_relays(base),
             "hy2_groups": [g for g in read_index(base / "hy2" / "index.tsv") if SAFE_NAME.match(g["name"])],
             "awg_clients": read_awg_clients(base),
@@ -2250,13 +2285,18 @@ class Handler(BaseHTTPRequestHandler):
                                             "и перезапусти панель: sudo systemctl restart iof-web"}, HTTPStatus.FORBIDDEN)
         try:
             name = text_field(body, "name", 40)
-            row = next((r for r in read_conf(self.server.base / "nodes.conf", 4) if r[0] == name), None)
-            if row is None:
-                raise ValueError(f"узла {name} нет в nodes.conf")
+            base = self.server.base
+            rows = read_conf(base / "nodes.conf", 4)
+            if name == CONTROLLER_NAME and name == controller_name(rows, read_migrate(base)):
+                ssh = "local"
+            else:
+                row = next((r for r in rows if r[0] == name), None)
+                if row is None:
+                    raise ValueError(f"узла {name} нет в nodes.conf")
+                ssh = row[2] or "local"
             if not term_size_ok(body.get("cols"), body.get("rows")):
                 raise ValueError("размер терминала: cols от 2 до 500, rows от 2 до 200")
-            ticket = terms.issue(name, row[2] or "local", body["cols"], body["rows"],
-                                 self.origin, self.session_token())
+            ticket = terms.issue(name, ssh, body["cols"], body["rows"], self.origin, self.session_token())
         except ValueError as e:
             return self.send_json({"error": str(e)}, HTTPStatus.BAD_REQUEST)
         self.send_json({"ticket": ticket})
@@ -2511,12 +2551,14 @@ def main():
     srv.ssh_pub = Path(ssh_key + ".pub")
     srv.hy2_template = Path(os.environ["HY2_TEMPLATE"]) if os.environ.get("HY2_TEMPLATE") else None
     srv.cache = StatusCache(args.iof, args.ttl)
+    srv.controller_cache = StatusCache(args.iof, args.ttl, "controller")
     srv.countries = CountryCache()
     srv.probes = Probes(srv.base)
 
     # После каждой задачи: свежий статус узлов и отчёт с ПК, если он ждал своей очереди
     def on_done():
         srv.cache.invalidate()
+        srv.controller_cache.invalidate()
         srv.probes.kick(srv.jobs, srv.iof)
 
     srv.jobs = Jobs(on_done=on_done)
